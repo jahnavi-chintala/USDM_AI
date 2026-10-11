@@ -1,0 +1,43 @@
+# Code only. Everything is ignored by default and only code is allowed back in, so protocol PDFs,
+# converted outputs, chunks, embeddings, caches, gold sets, reports, private test protocols, .env and
+# local_config.json can never be committed by accident.
+/*
+
+!/.gitignore
+!/.env.example
+!/README.md
+!/requirements.txt
+!/*.py
+
+!/docs/
+/docs/*
+!/docs/*.md
+
+!/tests/
+/tests/*
+!/tests/*.py
+
+!/tools/
+/tools/*
+!/tools/mermaid_validate/
+/tools/mermaid_validate/*
+!/tools/mermaid_validate/package.json
+!/tools/mermaid_validate/package-lock.json
+!/tools/mermaid_validate/validate.mjs
+
+# Evaluation scripts that hold no document content (gold_build.py does: it stays local)
+!/reports/
+/reports/*
+!/reports/eval/
+/reports/eval/*
+!/reports/eval/scripts/
+/reports/eval/scripts/*
+!/reports/eval/scripts/gold_extract.py
+!/reports/eval/scripts/gold_match.py
+!/reports/eval/scripts/gold_stats.py
+!/reports/eval/scripts/gold_validate.py
+!/reports/eval/scripts/inspect_answers.py
+!/reports/eval/scripts/phase2_rerun.py
+
+__pycache__/
+*.pyc
