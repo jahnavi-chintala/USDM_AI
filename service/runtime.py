@@ -48,6 +48,9 @@ LAZY_RESEARCH_EDGES = {
 }
 DATA_FILES = ["tools/mermaid_validate/package.json", "tools/mermaid_validate/package-lock.json",
               "tools/mermaid_validate/validate.mjs"]
+# The demo UI (static files served at /ui by service.api); every file in the folder, hidden files excluded.
+UI_DIR = "service/ui"
+UI_SUFFIXES = (".html", ".css", ".js", ".svg", ".png", ".ico")
 # Build inputs that are not runtime files (in the build context, never in the production image).
 BUILD_FILES = ["Dockerfile", "requirements.in", "requirements.lock", "docker/check_context.sh",
                "docker/fetch_models.py", "docker/lock_report.py"]
@@ -96,9 +99,17 @@ def closure(entry: list[str] | None = None) -> dict[str, set[str]]:
     return seen
 
 
+def ui_files() -> list[str]:
+    """The UI's static files (UI_SUFFIXES only: anything else in the folder is not shipped)."""
+    base = ROOT / UI_DIR
+    return sorted(p.relative_to(ROOT).as_posix() for p in base.rglob("*")
+                  if p.is_file() and p.suffix.lower() in UI_SUFFIXES
+                  and not any(part.startswith(".") for part in p.relative_to(base).parts)) if base.is_dir() else []
+
+
 def runtime_files() -> list[str]:
     files = {_module_path(m).relative_to(ROOT).as_posix() for m in closure()}
-    return sorted(files) + DATA_FILES
+    return sorted(files) + DATA_FILES + ui_files()
 
 
 def test_files() -> list[str]:

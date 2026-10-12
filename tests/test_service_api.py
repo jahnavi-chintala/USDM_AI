@@ -636,6 +636,37 @@ def test_unexpected_exception_is_opaque() -> None:
         root.removeHandler(capture)
 
 
+def test_ui_mount() -> None:
+    """The demo UI: static files from service/ui at /ui (index for /ui/), the UI's CSP on every file, JSON 404s,
+    / redirecting to /ui/, the Host check applying as everywhere."""
+    with temp_dir() as tmp:
+        ui = tmp / "ui"
+        (ui / "modules").mkdir(parents=True)
+        (ui / "index.html").write_text("<!doctype html><title>t</title><script type=module src=app.js></script>",
+                                       encoding="utf-8")
+        (ui / "modules" / "app.js").write_text("export const x = 1;\n", encoding="utf-8")
+        old = api.UI_DIR
+        api.UI_DIR = ui
+        try:
+            service = make_service(tmp / "data")
+            with TestClient(api.create_app(service), base_url=LOCAL) as client:
+                r = client.get("/", follow_redirects=False)
+                assert r.status_code in (302, 307) and r.headers["location"] == "/ui/", r.status_code
+                r = client.get("/ui/")
+                assert r.status_code == 200 and r.headers["content-type"].startswith("text/html"), r.status_code
+                assert r.headers["content-security-policy"] == api.UI_CSP and "'unsafe-inline'" not in api.UI_CSP
+                assert r.headers["x-content-type-options"] == "nosniff"
+                r = client.get("/ui/modules/app.js")
+                assert r.status_code == 200 and "javascript" in r.headers["content-type"], r.headers["content-type"]
+                assert r.headers["content-security-policy"] == api.UI_CSP
+                error_of(client.get("/ui/missing.js"), 404, "not_found")
+                error_of(client.get("/ui/../registry.sqlite"), 404, "not_found")
+                error_of(client.get("/ui/", headers={"host": "evil.example"}), 421, "invalid_host")
+                assert "/ui" not in client.get("/openapi.json").json()["paths"]
+        finally:
+            api.UI_DIR = old
+
+
 def test_host_and_origin_checks() -> None:
     """Only ALLOWED_HOSTS may be addressed, and browser pages of other hosts are refused (DNS rebinding,
     cross-site form posts); clients without an Origin header and pages of an allowed host pass."""
@@ -763,6 +794,58 @@ TOOL_CALLS = {
     "get_soa": {}, "abbreviation": {"term": "AE"}, "quote_check": {"quote": "Able to swallow tablets whole."},
     "search": {"query": "What dose of quillmorex is given?", "k": 4},
 }
+
+
+def test_delete_purges_caches() -> None:
+    """DELETE ?purge_caches=true also removes the PDF's conversion batches and its figure descriptions from the
+    shared caches; other documents' entries stay; without the flag the caches are left alone."""
+    if not tokenizer_cached():
+        print(f"   (skipped: tokenizer {TOKENIZER} not in the local Hugging Face cache)")
+        return
+    from docling_core.types.doc import DoclingDocument
+
+    from figure_vlm import document_key
+    from service.import_existing import import_folder
+
+    with temp_dir() as tmp:
+        folder, pdf = tmp / "src" / "Quillmore", tmp / "src" / "quillmore.pdf"
+        build_converted_folder(folder)
+        pdf.write_bytes(make_pdf("Quillmore study protocol", "Made-up text for a purge test"))
+        service = make_service(tmp / "data")
+        doc = import_folder(service.config, folder, pdf=pdf, version=VERSION, registry=service.registry,
+                            storage=service.storage)["doc_id"]
+        key = document_key(DoclingDocument.load_from_json(folder / "protocol.json"))
+        vlm, batches = service.config.vlm_cache_dir, service.config.batch_cache_dir
+        for name, doc_key in (("mine", key), ("other", "0123456789abcdef")):
+            (vlm / f"{name}.json").write_text(json.dumps({"doc_key": doc_key, "description": "made up"}),
+                                              encoding="utf-8")
+        for owner in (doc[:16], "f" * 16):
+            run = batches / owner / "layout-cfg"
+            run.mkdir(parents=True)
+            for f in ("0001-0015.json", "0016-0030.json", "manifest.json"):
+                (run / f).write_text("{}", encoding="utf-8")
+        (vlm / "broken.json").write_text("{not json", encoding="utf-8")
+        with client_for(service) as client:
+            r = client.delete(f"/documents/{doc}", params={"purge_caches": "true"})
+            assert r.status_code == 200 and r.json() == {"doc_id": doc, "deleted": True,
+                                                         "purged": {"batches": 2, "figures": 1}}, r.text
+            assert not (vlm / "mine.json").exists() and (vlm / "other.json").exists() and (vlm / "broken.json").exists()
+            assert not (batches / doc[:16]).exists() and (batches / ("f" * 16)).is_dir()
+            error_of(client.get(f"/documents/{doc}"), 404, "document_not_found")
+            # a document without a Docling JSON (fake pipeline): its batches go, no figure key, nothing else
+            other = upload(client, make_pdf("Purge study without figures")).json()
+            wait_job(client, other["job_id"])
+            (batches / other["doc_id"][:16]).mkdir()
+            (batches / other["doc_id"][:16] / "0001-0015.json").write_text("{}", encoding="utf-8")
+            r = client.delete(f"/documents/{other['doc_id']}?purge_caches=true")
+            assert r.json()["purged"] == {"batches": 1, "figures": 0}, r.text
+            assert (vlm / "other.json").exists()
+            # without the flag: nothing purged, no "purged" key
+            third = upload(client, make_pdf("Kept caches study")).json()
+            wait_job(client, third["job_id"])
+            (batches / third["doc_id"][:16]).mkdir()
+            assert client.delete(f"/documents/{third['doc_id']}").json() == {"doc_id": third["doc_id"], "deleted": True}
+            assert (batches / third["doc_id"][:16]).is_dir()
 
 
 def test_protocol_tools() -> None:

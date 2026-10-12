@@ -243,6 +243,38 @@ def test_doc_key_from_source_pdf() -> None:
         assert meta["source_pdf_hash"] is None and meta["doc_key"] == f"doc-{meta['source_sha256'][:12]}"
 
 
+def test_encrypted_pdf_converts_with_its_password() -> None:
+    """An encrypted PDF converts with the right password (the batch subprocess gets it from Docling's backend
+    options as a SecretStr: hybrid_backend must unwrap it for pdfium). Made-up content from scripts/e2e_lib.py;
+    skipped where that is not present (the Docker image's test target)."""
+    import importlib
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:  # a host-side helper, not a dependency of the image (hence no import statement)
+        e2e_lib = importlib.import_module("e2e_lib")
+    except ImportError:
+        print("   (skipped: scripts/e2e_lib.py not present)")
+        return
+    finally:
+        sys.path.remove(str(ROOT / "scripts"))
+    from convert_protocol import convert_batches
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf = Path(tmp) / "locked.pdf"
+        pdf.write_bytes(e2e_lib.make_pdf(e2e_lib.synthetic_protocol("ZX-4411", with_figure=False),
+                                         user_password="right-pw"))
+        log = Path(tmp) / "convert.log"
+        doc, pages = convert_batches(pdf, Path(tmp) / "out", password="right-pw", subprocess_log=log)
+        assert pages >= 1 and any("ZX-4411" in t.text for t in doc.texts), "converted text"
+        try:
+            convert_batches(pdf, Path(tmp) / "out2", password="wrong-pw", subprocess_log=log)
+        except Exception as exc:  # noqa: BLE001 - pdfium refuses the wrong password
+            assert "right-pw" not in str(exc)
+        else:
+            raise AssertionError("a wrong password must not convert")
+        assert "right-pw" not in log.read_text(encoding="utf-8", errors="replace")
+
+
 def test_isolated_failure_reports_type_and_location_only() -> None:
     from service.config import ServiceConfig
     from service.pipeline import PipelineFailed, process_document_isolated

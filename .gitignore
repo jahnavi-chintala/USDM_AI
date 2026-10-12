@@ -36,6 +36,16 @@
 !/service/
 /service/*
 !/service/*.py
+# the demo UI: static files of the types service.runtime.UI_SUFFIXES ships
+!/service/ui/
+/service/ui/**
+!/service/ui/**/
+!/service/ui/**/*.html
+!/service/ui/**/*.css
+!/service/ui/**/*.js
+!/service/ui/**/*.svg
+!/service/ui/**/*.png
+!/service/ui/**/*.ico
 
 !/tools/
 /tools/*

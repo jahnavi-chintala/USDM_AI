@@ -68,6 +68,8 @@ class HybridPdfBackend(ThreadedDoclingParseDocumentBackend):
         if isinstance(source, BytesIO):
             source = BytesIO(source.getvalue())
         password = getattr(options, "password", None)  # the same password docling-parse gets
+        if password is not None and hasattr(password, "get_secret_value"):  # PdfBackendOptions holds a SecretStr
+            password = password.get_secret_value()
         with pypdfium2_lock:
             self._pdoc = pdfium.PdfDocument(source, password=password)
 

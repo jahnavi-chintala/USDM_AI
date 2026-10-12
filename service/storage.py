@@ -234,6 +234,13 @@ class Storage(abc.ABC):
     def list_documents(self) -> list[str]:
         """doc_ids that have a published folder."""
 
+    # ---- shared caches
+    @abc.abstractmethod
+    def purge_caches(self, doc_id: str, figure_doc_key: str | None = None) -> dict[str, int]:
+        """Remove what the shared caches hold for one PDF: its conversion batches and, given the figure cache's
+        document key (figure_vlm.document_key), the figure descriptions made for it. {"batches", "figures"}:
+        the numbers of batch files and figure entries removed."""
+
     # ---- inbox
     @abc.abstractmethod
     def list_inbox(self) -> list[str]:
@@ -508,6 +515,26 @@ class LocalStorage(Storage):
 
     def list_documents(self) -> list[str]:
         return sorted(p.name for p in self.documents.iterdir() if p.is_dir() and DOC_ID_RE.fullmatch(p.name))
+
+    # ---- shared caches
+    def purge_caches(self, doc_id: str, figure_doc_key: str | None = None) -> dict[str, int]:
+        # batches: cache/batches/<first 16 hex of the PDF's SHA-256>/<converter configuration>/<pages>.json
+        batches = self.config.batch_cache_dir / check_doc_id(doc_id)[:16]
+        n_batches = 0
+        if batches.is_dir():
+            n_batches = sum(1 for p in batches.rglob("*.json") if p.is_file() and p.name != "manifest.json")
+            shutil.rmtree(batches, ignore_errors=True)
+        n_figures = 0
+        if figure_doc_key:
+            for entry in self.config.vlm_cache_dir.glob("*.json"):
+                try:
+                    key = json.loads(entry.read_text(encoding="utf-8")).get("doc_key")
+                except (OSError, ValueError, AttributeError):
+                    continue
+                if key == figure_doc_key:
+                    entry.unlink(missing_ok=True)
+                    n_figures += 1
+        return {"batches": n_batches, "figures": n_figures}
 
     # ---- inbox
     def list_inbox(self) -> list[str]:

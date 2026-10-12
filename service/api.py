@@ -17,6 +17,7 @@ Routes (OpenAPI at /docs and /openapi.json):
                                                  them) answers any other name: 404 unknown_tool
   POST /mcp                                      the MCP server (Streamable HTTP, stateless, JSON responses; the
                                                  same service and results, see service.mcp_server)
+  GET  /ui/                                      the demo UI (static files from service/ui; / redirects there)
 Uploads and reprocess requests answer 202 when a job was queued, else 200.
 
 Errors are JSON {"type", "message"[, "details"]}: a ServiceError with its own status; request validation 422
@@ -39,12 +40,13 @@ import re
 import sys
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from http import HTTPStatus
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Callable, Literal, Sequence
 
 from fastapi import Body, Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictInt, StrictStr, create_model
 from starlette.concurrency import run_in_threadpool
@@ -421,8 +423,13 @@ def create_app(service: ProtocolService | None = None, *, manage_lifecycle: bool
 
     @app.delete("/documents/{doc_id}", tags=["documents"], summary="Delete a document, its jobs and files",
                 responses=_errors(400, 404, 409))
-    def delete_document(doc_id: str, service: ServiceDep) -> JSONResponse:
-        return _ok(service.delete_document(doc_id))
+    def delete_document(doc_id: str, service: ServiceDep,
+                        purge_caches: Annotated[bool, Query(description="Also remove this PDF's conversion batches "
+                                                            "and figure descriptions from the shared caches: no "
+                                                            "trace of it stays under DATA_DIR.")] = False
+                        ) -> JSONResponse:
+        """{"doc_id", "deleted": true[, "purged": {"batches", "figures"}]}: 409 while a job of it runs."""
+        return _ok(service.delete_document(doc_id, purge_caches=purge_caches))
 
     @app.post("/documents/{doc_id}/reprocess", tags=["documents"], status_code=202,
               summary="Reprocess a stored document from its source PDF",
@@ -508,7 +515,33 @@ def create_app(service: ProtocolService | None = None, *, manage_lifecycle: bool
     from service.mcp_server import attach
 
     attach(app)
+
+    # ---------------------------------------------------------------- the demo UI (static, same origin)
+    app.mount("/ui", _UiFiles(directory=UI_DIR, html=True, check_dir=False), name="ui")
+
+    @app.get("/", include_in_schema=False)
+    def root() -> RedirectResponse:
+        return RedirectResponse("/ui/")
+
     return app
+
+
+UI_DIR = Path(__file__).resolve().parent / "ui"
+# The UI is plain files from this origin: no inline script or style, no other host, framed only by itself.
+UI_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; "
+          "frame-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'; object-src 'none'")
+
+
+class _UiFiles(StaticFiles):
+    """service/ui/ at /ui (index.html for /ui/), with UI_CSP and nosniff on every response."""
+
+    async def get_response(self, path: str, scope) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Content-Security-Policy"] = UI_CSP
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-cache"  # revalidate (ETag -> 304): no stale modules after an update
+        return response
 
 
 class ReprocessOptions(BaseModel):

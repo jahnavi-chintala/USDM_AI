@@ -8,9 +8,11 @@ tool API with provenance and quote checks.
 This repository holds code only. Protocol PDFs, converted outputs, caches, embeddings, evaluation
 gold sets and reports stay local and are never committed (see `.gitignore`).
 
-**As a service:** one Docker container with a REST API, an MCP server (HTTP at `/mcp` and stdio) and a
-background worker: upload a PDF, poll the job, call the tools. Build, run, configuration, backups, MCP
-setup, data handling and the pre-hosting checklist: [DEPLOY.md](DEPLOY.md). The code is in `service/`.
+**As a service:** one Docker container with a REST API, an MCP server (HTTP at `/mcp` and stdio), a demo UI
+at `/ui/` and a background worker: upload a PDF, poll the job, call the tools.
+- Build, run, configuration, backups, MCP setup, data handling and the pre-hosting checklist: [DEPLOY.md](DEPLOY.md).
+- The code is in `service/` (the UI in `service/ui/`).
+- `scripts/e2e_test.py` tests a running container end to end with public protocols.
 
 ## Setup
 

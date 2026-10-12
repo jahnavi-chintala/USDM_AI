@@ -35,9 +35,12 @@ n=$(count -type f \( -iname '*.sqlite' -o -iname '*.sqlite-*' -o -iname '*.db' -
         -o -iname '*.jsonl' -o -iname '*.pyc' -o -iname '*.docx' -o -iname '*.xlsx' -o -iname '*.zip' \))
 [ "$n" -eq 0 ] || fail "$n data / cache / archive file(s) (sqlite, npy, jsonl, pyc, docx, xlsx, zip)"
 
-# Only code and build inputs: a file type the whitelist never names means the whitelist is wrong.
+# Only code and build inputs (and the static UI, under service/ui only): a file type the whitelist never names
+# means the whitelist is wrong.
 n=$(count -type f ! \( -name '*.py' -o -name '*.sh' -o -name '*.mjs' -o -name 'package.json' \
-        -o -name 'package-lock.json' -o -name 'Dockerfile' -o -name 'requirements.in' -o -name 'requirements.lock' \))
+        -o -name 'package-lock.json' -o -name 'Dockerfile' -o -name 'requirements.in' -o -name 'requirements.lock' \) \
+        ! \( -path "$ctx/service/ui/*" \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.svg' \
+        -o -name '*.png' -o -name '*.ico' \) \))
 [ "$n" -eq 0 ] || fail "$n file(s) of a type the whitelist never includes"
 
 if [ "$failed" -ne 0 ]; then

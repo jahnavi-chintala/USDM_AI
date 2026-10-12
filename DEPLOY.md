@@ -27,14 +27,14 @@ docker compose up -d                                 # start (REST + MCP + worke
 docker compose ps                                    # wait for "(healthy)", about 30 s
 ```
 
-- **Using it:** open http://127.0.0.1:8000/docs for the interactive API. `GET /health` answers `{"status": "ok", ...}`.
+- **Using it:** open http://127.0.0.1:8000/ui/ for the demo UI (below), or http://127.0.0.1:8000/docs for the interactive API. `GET /health` answers `{"status": "ok", ...}`.
 - **Stopping:** `docker compose down` stops and removes the container. The volume, and with it every document, stays.
 
 **Checks** (optional, offline):
 
 ```powershell
 docker build --target test -t protocol-service:test .
-docker run --rm --network none protocol-service:test           # 5 service test suites, ~1 min, no network
+docker run --rm --network none protocol-service:test           # 6 service test suites, ~1.5 min, no network
 ```
 
 **End-to-end smoke test** against the running container:
@@ -46,6 +46,38 @@ docker run --rm --network none protocol-service:test           # 5 service test 
 - It uploads the two **public** protocols (LZZT, Lilly), then checks REST, MCP over HTTP and MCP over stdio, the known facts and the duplicate rules.
 - It takes about 30 minutes and sends about 27 requests to OpenRouter (see [Data handling](#6-data-handling)).
 - Without `--allow-openrouter` it stops before uploading anything.
+
+**Full end-to-end test** of the service as it is really used:
+
+```powershell
+.venv\Scripts\python.exe scripts\e2e_test.py --allow-openrouter --report $env:TEMP\e2e_report.json
+```
+
+- **What it covers:**
+  - Uploads Alexion, Bayer, PrECOG and Sanofi through every upload path: REST, MCP base64, and the inbox via `docker cp`.
+  - Runs a USDM-building agent over MCP HTTP and stdio, scored against the public USDM keys: identifiers, every inclusion/exclusion criterion, SoA visits, activities and cells, and quote_check of every extracted value.
+  - Runs several clients at once while a document converts; REST and MCP must give identical results.
+  - Restarts the container mid-conversion.
+  - Covers the duplicate/reprocess rules, and failure cases: corrupt, non-PDF, encrypted (none, wrong and right password), oversized, cancel, delete while running.
+  - Checks the cache purge.
+  - Runs a backup/restore drill on a scratch volume, in a throwaway container on port 8001.
+  - Measures stage times, tool latency, derived OpenRouter request counts and peak memory.
+- **Cost:** measured 74 min and about 76 OpenRouter requests when nothing is cached. Without `--allow-openrouter` it prints the estimate and stops.
+- **Last run** (2026-10-12): 129 passed, 0 failed, 1 skipped (PrECOG has no USDM key).
+- **What it changes in the live service:** it deletes and re-uploads its four public protocols, restarts the container once, and removes the made-up test documents it creates.
+- `--numbers-only --pdf-label MAIN|P1|P2|P3` runs the same flow on one private protocol in its own scratch container (port 8004, removed afterwards), printing only counts, booleans and timings.
+
+### Demo UI
+
+http://127.0.0.1:8000/ui/ is served by the service itself: same origin, plain HTML/CSS/JS with no external resources, and a strict Content-Security-Policy. It has five screens:
+
+- **Documents:** drag-and-drop upload with live per-stage progress; the document list with status, stale and related badges; reprocess, and delete with an optional cache purge.
+- **Document view:** identifiers, quality and warnings, plus the converted document, sections, chunks, images, quality report and files.
+- **Tool explorer:** every protocol tool with a form generated from `GET /tools`, the raw JSON and a readable view: read_section as Markdown with page and section markers, get_soa as a visit × activity grid, search as ranked blocks, quote_check with its locations.
+- **MCP:** the same calls as JSON-RPC to `/mcp`, side by side with REST and a "matches REST" badge.
+- **Use cases:** guided walkthroughs: eligibility criteria for USDM, SoA encounters and activities, verifying a value, identifiers and version.
+
+Upload, reprocess and search are marked "Calls OpenRouter" and ask for confirmation first.
 
 **Day to day:**
 
@@ -156,7 +188,7 @@ The interactive documentation, with every route, argument and response, is at ht
 |---|---|
 | `GET /health`, `GET /version` | Health (`503` when the registry or worker is down); pipeline version, fingerprint, packages, models, offline flag. |
 | `POST /documents` | Multipart upload: `file` (the PDF), optional `reprocess` (bool), optional `password` (form field only, never in the URL). Answers `{doc_id, job_id, status, duplicate, stale, queued, warnings}`: `202` when a job was queued, `200` otherwise. |
-| `GET /documents`, `GET /documents/{doc_id}`, `DELETE /documents/{doc_id}` | List (`status`, `limit`, `offset`); one document (status, version, stale flag, identifiers, quality summary, warnings, files, related and same-text documents, current job with stage and progress); delete. |
+| `GET /documents`, `GET /documents/{doc_id}`, `DELETE /documents/{doc_id}` | List (`status`, `limit`, `offset`); one document (status, version, stale flag, identifiers, quality summary, warnings, files, related and same-text documents, current job with stage and progress); delete (`purge_caches=true` also removes its cached conversion batches and figure descriptions). |
 | `POST /documents/{doc_id}/reprocess` | Reprocess from the stored PDF when the result is stale, or always with `force=true`. |
 | `GET /jobs`, `GET /jobs/{job_id}`, `GET /documents/{doc_id}/jobs`, `POST /jobs/{job_id}/cancel` | Jobs: state, stage, progress, per-stage seconds, warnings, error type and location. Only a queued job can be cancelled. |
 | `GET /documents/{doc_id}/files`, `GET /documents/{doc_id}/files/{name}` | The published files: `protocol.md`, `protocol.json`, `protocol.html`, `protocol.decisions.json`, `quality.json`, `chunks/*.jsonl` and `chunks/*.json`, `images/<file>`. Short names such as `chunks.jsonl`, `sections.json`, `decisions` and `md` also work. |
@@ -275,7 +307,7 @@ To add the missing parts later, reprocess the document online.
 
 - **Logs and error responses** carry ids, counts and exception types with our own file:line, never document text.
 - **PDF passwords** are held in memory until their job starts: never stored, logged or echoed.
-- **Deleting a document** (`DELETE /documents/{doc_id}`) removes its record, jobs and folder. The shared caches keep the conversion batches (`cache/batches/<pdf hash>`) and figure descriptions (`cache/vlm`). To remove every trace, also clear `/data/cache`; it is only a speed-up.
+- **Deleting a document** (`DELETE /documents/{doc_id}`) removes its record, jobs and folder. The shared caches keep its conversion batches (`cache/batches/<pdf hash>`) and figure descriptions (`cache/vlm`), so a re-upload is fast and sends nothing. To remove every trace, delete with `?purge_caches=true`: that also removes its batches and its figure descriptions, leaving other documents' entries in place. The answer reports what was removed (`"purged": {"batches": n, "figures": n}`).
 
 ## 7. Duplicate and version rules
 
@@ -299,7 +331,7 @@ The fingerprint covers the pipeline version, the settings, the Docling versions,
 - **Speed and memory:** measured on a 4-core laptop CPU, Docker with 8 logical CPUs.
   - Conversion takes about 7.5–11 s per page: LZZT, 97 pages, 14 min end to end; Sanofi, 152 pages, about 30 min.
   - Figure descriptions take 70–90 s per document; embeddings 15–20 s.
-  - Peak memory is about 5 GB per job while converting (1.7 GB otherwise).
+  - Peak memory is about 5 GB per job while converting (1.7 GB otherwise). The end-to-end test measured 6.0 GB for the whole container with agents querying during a conversion; the 8 GB limit covers that.
   - The converter uses 4 threads per job, so more CPUs only help with more concurrent jobs.
 - **Uploads:** at most `MAX_UPLOAD_MB` (100 MB). MCP `data_base64` uploads are held in memory.
 - **Lost passwords:** a PDF password is lost if the service restarts before its job starts; the job then fails and the PDF must be uploaded again.
