@@ -241,6 +241,33 @@ def test_colon_label_never_outranks_numbered_heading() -> None:
     assert S.build_section_index(b.d).to_json() == idx.to_json() and S.nest_colon_labels(b.d) == 0
 
 
+def test_quoted_headings_in_revision_history_inline() -> None:
+    # A list of changes quotes the protocol's section titles; they are not sections of the protocol.
+    b = Builder()
+    b.h("Revision History", 1)
+    b.h("Amendment 2", 2)
+    b.t("The following changes were made.")
+    b.h("5.2.1 Study Drug Administration", 2)
+    b.t("Old text replaced by new text.")
+    b.h("3.1 Eligibility Criteria", 3)
+    b.t("Criterion 4 removed.")
+    b.h("1. Introduction", 1)
+    b.t("Background.")
+    b.h("1.1 Rationale", 2)
+    b.h("2. Objectives", 1)
+    idx = S.build_section_index(b.d)
+    titles = [s.title for s in idx.sections]
+    assert "5.2.1 Study Drug Administration" not in titles and "3.1 Eligibility Criteria" not in titles, titles
+    history = next(s for s in idx.sections if s.title == "Revision History")
+    assert any(s.title == "Amendment 2" for s in idx.subtree(history.section_id))  # an unnumbered heading stays
+    texts = {t.self_ref: t.text for t in b.d.texts}
+    inline = [texts[r] for s in idx.subtree(history.section_id) for r in s.minor_headings]
+    assert inline == ["5.2.1 Study Drug Administration", "3.1 Eligibility Criteria"], inline
+    removed = next(t for t in b.d.texts if t.text == "Criterion 4 removed.")
+    assert idx.section_of(removed.self_ref) in {s.section_id for s in idx.subtree(history.section_id)}
+    assert {"S1", "S1.1", "S2"} <= set(idx.by_id) and idx.by_id["S1"].role == "introduction"
+
+
 # ---------------------------------------------------------------- reading-order repair
 
 def test_reading_order_repair() -> None:

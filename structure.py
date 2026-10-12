@@ -368,6 +368,7 @@ class Label:
 
 
 NUMBERED_KINDS = {"arabic", "roman", "alpha", "section"}
+_HEADING_MOVE_KINDS = {"arabic", "roman", "section"}  # section-number labels (lettered ones may be list items)
 
 _ARABIC = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(?=\S)")  # = protocol_postprocess._SECTION_NUM
 _SECTION_WORD = re.compile(r"(?i)^(?:section|chapter|part)\s+(\d+(?:\.\d+)*|[IVX]+)(?![\w])\.?\s*[:.\-–—]?\s*(?=\S)")
@@ -804,14 +805,28 @@ def _nest_colon_labels(heads: list, numbers: dict[str, str], eff: dict[str, int]
 
 
 def _heading_classes(doc: DoclingDocument, heads: list, numbers: dict[str, str]) -> tuple[set[str], set[str]]:
-    """(minor, colon_list) heading refs from the heading texts alone (_minor_reason)."""
+    """(minor, colon_list) heading refs from the heading texts alone (_minor_reason).
+
+    Quoted headings are minor too: from a heading whose role is a revision / amendment history (score >= 0.8)
+    up to the next heading with an accepted section number, a heading with a section-number label that is
+    not accepted ("5.2.1 Fulvestrant ..." in a list of changes) quotes a section of the protocol; it is not
+    one. Unnumbered headings there (an "Amendment 2" heading) keep their status."""
     protected = _protected_titles(doc)
     minor: set[str] = set()
     colon_list: set[str] = set()
+    history = False
     for h in heads:
         r = h.self_ref
         role, score = heading_role(h.text)
-        reason = _minor_reason(h.text, parse_label(h.text), r in numbers, role, score, protected)
+        label = parse_label(h.text)
+        if r in numbers:
+            history = False
+        if role == "amendment_history" and score >= 0.8:
+            history = True
+        elif history and r not in numbers and label is not None and label.kind in _HEADING_MOVE_KINDS:
+            minor.add(r)
+            continue
+        reason = _minor_reason(h.text, label, r in numbers, role, score, protected)
         if reason == "colon_list":
             colon_list.add(r)
         elif reason:
@@ -1059,9 +1074,6 @@ def reading_order_moves(doc: DoclingDocument, index: SectionIndex | None = None,
             if target is not None and s.section_id not in {p.section_id for p in index.path(target)}:
                 moves[s.heading_ref] = (s.section_id, target)
     return moves
-
-
-_HEADING_MOVE_KINDS = {"arabic", "roman", "section"}
 
 
 def _box(doc: DoclingDocument, item) -> tuple[int, float, float, float] | None:

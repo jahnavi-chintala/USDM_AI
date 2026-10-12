@@ -87,10 +87,19 @@ class ProtocolSettings:
     rebuild (booktabs and row-group rules stay below it)."""
     lattice_max_col_rule_coverage: float = 0.1
     """At most this share of side-by-side cell pairs may have a vertical rule for row-ruled mode."""
+    lattice_text_rows: bool = True
+    """In tables without rules between body rows (booktabs), join a one-cell TableFormer row to the row
+    above when the text layer shows it is that row's wrapped continuation (same style, aligned, tighter
+    than the row spacing, not numbered; table_lattice.join_text_rows)."""
+    lattice_text_rows_unruled: bool = False
+    """Also apply lattice_text_rows to tables with no rules at all (more often lists or TOCs)."""
     header_note_gap: float = 1.0
     """Vertical gap (in line heights) that splits a note out of a header cell; 0 turns it off."""
     figure_ocr_order: str = "auto"
     """auto | columns | rows: reading order of OCR fragments inside figures."""
+    join_hyphen_splits: bool = True
+    """Join a body paragraph or list item the layout model split into two items at a line that ends with
+    a hyphen (protocol_postprocess.join_hyphen_split_items)."""
     reading_order_repair: bool = True
     """Move text the converter read before a numbered heading although it lies below that heading on the
     same page (structure.repair_reading_order), so chunks, parents and protocol_api see the same order."""

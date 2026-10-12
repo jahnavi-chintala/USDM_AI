@@ -8,7 +8,10 @@ TableFormer side is a hand-built DoclingDocument that reproduces each failure mo
 columns, text moved across a row rule, a wrong header span, an unruled (booktabs) table that must
 stay untouched, a rotated page; tables ruled with horizontal lines only (fused and split rows
 corrected with columns from TableFormer, spans kept, booktabs / row-group rules, unseparable
-columns, header levels without a rule and rows above the top rule left alone).
+columns, header levels without a rule and rows above the top rule left alone); booktabs tables
+(rules at the top, under the header and at the bottom only) where a wrapped row label's second
+line is joined to its row, while group labels (indented or empty-first-column rows below, bold),
+numbered lines, header lines and lines at row distance stay rows.
 """
 
 import ctypes
@@ -47,8 +50,8 @@ class Page:
     def _pt(self, x: float, y: float) -> tuple[float, float]:
         return (self.w - y, x) if self.rot90 else (x, y)  # displayed -> user space
 
-    def text(self, s: str, x: float, y: float, size: float = 9) -> None:
-        obj = pr.FPDFPageObj_NewTextObj(self.pdf.raw, b"Helvetica", ctypes.c_float(size))
+    def text(self, s: str, x: float, y: float, size: float = 9, font: bytes = b"Helvetica") -> None:
+        obj = pr.FPDFPageObj_NewTextObj(self.pdf.raw, font, ctypes.c_float(size))
         buf = (s + "\x00").encode("utf-16-le")
         pr.FPDFText_SetText(obj, ctypes.cast(ctypes.c_char_p(buf), ctypes.POINTER(pr.FPDF_WCHAR)))
         ux, uy = self._pt(x, y)
@@ -569,6 +572,144 @@ def test_row_ruled_rows_above_top_rule_not_merged() -> None:
     entry = log["table_lattice"][0]
     assert (entry["action"], entry.get("reason")) == ("skipped", "rows_outside_rules"), entry
     assert d.tables[0].data.model_dump() == snapshot
+
+
+# ------------------------------------------------------------------ booktabs tables: rows from the text layer
+
+# Label | H0 | H1 | N; Helvetica 9, rows 15 pt apart, a wrapped cell's lines 11 pt apart.
+BT_X = [72, 172, 232, 292, 352]
+BT_HEAD = [(0, [("Indication", 75, 688)], True), (1, [("H0", 180, 688)], True), (2, [("H1", 240, 688)], True),
+           (3, [("N", 300, 688)], True)]
+
+
+def bt_row(label: str | None, y: float, values=("15%", "30%", "26"), x: float = 75) -> list:
+    """A TableFormer row: the label (column 0, at x) and values on one line at baseline y."""
+    row = [(0, [(label, x, y)])] if label else []
+    return row + [(c, [(v, BT_X[c] + 8, y)]) for c, v in enumerate(values, start=1)]
+
+
+def booktabs_doc(name: str, rows: list, bold: tuple = (), rules: tuple = (700, 682), bottom: bool = True):
+    """Draws the rows' text (bold: texts set in Helvetica-Bold) with rules at `rules` and (bottom)
+    under the last line, and builds TableFormer's cells (one per (column, lines[, header]) entry
+    of a row; the cell box spans the column and its lines)."""
+    pdf = pdfium.PdfDocument.new()
+    page = Page(pdf, 612, 792)
+    cells = []
+    for r, row in enumerate(rows):
+        for col, parts, *head in row:
+            for s, x, y in parts:
+                page.text(s, x, y, font=b"Helvetica-Bold" if s in bold else b"Helvetica")
+            ys = [y for _, _, y in parts]
+            cells.append(cell(" ".join(s for s, _, _ in parts), r, col, (BT_X[col], min(ys) - 3, BT_X[col + 1], max(ys) + 8),
+                              header=bool(head and head[0])))
+    low = min(y for row in rows for _, parts, *_ in row for _, _, y in parts)
+    for y in (*rules, low - 6) if bottom else rules:
+        page.rule(BT_X[0], y, BT_X[-1], y)
+    return save(pdf, [page], name), doc_with_table(cells, len(rows), 4, (70, low - 8, 354, 702))
+
+
+def run_text_rows(pdf, d, **kw) -> tuple[dict, dict]:
+    log = {}
+    counts = tl.correct_tables_with_lattice(d, pdf, log, **kw)  # text_rows is on by default
+    entry = log["table_lattice"][0]
+    # the log holds numbers and identifiers only, never cell text
+    for k, v in entry.items():
+        if isinstance(v, str):
+            assert v.replace("_", "").replace(":", "").isalpha() and v.islower(), (k, v)
+        elif isinstance(v, dict):
+            assert all(isinstance(n, int) and kk.replace("_", "").isalpha() for kk, n in v.items()), (k, v)
+    return counts, entry
+
+
+def test_text_rows_wrapped_label_joined() -> None:
+    """'Liver and' / 'biliary': one row label on two lines (11 pt apart, rows are 15 pt apart);
+    TableFormer made the second line a row of its own. Joined only with text_rows on."""
+    rows = [BT_HEAD, bt_row("Liver and", 668), [(0, [("biliary", 75, 657)])], bt_row("Ovarian", 642),
+            bt_row("Gastric", 627, ("20%", "40%", "17"))]
+    pdf, d = booktabs_doc("tr_wrapped", rows)
+    snapshot = d.tables[0].data.model_dump()
+    counts = tl.correct_tables_with_lattice(d, pdf, {}, text_rows=False)
+    assert not counts.get("text_rows_joined") and d.tables[0].data.model_dump() == snapshot, counts
+    counts = tl.correct_tables_with_lattice(d, pdf, {}, mode="verify")  # verify mode changes nothing
+    assert not counts.get("text_rows_joined") and d.tables[0].data.model_dump() == snapshot, counts
+    pdf, d = booktabs_doc("tr_wrapped", rows)
+    before = words(d.tables[0])
+    counts, entry = run_text_rows(pdf, d)
+    t = d.tables[0]
+    assert (counts["text_rows_tables"], counts["text_rows_joined"]) == (1, 1), (counts, entry)
+    assert entry["action"] == "disagree_not_ruled" and entry["rows_after"] == 4, entry
+    assert (t.data.num_rows, t.data.num_cols) == (4, 4)
+    g = grid_of(t)
+    assert g[(1, 0)] == "Liver and biliary" and g[(1, 3)] == "26", g
+    assert g[(2, 0)] == "Ovarian" and g[(3, 0)] == "Gastric" and g[(3, 2)] == "40%", g
+    assert words(t) == before
+    joined = next(c for c in t.data.table_cells if c.text == "Liver and biliary")
+    assert joined.row_span == 1 and joined.bbox.to_bottom_left_origin(792).b < 657 - 2
+    # the same table without any rules: joined only with text_rows_unruled
+    pdf, d = booktabs_doc("tr_unruled", rows, rules=(), bottom=False)
+    snapshot = d.tables[0].data.model_dump()
+    counts, entry = run_text_rows(pdf, d)
+    assert entry["reason"] == "no_rules" and d.tables[0].data.model_dump() == snapshot, entry
+    counts, entry = run_text_rows(pdf, d, text_rows_unruled=True)
+    assert counts["text_rows_joined"] == 1 and grid_of(d.tables[0])[(1, 0)] == "Liver and biliary", entry
+
+
+def test_text_rows_group_label_kept() -> None:
+    """A label-only line 11 pt under a row with values labels a group: the rows under it are
+    indented, or have no text in the first column. It stays a row."""
+    for name, rows in (
+            ("tr_indented", [BT_HEAD, bt_row("Overall", 668), [(0, [("Hepatic", 75, 657)])], bt_row("ALT", 642, x=85),
+                             bt_row("AST", 627, x=85)]),
+            ("tr_empty_first", [BT_HEAD, bt_row("Overall", 668), [(0, [("Hepatic", 75, 657)])], bt_row(None, 642),
+                                bt_row("Renal", 627)])):
+        pdf, d = booktabs_doc(name, rows)
+        snapshot = d.tables[0].data.model_dump()
+        counts, entry = run_text_rows(pdf, d)
+        assert not counts.get("text_rows_joined") and d.tables[0].data.model_dump() == snapshot, (name, entry)
+        assert entry["text_rows_reasons"] == {"next_row": 1}, (name, entry)
+
+
+def test_text_rows_bold_group_label_kept() -> None:
+    rows = [BT_HEAD, bt_row("Overall", 668), [(0, [("Hepatic", 75, 657)])], bt_row("ALT", 642), bt_row("AST", 627)]
+    pdf, d = booktabs_doc("tr_bold", rows, bold=("Hepatic",))
+    snapshot = d.tables[0].data.model_dump()
+    counts, entry = run_text_rows(pdf, d)
+    assert d.tables[0].data.model_dump() == snapshot and entry["text_rows_reasons"] == {"style": 1}, entry
+
+
+def test_text_rows_numbered_line_kept() -> None:
+    rows = [BT_HEAD, bt_row("1. Hepatic", 668), [(0, [("2. Renal", 75, 657)])], bt_row("Ovarian", 642),
+            bt_row("Gastric", 627)]
+    pdf, d = booktabs_doc("tr_numbered", rows)
+    snapshot = d.tables[0].data.model_dump()
+    counts, entry = run_text_rows(pdf, d)
+    assert d.tables[0].data.model_dump() == snapshot and entry["text_rows_reasons"] == {"numbered": 1}, entry
+
+
+def test_text_rows_header_band_untouched() -> None:
+    """'Parameter' / '(units)': a header cell on two lines that TableFormer split into two
+    header rows, above the header rule. Untouched whether TableFormer flagged the rows as
+    header or not (then the rule under the header marks the band)."""
+    head = [(0, [("Parameter", 75, 688)]), (1, [("Day 1", 180, 688)]), (2, [("Day 8", 240, 688)]),
+            (3, [("Day 15", 300, 688)])]
+    for flagged in (True, False):
+        rows = [[(*c, flagged) for c in head], [(0, [("(units)", 75, 677)], flagged)],
+                bt_row("Weight", 656), bt_row("Height", 641), bt_row("BMI", 626)]
+        pdf, d = booktabs_doc(f"tr_header_{flagged}", rows, rules=(700, 671))
+        snapshot = d.tables[0].data.model_dump()
+        counts, entry = run_text_rows(pdf, d)
+        assert d.tables[0].data.model_dump() == snapshot and not counts.get("text_rows_joined"), (flagged, entry)
+        assert not entry.get("text_rows_candidates"), (flagged, entry)
+
+
+def test_text_rows_larger_gap_kept() -> None:
+    """A label-only line at the table's row distance (15 pt) is a row of its own."""
+    rows = [BT_HEAD, bt_row("Liver and", 668), [(0, [("biliary", 75, 653)])], bt_row("Ovarian", 638),
+            bt_row("Gastric", 623)]
+    pdf, d = booktabs_doc("tr_gap", rows)
+    snapshot = d.tables[0].data.model_dump()
+    counts, entry = run_text_rows(pdf, d)
+    assert d.tables[0].data.model_dump() == snapshot and entry["text_rows_reasons"] == {"gap": 1}, entry
 
 
 # ------------------------------------------------------------------ table_merge row structure

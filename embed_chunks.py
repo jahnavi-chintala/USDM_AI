@@ -18,33 +18,35 @@ fallbacks. The API key comes from OPENROUTER_API_KEY or .env and is never logged
 import argparse
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
-import httpx
 import numpy as np
 
 from figure_vlm import _api_key
+from openrouter_http import post_json
 
 log = logging.getLogger("embed_chunks")
 
-MODEL = "qwen/qwen3-embedding-8b"
+MODEL = os.environ.get("EMBED_MODEL") or "qwen/qwen3-embedding-8b"  # the service's EMBED_MODEL setting
 URL = "https://openrouter.ai/api/v1/embeddings"
 QUERY_INSTRUCTION = ("Given a question about a clinical trial protocol, retrieve the protocol "
                      "passages that answer it")
 
 
-def embed_texts(texts: list[str], model: str = MODEL, batch: int = 32) -> np.ndarray:
+def embed_texts(texts: list[str], model: str = MODEL, batch: int = 32, progress=None) -> np.ndarray:
     from retrieve import require_online
 
     require_online()  # OPENROUTER_OFFLINE=1 turns any embedding call into an error
     key = _api_key("OPENROUTER_API_KEY")
     out = []
+    n_batches = (len(texts) + batch - 1) // batch
     for i in range(0, len(texts), batch):
         body = {"model": model, "input": texts[i:i + batch],
                 "provider": {"data_collection": "deny", "zdr": True, "allow_fallbacks": False}}
         for attempt in range(1, 4):
-            resp = httpx.post(URL, json=body, timeout=120, headers={"Authorization": f"Bearer {key}"})
+            resp = post_json(URL, body, key, timeout=120)
             if resp.status_code == 200:
                 break
             if resp.status_code in (429, 500, 502, 503) and attempt < 3:
@@ -54,21 +56,28 @@ def embed_texts(texts: list[str], model: str = MODEL, batch: int = 32) -> np.nda
         data = sorted(resp.json()["data"], key=lambda d: d["index"])
         out += [d["embedding"] for d in data]
         log.info("embedded %d/%d", min(i + batch, len(texts)), len(texts))
+        if progress is not None:
+            progress("embed", i // batch + 1, n_batches)
     vecs = np.asarray(out, dtype=np.float32)
     return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
 
 
-def cmd_embed(args) -> None:
-    chunks = [json.loads(l) for l in Path(args.chunks).read_text(encoding="utf-8").splitlines() if l.strip()]
-    out = Path(args.chunks).parent
-    cache_file = out / f"embedding_cache.{args.model.replace('/', '_')}.json"
+def embed_document(chunks_path: Path, model: str = MODEL, progress=None) -> dict[str, int]:
+    """Embeddings for every chunk of chunks_path into its folder (embeddings.npy + embeddings_meta.json).
+
+    Vectors are cached per chunk content hash in embedding_cache.<model>.json next to the chunks,
+    so only new or changed chunks are sent. With OPENROUTER_OFFLINE set and chunks missing from
+    the cache, retrieve.OfflineRefused is raised before anything is written.
+    progress("embed", done, total) per request batch. Returns counts."""
+    chunks = [json.loads(l) for l in Path(chunks_path).read_text(encoding="utf-8").splitlines() if l.strip()]
+    out = Path(chunks_path).parent
+    cache_file = out / f"embedding_cache.{model.replace('/', '_')}.json"
     cache = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
 
     todo = [c for c in chunks if c["content_hash"] not in cache]
-    log.info("%d chunks, %d cached, %d to embed with %s", len(chunks), len(chunks) - len(todo),
-             len(todo), args.model)
+    log.info("%d chunks, %d cached, %d to embed with %s", len(chunks), len(chunks) - len(todo), len(todo), model)
     if todo:
-        vecs = embed_texts([c["embed_text"] for c in todo], args.model)
+        vecs = embed_texts([c["embed_text"] for c in todo], model, progress=progress)
         for c, v in zip(todo, vecs):
             cache[c["content_hash"]] = v.tolist()
         cache_file.write_text(json.dumps(cache), encoding="utf-8")
@@ -76,11 +85,16 @@ def cmd_embed(args) -> None:
     matrix = np.asarray([cache[c["content_hash"]] for c in chunks], dtype=np.float32)
     np.save(out / "embeddings.npy", matrix)
     (out / "embeddings_meta.json").write_text(json.dumps({
-        "model": args.model, "dimensions": int(matrix.shape[1]), "normalized": True,
+        "model": model, "dimensions": int(matrix.shape[1]), "normalized": True,
         "query_instruction": QUERY_INSTRUCTION,
         "chunk_ids": [c["chunk_id"] for c in chunks],
     }, indent=1), encoding="utf-8")
     log.info("Wrote %s (%d x %d)", out / "embeddings.npy", *matrix.shape)
+    return {"chunks": len(chunks), "cached": len(chunks) - len(todo), "embedded": len(todo)}
+
+
+def cmd_embed(args) -> None:
+    embed_document(Path(args.chunks), args.model)
 
 
 def cmd_search(args) -> None:

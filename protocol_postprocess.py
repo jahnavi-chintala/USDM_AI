@@ -435,6 +435,9 @@ def demote_stray_furniture(doc: DoclingDocument, settings: ProtocolSettings | No
 
 
 _PAGE_NUMBER_ONLY = re.compile(r"^(?:page\s*)?#+(?:\s*(?:of|/)\s*#+)?$", re.I)
+# A page-number expression anywhere in a (digit-masked) header line: "Version #.# Page: # of #".
+_PAGE_NUMBER_IN = re.compile(r"\bpage\s*:?\s*#+(?:\s*(?:of|/)\s*#+)?(?!\w)", re.I)
+_WORD = re.compile(r"[^\W_]+")
 
 
 def restore_unique_headers(doc: DoclingDocument, log: dict | None = None) -> int:
@@ -443,8 +446,11 @@ def restore_unique_headers(doc: DoclingDocument, log: dict | None = None) -> int
     A running header repeats on many pages; a header line printed on one page only
     (typically the title page: "NCT #: NCT04573309", a registry or IND number) is
     content, and as furniture it never reaches the chunks. Repetition is compared with
-    digits masked, so "Page 3 of 90" style lines still count as repeated; bare page
-    numbers are never restored.
+    digits masked, so "Page 3 of 90" style lines still count as repeated. Never restored:
+    lines holding a page-number expression ("Version 1.0 Page: 3 of 86"), and lines without
+    digits whose words all occur in a header/footer repeated on other pages (a fragment of
+    the running header that the layout split differently on one page; digits may be new
+    information, such as an identifier, so a line with digits is not judged this way).
     """
     log = log if log is not None else {}
     furniture = [t for t in doc.texts if t.label in (DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER)]
@@ -452,10 +458,13 @@ def restore_unique_headers(doc: DoclingDocument, log: dict | None = None) -> int
     for t in furniture:
         pages.setdefault(re.sub(r"\d+", "#", " ".join(t.text.split())).lower(), set()).update(
             p.page_no for p in t.prov)
+    running = {w for key, ps in pages.items() if len(ps) > 1 for w in _WORD.findall(key)}
     restored = 0
     for t in furniture:
         key = re.sub(r"\d+", "#", " ".join(t.text.split())).lower()
         if len(pages[key]) != 1 or not t.text.strip() or _PAGE_NUMBER_ONLY.match(key) or len(doc.pages) < 3:
+            continue
+        if _PAGE_NUMBER_IN.search(key) or ("#" not in key and set(_WORD.findall(key)) <= running):
             continue
         t.label = DocItemLabel.TEXT
         t.content_layer = ContentLayer.BODY
@@ -863,6 +872,53 @@ def absorb_split_list_lines(doc: DoclingDocument, pdf: pdfium.PdfDocument) -> in
     return repaired
 
 
+_HYPHEN_END = re.compile(r"[^\W_][-‐‑]$")
+
+
+def join_hyphen_split_items(doc: DoclingDocument, log: dict | None = None) -> int:
+    """Join a paragraph the layout model split into two items at a line that ends with a hyphen.
+
+    Item A (body text or list item) ends with a word and an attached hyphen; the next item B in the
+    same parent (body text or list item) starts with a word character, lies on the same page directly
+    below A (gap at most half a line) and in A's column (>= 50 % of B's width within A's). A paragraph
+    does not end on a dangling hyphen, so B is A's next line. B's text is appended to A's after a space
+    and B is deleted; text_reconcile then decides from the PDF whether "word- word" becomes
+    "word-word", "wordword" or stays suspended, as for a line break inside one item. Run before
+    reconcile_text. Returns the number of joins; log["hyphen_joins"]: item, page (no text).
+    """
+    entries = log.setdefault("hyphen_joins", []) if log is not None else []
+    max_gap = 0.5 * _line_height(doc)
+    kinds = (DocItemLabel.TEXT, DocItemLabel.LIST_ITEM)
+    joined = 0
+    for parent in [doc.body, *doc.groups]:
+        i = 0
+        while i + 1 < len(parent.children):
+            a, b = parent.children[i].resolve(doc), parent.children[i + 1].resolve(doc)
+            ok = (isinstance(a, TextItem) and isinstance(b, TextItem) and a.label in kinds and b.label in kinds
+                  and a.content_layer == ContentLayer.BODY and b.content_layer == ContentLayer.BODY
+                  and a.prov and b.prov and _HYPHEN_END.search(a.text.rstrip()) is not None
+                  and b.text[:1].isalnum() and not (getattr(b, "marker", "") or "").strip())  # never past a marker
+            if ok:
+                pa, pb = a.prov[-1], b.prov[0]
+                gap = _gap(doc, pa, pb)
+                h = doc.pages[pa.page_no].size.height
+                ba, bb = pa.bbox.to_top_left_origin(h), pb.bbox.to_top_left_origin(h)
+                width = bb.r - bb.l
+                in_column = width > 0 and (min(ba.r, bb.r) - max(ba.l, bb.l)) / width >= 0.5
+                ok = gap is not None and -1.0 <= gap <= max_gap and in_column and len(b.prov) == 1
+            if not ok:
+                i += 1
+                continue
+            a.text = f"{a.text.rstrip()} {b.text.lstrip()}"
+            a.orig = f"{a.orig.rstrip()} {b.orig.lstrip()}" if a.orig and b.orig else a.text
+            a.prov[-1] = ProvenanceItem(page_no=pa.page_no, bbox=BoundingBox.enclosing_bbox([pa.bbox, pb.bbox]),
+                                        charspan=(0, len(a.text)))
+            entries.append({"item": a, "page": pa.page_no})
+            doc.delete_items(node_items=[b])
+            joined += 1
+    return joined
+
+
 # Adobe Symbol encoding (bytes 0x20-0xFE as Word emits them at U+F020-U+F0FE).
 # ASCII-identical positions map to themselves.
 _SYMBOL_ENCODING = (
@@ -1064,6 +1120,9 @@ def postprocess(doc: DoclingDocument, pdf: pdfium.PdfDocument,
     reocr = reocr_figures(doc, pdf, log, order=settings.figure_ocr_order) if settings.figure_reocr else {}
     pictures = flatten_picture_text(doc, settings)
     list_lines = absorb_split_list_lines(doc, pdf)
+    # A paragraph split into two items at a hyphenated line end: one item again, before reconcile_text
+    # decides the hyphen from the PDF.
+    hyphen_joins = join_hyphen_split_items(doc, log) if settings.join_hyphen_splits else 0
     # After the list repair, whose text is re-read from the PDF text layer.
     glyphs = normalize_symbol_glyphs(doc, settings, log)
     titles = resolve_repeated_table_titles(doc, settings, log)
@@ -1085,7 +1144,9 @@ def postprocess(doc: DoclingDocument, pdf: pdfium.PdfDocument,
                                            header_note_gap=settings.header_note_gap or None,
                                            row_ruled=settings.lattice_row_ruled,
                                            min_row_rule_coverage=settings.lattice_min_row_rule_coverage,
-                                           max_col_rule_coverage=settings.lattice_max_col_rule_coverage)
+                                           max_col_rule_coverage=settings.lattice_max_col_rule_coverage,
+                                           text_rows=settings.lattice_text_rows,
+                                           text_rows_unruled=settings.lattice_text_rows_unruled)
                if settings.table_lattice != "off" else {})
     merged = merge_split_tables(doc, settings, log)
     inner_headers = mark_inner_header_rows(doc, log)
@@ -1116,10 +1177,11 @@ def postprocess(doc: DoclingDocument, pdf: pdfium.PdfDocument,
     return {"hyphens_fixed": hyphens, "symbol_glyphs_fixed": glyphs, "shadow_pictures_dropped": shadows,
             "stray_furniture_moved": furniture, "single_page_headers_restored": restored_headers, "figures_reocr": reocr.get("reocr", 0),
             "figure_text_flattened": pictures,
-            "list_items_repaired": list_lines, **titles,
+            "list_items_repaired": list_lines, "hyphen_split_items_joined": hyphen_joins, **titles,
             "text_reconciled": sum(v for v in reconciled.values() if isinstance(v, int)),
             "label_value_pairs": pairs, "tables_lattice_corrected": lattice.get("corrected", 0),
             "tables_lattice_rows_corrected": lattice.get("corrected_rows", 0),
+            "table_text_rows_joined": lattice.get("text_rows_joined", 0),
             "tables_merged": merged, "inner_header_rows": inner_headers, "split_cells_fixed": split_cells, "overlapping_cells_fixed": overlaps,
             "headings_releveled": headings, "toc_entries": toc, "reading_order_repairs": reordered,
             "colon_labels_nested": nested,

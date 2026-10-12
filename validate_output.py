@@ -218,6 +218,27 @@ def aggregate(report: list[dict], threshold: float = 0.97) -> dict:
     }
 
 
+def quality_report(doc: DoclingDocument, pdf: pdfium.PdfDocument, decisions: dict | None = None,
+                   threshold: float = 0.97) -> dict:
+    """Numbers-only quality report of a converted document: word coverage against the PDF text layer
+    (per page and overall), table QA (marks, ruling-line verdicts) and figure counts. No document text."""
+    from figure_vlm import skip_figure
+
+    report = page_coverage(doc, pdf)
+    tables = table_checks(doc, pdf, decisions)
+    pictures = list(doc.pictures)
+    described = sum(1 for p in pictures if p.meta is not None and getattr(p.meta, "description", None))
+    figures = {"pictures": len(pictures), "skipped_logo_like": sum(1 for p in pictures if skip_figure(p, doc)),
+               "described": described}
+    return {
+        "coverage": aggregate(report, threshold),
+        "pages": [{k: v for k, v in r.items() if k != "missing"} for r in report],
+        "tables": {k: v for k, v in tables.items() if k != "per_table"},
+        "tables_per_table": [{k: v for k, v in t.items()} for t in tables.get("per_table", [])],
+        "figures": figures,
+    }
+
+
 def main() -> None:
     from project_paths import main_json, main_pdf
 

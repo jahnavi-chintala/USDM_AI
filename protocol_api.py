@@ -43,7 +43,6 @@ import bisect
 import hashlib
 import json
 import logging
-import os
 import re
 import sys
 from collections import Counter
@@ -124,7 +123,10 @@ def _jsonable(x: Any) -> Any:
 
 
 def _offline() -> bool:
-    return os.environ.get("OPENROUTER_OFFLINE") == "1"
+    """OPENROUTER_OFFLINE as everywhere else (1 / true / yes / on): a cache miss is OfflineCacheMiss."""
+    from retrieve import offline
+
+    return offline()
 
 
 @dataclass

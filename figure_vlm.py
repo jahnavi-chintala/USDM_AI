@@ -142,7 +142,7 @@ class OpenRouterRunner:
         import base64
         import io
 
-        import httpx
+        from openrouter_http import post_json
 
         buf = io.BytesIO()
         image.save(buf, format="PNG")
@@ -161,8 +161,7 @@ class OpenRouterRunner:
         from retrieve import require_online
 
         require_online()  # OPENROUTER_OFFLINE=1 turns any VLM call into an error
-        resp = httpx.post(self.URL, json=body, timeout=300,
-                          headers={"Authorization": f"Bearer {self.key}"})
+        resp = post_json(self.URL, body, self.key, timeout=300)
         if resp.status_code != 200:
             raise RuntimeError(f"OpenRouter {resp.status_code}: {resp.text[:500]}")
         data = resp.json()
@@ -327,6 +326,98 @@ def _iou(a: list[float], b: list[float]) -> float:
     return inter / (area(a) + area(b) - inter) if inter else 0.0
 
 
+def _cache_entries(cache_dir: Path, model: str) -> list[tuple[str, FigureResult]]:
+    entries = []
+    for f in cache_dir.glob("*.json") if cache_dir.is_dir() else []:
+        r = FigureResult(**json.loads(f.read_text(encoding="utf-8")))
+        if r.model == model and r.prompt_version == PROMPT_VERSION:
+            entries.append((f.stem, r))
+    return entries
+
+
+def _cached_result(entries: list, key: str | None, doc_key: str, page: int, box: list[float]) -> FigureResult | None:
+    """The cached result of a figure: same pixels, or else same document, page and position (IoU >= 0.8)."""
+    return next((r for k, r in entries if k == key), None) or next(
+        (r for _, r in entries if r.doc_key == doc_key and r.page == page and r.bbox and _iou(r.bbox, box) >= 0.8),
+        None)
+
+
+def _figures(doc):
+    """(picture, page, box, image) of every figure worth describing (not skipped, with an image)."""
+    for pic in doc.pictures:
+        if skip_figure(pic, doc) or not pic.prov:
+            continue
+        page = pic.prov[0].page_no
+        b = pic.prov[0].bbox.to_bottom_left_origin(doc.pages[page].size.height)
+        img = pic.get_image(doc)
+        yield pic, page, [b.l, b.t, b.r, b.b], (img.convert("RGB") if img is not None else None)
+
+
+def describe_missing(doc, model: str, cache_dir: Path, *, concurrency: int = 4, retries: int = 2,
+                     progress=None, runner=None, backoff: float = 2.0) -> dict[str, int]:
+    """Describe every figure that is not skipped and has no cached result, with `model`
+    ("openrouter:<model id>": OpenRouter, zero-data-retention routing; only the figure image and
+    the prompts are sent). Results go to the shared cache (key: image + model + prompt version),
+    so attach_cached() then finds them. Bounded concurrency, `retries` retries per figure with
+    backoff; a figure that still fails is counted, never fatal. With OPENROUTER_OFFLINE set,
+    nothing is sent: the figures still missing are counted under "offline". Counts only (no
+    text, no exception messages): to_describe, described_now, failed, offline, already_cached,
+    no_image, unsupported_model. `runner` replaces the OpenRouter client (tests).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from docling_core.types.doc import TextItem
+
+    stats = {"to_describe": 0, "described_now": 0, "failed": 0, "offline": 0, "already_cached": 0,
+             "no_image": 0, "unsupported_model": 0}
+    entries = _cache_entries(cache_dir, model)
+    doc_key = document_key(doc)
+    todo = []
+    for pic, page, box, img in _figures(doc):
+        if img is None:
+            stats["no_image"] += 1
+            continue
+        if _cached_result(entries, cache_key(img, model), doc_key, page, box) is not None:
+            stats["already_cached"] += 1
+            continue
+        todo.append((pic, page, box, img))
+    stats["to_describe"] = len(todo)
+    if not todo:
+        return stats
+    if runner is None:
+        if not model.startswith("openrouter:"):
+            stats["unsupported_model"] = len(todo)  # local models are a research path (main()), not the service's
+            return stats
+        from retrieve import offline
+
+        if offline():
+            stats["offline"] = len(todo)
+            return stats
+        runner = OpenRouterRunner(model.split(":", 1)[1])
+
+    def one(pic, page, box, img) -> bool:
+        ocr = " ".join(it.text for it, _ in doc.iterate_items(root=pic, traverse_pictures=True)
+                       if isinstance(it, TextItem))
+        for attempt in range(retries + 1):
+            try:
+                describe(runner, img, _figure_class(pic), ocr, cache_dir, page, box, doc_key)
+                return True
+            except Exception as exc:  # noqa: BLE001 - one figure must not stop the document
+                log.warning("Figure on p.%d: %s (attempt %d of %d)", page, type(exc).__name__, attempt + 1,
+                            retries + 1)
+                if attempt < retries:
+                    time.sleep(backoff * (attempt + 1))
+        return False
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = [pool.submit(one, *t) for t in todo]
+        for k, fut in enumerate(as_completed(futures), start=1):
+            stats["described_now" if fut.result() else "failed"] += 1
+            if progress is not None:
+                progress("figures", k, len(todo))
+    return stats
+
+
 def attach_cached(doc, model: str, cache_dir: Path) -> dict[str, int]:
     """Attach cached VLM results to the document's figures (no model is run).
 
@@ -340,24 +431,12 @@ def attach_cached(doc, model: str, cache_dir: Path) -> dict[str, int]:
     from docling_core.types.doc.document import DescriptionMetaField
     from docling_core.types.doc.labels import CodeLanguageLabel
 
-    entries = []
-    for f in cache_dir.glob("*.json"):
-        r = FigureResult(**json.loads(f.read_text(encoding="utf-8")))
-        if r.model == model and r.prompt_version == PROMPT_VERSION:
-            entries.append((f.stem, r))
+    entries = _cache_entries(cache_dir, model)
     stats = {"described": 0, "mermaid": 0, "missing": 0}
     doc_key = document_key(doc)
-    for pic in doc.pictures:
-        if skip_figure(pic, doc) or not pic.prov:
-            continue
-        page = pic.prov[0].page_no
-        b = pic.prov[0].bbox.to_bottom_left_origin(doc.pages[page].size.height)
-        box = [b.l, b.t, b.r, b.b]
-        img = pic.get_image(doc)
-        key = cache_key(img.convert("RGB"), model) if img is not None else None
-        res = next((r for k, r in entries if k == key), None) or next(
-            (r for _, r in entries if r.doc_key == doc_key and r.page == page and r.bbox
-             and _iou(r.bbox, box) >= 0.8), None)
+    for pic, page, box, img in _figures(doc):
+        key = cache_key(img, model) if img is not None else None
+        res = _cached_result(entries, key, doc_key, page, box)
         if res is None:
             stats["missing"] += 1
             log.warning("No cached %s result for the figure on p.%d; run figure_vlm.py for it", model, page)

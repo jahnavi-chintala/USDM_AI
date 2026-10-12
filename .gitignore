@@ -6,8 +6,24 @@
 !/.gitignore
 !/.env.example
 !/README.md
+!/DEPLOY.md
 !/requirements.txt
+!/requirements.in
+!/requirements.lock
+!/Dockerfile
+!/.dockerignore
+!/docker-compose.yml
+!/.gitattributes
 !/*.py
+
+!/docker/
+/docker/*
+!/docker/*.py
+!/docker/*.sh
+
+!/scripts/
+/scripts/*
+!/scripts/*.py
 
 !/docs/
 /docs/*
@@ -16,6 +32,10 @@
 !/tests/
 /tests/*
 !/tests/*.py
+
+!/service/
+/service/*
+!/service/*.py
 
 !/tools/
 /tools/*
@@ -38,6 +58,7 @@
 !/reports/eval/scripts/gold_validate.py
 !/reports/eval/scripts/inspect_answers.py
 !/reports/eval/scripts/phase2_rerun.py
+!/reports/eval/scripts/regression_snapshot.py
 
 __pycache__/
 *.pyc

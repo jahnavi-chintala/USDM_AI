@@ -185,6 +185,29 @@ def first_row_is_header(texts: list[list[str]]) -> bool:
         for t in first)
 
 
+_SOA_ROWS: list[tuple[Any, dict[str, set[int]]]] = []  # (document, rows) for the last two documents
+
+
+def soa_section_rows(doc: DoclingDocument) -> dict[str, set[int]]:
+    """Table ref -> grid rows that soa.py reads as section headings although they hold only a label
+    (Schedules of Activities without rows across the table). Computed once per document; {} when soa.py
+    finds nothing or fails."""
+    for d, rows in _SOA_ROWS:
+        if d is doc:
+            return rows
+    rows: dict[str, set[int]] = {}
+    try:
+        from soa import _index, extract_soa
+
+        for s in extract_soa(doc, _index(doc)):
+            for x in s.get("section_rows", []):
+                rows.setdefault(x["table_id"], set()).add(x["row"])
+    except Exception:  # noqa: BLE001 - the serializer works without it (label-only rows stay plain lines)
+        rows = {}
+    _SOA_ROWS[:] = [*_SOA_ROWS[-1:], (doc, rows)]
+    return rows
+
+
 class ProtocolTableSerializer(MarkdownTableSerializer):
     """Tables as self-describing row lines ("rows") or compact Markdown.
 
@@ -203,7 +226,9 @@ class ProtocolTableSerializer(MarkdownTableSerializer):
         the note is stated once on the Columns line ("(header note: ...)");
       * a full-width body row is a section: written once as "Section: ...",
         and its short name prefixes the labels of the rows beneath it until
-        the next section ("Section name › Row label: ...");
+        the next section ("Section name › Row label: ..."); so is a label-only
+        row of a Schedule of Activities that soa.py reads as a section heading
+        (soa_section_rows);
       * a body row repeating the header's row-label cell starts a new block of
         column labels (stacked header): it is written as "Label: a | b | ..."
         and the rows below use its labels.
@@ -337,6 +362,7 @@ class ProtocolTableSerializer(MarkdownTableSerializer):
         entries = cls._columns_entries(head, n_cols, alias)
 
         stub = "".join("".join(t.split()).lower() for t in dict.fromkeys(texts[r][0] for r in range(n_head)) if t)
+        section_rows = soa_section_rows(doc).get(item.self_ref, set())
         lines, section, r = [], "", n_head
         while r < len(grid):
             row = grid[r]
@@ -358,9 +384,10 @@ class ProtocolTableSerializer(MarkdownTableSerializer):
                     lines.append(f"{label}: {' | '.join(vals)}" if vals else label)
                 r = end
                 continue
-            # A section row: one cell across every column.
-            if (n_cols > 1 and len(starting) == 1 and starting[0].start_col_offset_idx == 0
-                    and starting[0].end_col_offset_idx >= n_cols and label):
+            # A section row: one cell across every column, or a label-only row that soa.py reads as the
+            # heading of the activities below it (a Schedule of Activities without rows across it).
+            if (n_cols > 1 and len(starting) == 1 and starting[0].start_col_offset_idx == 0 and label
+                    and (starting[0].end_col_offset_idx >= n_cols or r in section_rows)):
                 lines.append(f"Section: {label}")
                 section = cls._section_name(label)
                 r += 1
@@ -857,6 +884,10 @@ def doc_metadata(doc: DoclingDocument, json_path: Path,
         date = _most_frequent(counts, order)
 
     sha = hashlib.sha256(json_path.read_bytes()).hexdigest()[:16]
+    # The document key comes from the source PDF (Docling's binary_hash, recorded by convert_protocol): the same
+    # PDF gets the same chunk ids on every platform and in every run. A JSON without an origin (converted before
+    # it was recorded) falls back to the JSON's hash.
+    pdf_hash = f"{doc.origin.binary_hash:016x}" if doc.origin is not None else None
     meta = {
         "doc_name": doc.name,
         "protocol_id": pid,
@@ -866,8 +897,9 @@ def doc_metadata(doc: DoclingDocument, json_path: Path,
         "version_date": date,
         "source_json": json_path.name,
         "source_sha256": sha,
+        "source_pdf_hash": pdf_hash,
         "version_label": " ".join(version) if version else None,
-        "doc_key": f"doc-{sha[:12]}",
+        "doc_key": f"doc-{(pdf_hash or sha)[:12]}",
     }
     for key, value in (explicit or {}).items():
         if key not in META_FIELDS:
@@ -1002,7 +1034,7 @@ def doc_prefix(meta: dict[str, Any]) -> str:
 
 def chunk_id_base(meta: dict[str, Any]) -> str:
     """"C1234567-A4" when id and amendment are known (keeps existing ids and caches valid),
-    else the source-sha document key, so ids never collide across documents or read "None"."""
+    else the document key from the source PDF's hash, so ids never collide across documents or read "None"."""
     if meta["protocol_id"] and meta["amendment"]:
         return f"{meta['protocol_id']}-A{meta['amendment']}"
     return meta["doc_key"]
@@ -1193,24 +1225,49 @@ def main() -> None:
     logging.getLogger("transformers").setLevel(logging.ERROR)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("docling_core.types.doc.items.picture.picture").setLevel(logging.WARNING)  # "sequence longer than max" noise
-    src, out = Path(args.json), Path(args.out)
+    chunk_document(Path(args.json), Path(args.out), tokenizer=args.tokenizer, max_tokens=args.max_tokens,
+                   table_format=args.table_format, merge_peers=not args.no_merge_peers, prefix=args.prefix,
+                   explicit_meta=dict(kv.split("=", 1) for kv in args.meta), quiet_text=args.quiet_text,
+                   parent_min=args.parent_min, parent_max=args.parent_max)
+
+
+def _relative_image_path(uri: str | None, root: Path) -> str | None:
+    """A figure's image as a posix path relative to the folder of the Docling JSON ("images/image_000.png"), so
+    chunk records do not depend on where the document is stored (Docling writes \\ on Windows)."""
+    if not uri or uri.startswith("data:") or "://" in uri:
+        return None
+    path = Path(uri.replace("\\", "/"))
+    if path.is_absolute():
+        try:
+            path = path.relative_to(root)
+        except ValueError:
+            return path.name
+    return path.as_posix()
+
+
+def chunk_document(src: Path, out: Path, *, tokenizer: str = "Qwen/Qwen3-Embedding-8B", max_tokens: int = 512,
+                   table_format: str = "rows", merge_peers: bool = True, prefix: str | None = None,
+                   explicit_meta: dict[str, str] | None = None, quiet_text: bool = False,
+                   parent_min: int = 300, parent_max: int = 1500) -> dict:
+    """Chunk one converted document (Docling JSON `src`) into `out`: chunks.jsonl, parents.jsonl,
+    sections.json, tables.jsonl, glossary.json, abbreviations.json and stats.json (returned).
+    quiet_text logs counts only (confidential documents)."""
     out.mkdir(parents=True, exist_ok=True)
 
     doc = DoclingDocument.load_from_json(src)
-    explicit = dict(kv.split("=", 1) for kv in args.meta)
-    meta = doc_metadata(doc, src, explicit)
-    prefix = args.prefix if args.prefix is not None else doc_prefix(meta)
+    meta = doc_metadata(doc, src, explicit_meta or {})
+    prefix = prefix if prefix is not None else doc_prefix(meta)
     id_base = chunk_id_base(meta)
-    if args.quiet_text:
+    if quiet_text:
         log.info("Document fields found: %s", {k: bool(meta[k]) for k in META_FIELDS})
     else:
         log.info("Document: %s", meta)
 
-    provider = ProtocolSerializerProvider(args.table_format)
+    provider = ProtocolSerializerProvider(table_format)
     chunker = ProtocolChunker(
-        tokenizer=build_tokenizer(args.tokenizer, args.max_tokens),
+        tokenizer=build_tokenizer(tokenizer, max_tokens),
         serializer_provider=provider,
-        merge_peers=not args.no_merge_peers,
+        merge_peers=merge_peers,
         doc_prefix=prefix,
     )
     chunks = list(chunker.chunk(dl_doc=doc))
@@ -1269,7 +1326,7 @@ def main() -> None:
                 uri = str(p.image.uri) if p.image and p.image.uri else None
                 rec["figures"].append({
                     "figure_id": p.self_ref, "class": f["class"], "caption": f["caption"] or None,
-                    "image_path": (img_root / uri).as_posix() if uri else None,
+                    "image_path": _relative_image_path(uri, img_root),
                     "has_description": bool(f["description"]), "has_mermaid": bool(f["mermaid"]),
                 })
         records.append(rec)
@@ -1284,7 +1341,7 @@ def main() -> None:
     import parents as parents_mod
 
     index = parents_mod.section_index(doc)
-    store = parents_mod.ParentStore(doc, index, records, chunker.tokenizer, args.parent_min, args.parent_max,
+    store = parents_mod.ParentStore(doc, index, records, chunker.tokenizer, parent_min, parent_max,
                                     serializer=serializer)
     store.annotate(records)
     parent_stats = store.stats()
@@ -1338,10 +1395,10 @@ def main() -> None:
     toks = sorted(r["n_tokens"] for r in records)
     pct = lambda q: toks[min(len(toks) - 1, int(q * len(toks)))]  # noqa: E731
     bins = Counter(min(t // 64, 8) for t in toks)
-    checks = quality_checks(doc, records, serializer, args.max_tokens)
+    checks = quality_checks(doc, records, serializer, max_tokens)
     stats = {
-        "settings": {"tokenizer": args.tokenizer, "max_tokens": args.max_tokens,
-                     "table_format": args.table_format, "merge_peers": not args.no_merge_peers,
+        "settings": {"tokenizer": tokenizer, "max_tokens": max_tokens,
+                     "table_format": table_format, "merge_peers": merge_peers,
                      "prefix": prefix},
         "document": meta,
         "chunks": len(records),
@@ -1366,13 +1423,13 @@ def main() -> None:
     log.info("Chunk types: %s", stats["chunk_types"])
     log.info("Chunks containing label: %s", stats["chunks_containing_label"])
     for cid, n, kind, sec in stats["largest"]:
-        if args.quiet_text:  # chunk ids may contain the protocol id
+        if quiet_text:  # chunk ids may contain the protocol id
             log.info("  largest: %4d tokens  %s", n, kind)
         else:
             log.info("  largest: %s %4d tokens  %-8s %s", cid, n, kind, (sec or "")[:60])
     for name, val in checks.items():
         (log.warning if val and name not in INFO_CHECKS else log.info)(
-            "Check %s: %d %s", name, len(val), "" if args.quiet_text or not val else val[:8])
+            "Check %s: %d %s", name, len(val), "" if quiet_text or not val else val[:8])
     log.info("Parents (%s index): %d %s | tokens median/p90/max %d/%d/%d | under min %d, non-table over max %d",
              parent_stats["index"], parent_stats["parents"], parent_stats["kinds"], parent_stats["tokens"]["median"],
              parent_stats["tokens"]["p90"], parent_stats["tokens"]["max"], parent_stats["under_min"],
@@ -1382,11 +1439,12 @@ def main() -> None:
                     parent_stats["chunks_mapped"], len(records), parent_stats["chunks_in_several_parents"],
                     parent_stats["chunks_without_unit"])
     ids = meta["identifiers"]
-    if args.quiet_text:
+    if quiet_text:
         log.info("Identifiers found: %s", {k: bool(ids.get(k)) for k in ("sponsor_protocol_id", *IDENTIFIER_PATTERNS)})
     else:
         log.info("Identifiers: %s", {k: ids.get(k) for k in ("sponsor_protocol_id", *IDENTIFIER_PATTERNS)})
     log.info("Outputs written to %s", out.resolve())
+    return stats
 
 
 if __name__ == "__main__":

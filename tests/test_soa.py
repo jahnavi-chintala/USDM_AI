@@ -242,6 +242,31 @@ def test_label_only_section_rows() -> None:
     acts = {a["label"]: a["section"] for a in s["activities"]}
     assert acts == {"Informed consent": "Eligibility", "Inclusion criteria": "Eligibility",
                     "PD sampling (see manual)": "Eligibility", "Vital signs": "Safety"}, acts
+    assert s["section_rows"] == [{"table_id": "#/tables/0", "row": 1}, {"table_id": "#/tables/0", "row": 5}]
+    # The chunk serializer writes the same rows as sections and carries them into the row labels below.
+    from chunk_protocol import ProtocolSerializerProvider, ProtocolTableSerializer, soa_section_rows
+
+    assert soa_section_rows(d) == {"#/tables/0": {1, 5}}
+    _, lines = ProtocolTableSerializer.columns_and_rows(d.tables[0], d, ProtocolSerializerProvider().get_serializer(d))
+    assert lines[:2] == ["Section: Eligibility", "Eligibility › Informed consent: Screening = X"], lines
+    assert "Section: Safety" in lines and lines[-1].startswith("Safety › Vital signs: ")
+    assert "Eligibility › PD sampling (see manual)" in lines  # an empty activity stays a row under its section
+
+
+def test_label_only_rows_with_sections_across_not_carried() -> None:
+    """With sections across the table, soa.py keeps a label-only row as an activity, and so does the chunker."""
+    d = new_doc()
+    rows = [["Procedure", "Screening", "Day 1", "Day 8", "Day 15", "EOT"],
+            ["Tumor imaging (see 8.1)", "", "", "", "", ""], ["Informed consent", "X", "", "", "", ""],
+            ["Vital signs", "X", "X", "X", "X", "X"], ["ECG", "X", "", "X", "", "X"]]
+    cells = grid_rows(rows[:1], header=1) + [C("Clinical assessments", 1, 0, cs=6)] + grid_rows(rows[1:], start=2)
+    add_table(d, cells, pv(1, 560, 100))
+    [s] = soa.extract_soa(d)
+    assert s["section_rows"] == [] and by_label(s["activities"], "Tumor imaging (see 8.1)")["section"] == \
+        "Clinical assessments"
+    from chunk_protocol import soa_section_rows
+
+    assert soa_section_rows(d) == {}
 
 
 def test_header_windows_stub_units_and_split_column() -> None:

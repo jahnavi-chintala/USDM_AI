@@ -44,6 +44,19 @@ depend on resolution. For every raw (per-page, pre-merge) table fragment:
    done when a boundary has no clean gap, a spanning cell shares a row band
    with cells ending or starting at its boundary, or text above the top /
    below the bottom rule holds several TableFormer rows (logged reasons).
+7. Text rows (optional, on by default): in a table whose rules do not separate
+   its body rows (booktabs, row-group rules: disagree_not_ruled; optionally
+   also tables without rules) the rows still come from TableFormer, which
+   sometimes makes the second line of a wrapped cell a row of its own. Such a
+   one-cell row is joined to the row above when the text layer shows a wrapped
+   line, not a row: the row above starts several cells on one line, the line
+   is closer to it than the table's row pitch (and not farther than its
+   within-cell line pitch), with the same font, size, weight, colour and
+   shading, aligned with the cell above, not numbered or bulleted, no rule in
+   between, outside the header band, and the next row does not look like the
+   members of a group it would label (empty or indented first column). Logged
+   as text_rows_joined / text_rows_candidates / text_rows_reasons (numbers);
+   the word multiset is kept (`join_text_rows`).
 
 Header cells holding two text blocks separated by a blank line (a column name
 with a note under it) get a newline between the blocks, so the chunk
@@ -56,6 +69,7 @@ Every decision is geometric; nothing is protocol- or string-specific.
 from __future__ import annotations
 
 import ctypes
+import re
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -133,13 +147,9 @@ class Char:
         self.cx, self.cy = (self.l + self.r) / 2, (self.b + self.t) / 2
 
 
-def page_chars(page: pdfium.PdfPage, frame: PageFrame) -> list[Char]:
-    """Printed characters of a page in content-stream order (whitespace and pdfium's
-    generated spaces/line breaks left out), in the Docling page frame."""
-    tp = page.get_textpage()  # keep the object alive: its finalizer closes the raw handle
-    raw = tp.raw
+def _printed(raw, frame: PageFrame):
+    """(text-page index, Char) of the printed characters of a text page, in stream order."""
     l, r, b, t = ctypes.c_double(), ctypes.c_double(), ctypes.c_double(), ctypes.c_double()
-    out = []
     for i in range(pr.FPDFText_CountChars(raw)):
         u = pr.FPDFText_GetUnicode(raw, i)
         if not u or pr.FPDFText_IsGenerated(raw, i) == 1:
@@ -151,7 +161,50 @@ def page_chars(page: pdfium.PdfPage, frame: PageFrame) -> list[Char]:
         if ch.isspace():
             continue
         pr.FPDFText_GetCharBox(raw, i, l, r, b, t)
-        out.append(Char(ch, *frame.box(l.value, b.value, r.value, t.value)))
+        yield i, Char(ch, *frame.box(l.value, b.value, r.value, t.value))
+
+
+def page_chars(page: pdfium.PdfPage, frame: PageFrame) -> list[Char]:
+    """Printed characters of a page in content-stream order (whitespace and pdfium's
+    generated spaces/line breaks left out), in the Docling page frame."""
+    tp = page.get_textpage()  # keep the object alive: its finalizer closes the raw handle
+    return [c for _, c in _printed(tp.raw, frame)]
+
+
+@dataclass(frozen=True, slots=True)
+class CharStyle:
+    """Typography of one printed character: key = (font name without the subset prefix,
+    weight, text render mode, fill colour); size = font size x text matrix scale; base =
+    baseline height (Docling frame)."""
+    key: tuple
+    size: float
+    base: float
+
+
+def char_styles(page: pdfium.PdfPage, frame: PageFrame) -> list[CharStyle]:
+    """CharStyle of each character of `page_chars(page, frame)` (same order)."""
+    tp = page.get_textpage()
+    raw = tp.raw
+    buf = ctypes.create_string_buffer(256)
+    # exactly the binding's pointer types (int* flags, unsigned int* colour): c_long / c_ulong are the same
+    # types on Windows but 64-bit on Linux, where ctypes refuses them (ArgumentError)
+    flags = ctypes.c_int()
+    m = pr.FS_MATRIX()
+    ox, oy = ctypes.c_double(), ctypes.c_double()
+    rgba = [ctypes.c_uint() for _ in range(4)]
+    out = []
+    for i, _ in _printed(raw, frame):
+        n = pr.FPDFText_GetFontInfo(raw, i, buf, 256, flags)
+        name = buf.value.decode("latin-1", "replace") if n else ""
+        if len(name) > 7 and name[6] == "+" and name[:6].isalpha() and name[:6].isupper():
+            name = name[7:]  # subset prefix
+        scale = abs(m.a * m.d - m.b * m.c) ** 0.5 if pr.FPDFText_GetMatrix(raw, i, m) else 1.0
+        obj = pr.FPDFText_GetTextObject(raw, i)
+        render = pr.FPDFTextObj_GetTextRenderMode(obj) if obj else -1
+        color = tuple(c.value for c in rgba[:3]) if pr.FPDFText_GetFillColor(raw, i, *rgba) else None
+        pr.FPDFText_GetCharOrigin(raw, i, ox, oy)
+        out.append(CharStyle((name, pr.FPDFText_GetFontWeight(raw, i), render, color),
+                             pr.FPDFText_GetFontSize(raw, i) * scale, frame.pt(ox.value, oy.value)[1]))
     return out
 
 
@@ -892,6 +945,258 @@ def _virtual_columns(cells: list[TableCell], tokens: list[Token], ys: list, brea
                                     "span_bands_open": n_open}
 
 
+# ---------------------------------------------------------------------------- text rows (no rules between body rows)
+
+# A line that starts a new numbered / bulleted item ("1.", "2.1", "a)", "(iv)", "Part 2", "Cohort B:", "•").
+_NUMBERED = re.compile(
+    r"\s*(?:\(?(?:\d+(?:\.\d+)*|[A-Za-z]|[ivx]{1,5}|[IVX]{1,5})[.)]|\d+(?:\.\d+)+"
+    r"|[A-Z][A-Za-z]*\.?\s+(?:\d+(?:\.\d+)*|[IVX]{1,5}|[A-Z])[.:)]?"
+    r"|[•·▪◦‣∙●○■□➢►*–—-])(?:\s|$)")
+
+
+@dataclass
+class _TextCell:
+    """A TableFormer cell's text lines in the text layer: (baseline, left, right, bottom, top)
+    top to bottom; its dominant style key and median font size."""
+    lines: list
+    key: tuple
+    size: float
+
+    @property
+    def first(self):
+        return self.lines[0]
+
+    @property
+    def last(self):
+        return self.lines[-1]
+
+
+def _text_cell(toks: list[Token], chars: list[Char], styles: list[CharStyle]) -> _TextCell | None:
+    """The cell's lines, or None when a word is not (or only by inheritance) in the text layer
+    or a baseline does not sit in its line (text not upright)."""
+    toks = [tk for tk in toks if tk.norm]
+    if not toks or any(tk.box is None or tk.inherited or not tk.chars for tk in toks):
+        return None
+    lines = []
+    for b, t, ws in _lines(toks):
+        base = median(styles[i].base for tk in ws for i in tk.chars)
+        if not b - 0.5 * (t - b) <= base <= t:
+            return None
+        lines.append((base, min(tk.box[0] for tk in ws), max(tk.box[2] for tk in ws), b, t))
+    idx = [i for tk in toks for i in tk.chars]
+    return _TextCell(lines, Counter(styles[i].key for i in idx).most_common(1)[0][0],
+                     median(styles[i].size for i in idx))
+
+
+def _wide_rule_ys(h: list, toks: list[Token], share: float = 0.9) -> list[float]:
+    """Heights of horizontal rules inside the table's text (words above and below them) that
+    cover at least `share` of the width of the table's words."""
+    boxes = [tk.box for tk in toks if tk.box is not None]
+    if not boxes or not h:
+        return []
+    lo, hi = min(bx[0] for bx in boxes), max(bx[2] for bx in boxes)
+    out = []
+    for y, _, _ in _clusters([y for y, _, _ in h], tol=1.0, sliver=1.0):
+        segs = [(x0, x1) for yy, x0, x1 in h if abs(yy - y) <= 1.0]
+        if (_cover(segs, lo, hi) >= share and any(bx[1] > y for bx in boxes)
+                and any(bx[3] < y for bx in boxes)):
+            out.append(y)
+    return out
+
+
+def join_text_rows(table: TableItem, cells: list[TableCell], tokens: list[Token], chars: list[Char],
+                   styles: list[CharStyle], h_rules: list, fills: list, page_h: float,
+                   trace: list | None = None) -> dict:
+    """Join wrapped continuation lines that TableFormer made rows of their own, in a table
+    whose rules do not separate its body rows (booktabs or unruled).
+
+    A TableFormer row whose text is in one cell only (row span 1, not full width, not a
+    header or section cell) is joined to the row above when all hold:
+    - the row above is a body row with several cells, all starting on the same text line
+      (rows already joined to it count as part of it), and holds a cell in the same columns;
+    - neither row is in the header band: the leading rows up to the first body row (two or
+      more cells, none flagged header), and rows with text above the highest table-wide rule
+      inside the table (the rule under a booktabs header);
+    - no horizontal rule lies between the two lines;
+    - same typography as the cell above (font, weight, render mode, colour, size within 5 %),
+      and the same shading;
+    - it does not start a numbered or bulleted item;
+    - it is aligned with the cell above (left edge with its first line, or centre or right
+      edge with its last line);
+    - the next row has text in the first column, not indented relative to this line (when
+      that column is left-aligned): otherwise this line labels a group of rows;
+    - its baseline distance to the line above (the pitch) is at least 0.6 of the font size,
+      at most the within-cell line pitch of the body (multi-line body cells; +10 %) when
+      there is one, and clearly smaller (by max(1 pt, 10 %)) than the row pitch: the median
+      baseline distance between consecutive body rows of several cells, and the distance
+      to the next row when that is such a row. Without a row pitch nothing is joined.
+    The joined cell's text is the cells' texts top to bottom; rows below move up. Returns
+    counts: candidates, rows joined, rejections by reason (no text). The word multiset of
+    the table is unchanged, else nothing is changed (reason word_multiset_mismatch).
+    trace (diagnostics): receives (row, reason or "joined", pitch, row pitch refs, p_in) per candidate.
+    """
+    out: dict = {"text_rows_candidates": 0, "text_rows_joined": 0}
+    reasons: Counter = Counter()
+    by_cell: dict[int, list[Token]] = defaultdict(list)
+    for tk in tokens:
+        by_cell[tk.cell].append(tk)
+    geo = {ci: _text_cell(by_cell[ci], chars, styles) for ci in range(len(cells))}
+    rows: dict[int, list[int]] = defaultdict(list)
+    for ci, c in enumerate(cells):
+        rows[c.start_row_offset_idx].append(ci)
+    order = sorted(rows)
+    n_cols = table.data.num_cols
+
+    def starts_together(cis: list[int]) -> bool:
+        gs = [geo[ci] for ci in cis]
+        if any(g is None for g in gs):
+            return False
+        bases = [g.first[0] for g in gs]
+        return max(bases) - min(bases) <= 0.3 * median(g.size for g in gs)
+
+    def value_row(r: int) -> bool:
+        cis = rows.get(r, [])
+        return (len(cis) >= 2 and all(cells[ci].row_span == 1 and not cells[ci].column_header for ci in cis)
+                and starts_together(cis))
+
+    # Header band: leading rows before the first body row, and rows with text above the
+    # highest table-wide rule inside the table.
+    head: set[int] = set()
+    for r in order:
+        if value_row(r):
+            break
+        head.add(r)
+    wide = _wide_rule_ys(h_rules, tokens)
+    if wide:
+        y_head = max(wide)
+        head |= {cells[tk.cell].start_row_offset_idx for tk in tokens if tk.box is not None and tk.box[1] > y_head}
+    body = [r for r in order if r not in head]
+    body_set = set(body)
+
+    # Pitches: within body cells (consecutive lines), between consecutive body rows of several cells.
+    in_cell = [a[0] - b[0] for r in body for ci in rows[r] if geo[ci] is not None and not cells[ci].column_header
+               for a, b in zip(geo[ci].lines, geo[ci].lines[1:])]
+    p_in = median(in_cell) if in_cell else None
+
+    def row_pitch(upper: list[int], lower: list[int]) -> float:
+        return min(geo[ci].last[0] for ci in upper) - max(geo[ci].first[0] for ci in lower)
+
+    between = [row_pitch(rows[r], rows[r + 1]) for r in body if r + 1 in body_set and value_row(r) and value_row(r + 1)]
+    p_row = median(between) if between else None
+    # Column 0 alignment: centred when its lines' centres agree and their left edges do not.
+    col0 = [geo[ci].first for r in body for ci in rows[r] if cells[ci].start_col_offset_idx == 0 and geo[ci] is not None]
+    sizes = [geo[ci].size for r in body for ci in rows[r] if geo[ci] is not None]
+    tol0 = max(1.5, 0.25 * median(sizes)) if sizes else 1.5
+    centred0 = (len(col0) >= 2 and max(ln[1] for ln in col0) - min(ln[1] for ln in col0) > tol0
+                and max((ln[1] + ln[2]) / 2 for ln in col0) - min((ln[1] + ln[2]) / 2 for ln in col0) <= tol0)
+
+    def in_fills(ln) -> set:
+        x, y = (ln[1] + ln[2]) / 2, (ln[3] + ln[4]) / 2
+        return {k for k, (l, b, r, t) in enumerate(fills) if l <= x <= r and b <= y <= t}
+
+    groups: list[dict] = []  # {"rows": [...], "cols": {(c0, c1): [ci, ...]}, "value": bool}
+    for r in order:
+        cis = rows[r]
+        g = groups[-1] if groups else None
+        reason = None
+        if len(cis) == 1 and g is not None and g["value"] and r in body_set and g["rows"][-1] == r - 1:
+            ci = cis[0]
+            c = cells[ci]
+            col = (c.start_col_offset_idx, c.end_col_offset_idx)
+            above = g["cols"].get(col)
+            out["text_rows_candidates"] += 1
+            nxt = rows.get(r + 1)
+            pitch = refs = None
+            if c.row_span != 1 or c.column_header or c.row_section or c.col_span >= n_cols > 1:
+                reason = "section_or_span"
+            elif above is None:
+                reason = "no_cell_above"
+            elif geo[ci] is None or any(geo[a] is None for a in above):
+                reason = "unplaced"
+            else:
+                me, up_first, up = geo[ci], geo[above[0]], geo[above[-1]]
+                tol_x = max(1.5, 0.25 * up.size)
+                pitch = up.last[0] - me.first[0]
+                lo_x, hi_x = me.first[1], me.first[2]
+                if any(me.first[4] - 0.5 <= y <= up.last[3] + 0.5 and _cover([(x0, x1)], lo_x, hi_x) >= 0.5
+                       for y, x0, x1 in h_rules):
+                    reason = "rule_between"
+                elif (me.key != up_first.key or abs(me.size - up_first.size) > 0.05 * up_first.size
+                      or in_fills(me.first) != in_fills(up.last)):
+                    reason = "style"
+                elif _NUMBERED.match(c.text):
+                    reason = "numbered"
+                elif not (abs(me.first[1] - up_first.first[1]) <= tol_x
+                          or abs((me.first[1] + me.first[2]) / 2 - (up.last[1] + up.last[2]) / 2) <= tol_x
+                          or abs(me.first[2] - up.last[2]) <= tol_x):
+                    reason = "alignment"
+                else:
+                    n0 = [k for k in (nxt or []) if cells[k].start_col_offset_idx == 0]
+                    if nxt is not None and (not n0 or geo[n0[0]] is None):
+                        reason = "next_row"
+                    elif nxt is not None and not centred0:  # left-aligned first column: indentation
+                        if col[0] == 0:
+                            ref_l = me.first[1]
+                        else:
+                            k0 = next((v[0] for key, v in g["cols"].items() if key[0] == 0), None)
+                            ref_l = geo[k0].first[1] if k0 is not None and geo[k0] is not None else None
+                        if ref_l is None or geo[n0[0]].first[1] > ref_l + tol_x:
+                            reason = "next_row"
+                    if reason is None:
+                        refs = [p for p in (p_row, row_pitch([ci], nxt) if nxt and value_row(r + 1) else None) if p]
+                        if pitch < 0.6 * me.size:
+                            reason = "overlap"
+                        elif not refs:
+                            reason = "no_row_pitch"
+                        elif pitch > min(refs) - max(1.0, 0.1 * min(refs)):
+                            reason = "gap"
+                        elif p_in is not None and pitch > p_in + max(0.5, 0.1 * p_in):
+                            reason = "gap"
+            if trace is not None:
+                trace.append((r, reason or "joined", pitch, refs, p_in))
+            if reason is None:
+                g["rows"].append(r)
+                above.append(ci)
+                continue
+            reasons[reason] += 1
+        groups.append({"rows": [r], "cols": {(cells[ci].start_col_offset_idx, cells[ci].end_col_offset_idx): [ci]
+                                             for ci in cis}, "value": r in body_set and value_row(r)})
+    if reasons:
+        out["text_rows_reasons"] = dict(reasons)
+    removed = sorted(r for g in groups for r in g["rows"][1:])
+    if not removed:
+        return out
+    joined: dict[int, tuple[str, BoundingBox]] = {}
+    drop: set[int] = set()
+    for g in groups:
+        for cis in g["cols"].values():
+            if len(cis) > 1:
+                bbs = [cells[ci].bbox.to_top_left_origin(page_h) for ci in cis]
+                bbox = BoundingBox(l=min(b.l for b in bbs), t=min(b.t for b in bbs), r=max(b.r for b in bbs),
+                                   b=max(b.b for b in bbs), coord_origin=CoordOrigin.TOPLEFT)
+                joined[id(cells[cis[0]])] = (" ".join(cells[ci].text for ci in cis), bbox)
+                drop |= {id(cells[ci]) for ci in cis[1:]}
+    gone = set(removed)
+    new = []
+    for c in table.data.table_cells:
+        if id(c) in drop or (c.start_row_offset_idx in gone and not c.text.strip()):
+            continue
+        r0 = c.start_row_offset_idx - sum(1 for x in removed if x < c.start_row_offset_idx)
+        r1 = c.end_row_offset_idx - sum(1 for x in removed if x < c.end_row_offset_idx)
+        upd = {"start_row_offset_idx": r0, "end_row_offset_idx": r1, "row_span": r1 - r0}
+        if id(c) in joined:
+            upd["text"], upd["bbox"] = joined[id(c)]
+        new.append(c.model_copy(update=upd))
+    if Counter(w for c in table.data.table_cells for w in c.text.split()) != Counter(w for c in new for w in c.text.split()):
+        out["text_rows_reason"] = "word_multiset_mismatch"
+        return out
+    data = TableData(num_rows=table.data.num_rows - len(removed), num_cols=n_cols, table_cells=new)
+    data.orientation = table.data.orientation
+    table.data = data
+    out.update(text_rows_joined=len(removed), rows_after=data.num_rows)
+    return out
+
+
 # ---------------------------------------------------------------------------- driver
 
 class PageCache:
@@ -900,6 +1205,7 @@ class PageCache:
     def __init__(self, pdf: pdfium.PdfDocument):
         self.pdf = pdf
         self._data: dict[int, tuple] = {}
+        self._styles: dict[int, list[CharStyle]] = {}
 
     def __call__(self, page_no: int) -> tuple[list[Char], Rules, PageFrame]:
         if page_no not in self._data:
@@ -907,6 +1213,16 @@ class PageCache:
             frame = PageFrame(page)
             self._data[page_no] = (page_chars(page, frame), page_rules(page, frame), frame)
         return self._data[page_no]
+
+    def styles(self, page_no: int) -> list[CharStyle]:
+        """CharStyle per character of the page (aligned with its chars); computed on demand."""
+        if page_no not in self._styles:
+            chars, _, frame = self(page_no)
+            styles = char_styles(self.pdf[page_no - 1], frame)
+            if len(styles) != len(chars):
+                raise ValueError("character styles not aligned with characters")
+            self._styles[page_no] = styles
+        return self._styles[page_no]
 
 
 def _compare(lat: Lattice, tokens: list[Token], cells: list[TableCell], chars: list[Char]) -> tuple[dict, dict, dict]:
@@ -967,10 +1283,26 @@ def _correct(entry: dict, table: TableItem, cells: list[TableCell], tokens: list
                      header_notes_split=_split_header_notes(new_pairs, lat, note_gap))
 
 
+def _single_cell_rows(cells: list[TableCell]) -> bool:
+    """Some row holds one non-empty cell and the row above it several."""
+    n = Counter(c.start_row_offset_idx for c in cells)
+    return any(k == 1 and n.get(r - 1, 0) >= 2 for r, k in n.items())
+
+
+def _text_rows(entry: dict, table: TableItem, cells: list[TableCell], tokens: list[Token], chars: list[Char],
+               pages: PageCache, page_no: int, h_rules: list, fills: list, page_h: float) -> None:
+    """`join_text_rows` into the entry; an error leaves the table and the lattice verdict as they are."""
+    try:
+        entry.update(join_text_rows(table, cells, tokens, chars, pages.styles(page_no), h_rules, fills, page_h))
+    except Exception as exc:  # noqa: BLE001 - the table stays as TableFormer made it
+        entry["text_rows_reason"] = f"error:{type(exc).__name__}"
+
+
 def check_table(table: TableItem, doc: DoclingDocument, pages: PageCache, mode: str = "correct",
                 min_rule_coverage: float = 0.9, min_text_match: float = 0.9,
                 header_note_gap: float | None = 1.0, *, row_ruled: bool = True,
-                min_row_rule_coverage: float = 0.9, max_col_rule_coverage: float = 0.1) -> dict:
+                min_row_rule_coverage: float = 0.9, max_col_rule_coverage: float = 0.1,
+                text_rows: bool = True, text_rows_unruled: bool = False) -> dict:
     """Verify (and in mode "correct" possibly rebuild) one single-page table; returns its
     log entry (counts, action, reason; no text).
 
@@ -979,7 +1311,14 @@ def check_table(table: TableItem, doc: DoclingDocument, pages: PageCache, mode: 
     vertical rule) is checked against a row-ruled lattice: rows from the horizontal rules,
     columns from TableFormer placed in the whitespace between the columns' words
     (`_virtual_columns`), and rebuilt when at least `min_row_rule_coverage` of the stacked
-    cell pairs are separated by a rule. Such entries carry lattice_mode "rows"."""
+    cell pairs are separated by a rule. Such entries carry lattice_mode "rows".
+
+    text_rows (mode "correct"): in a table whose rules do not settle its rows (action
+    disagree_not_ruled: booktabs, row-group rules) wrapped continuation lines that
+    TableFormer made rows of their own are joined to the row above (`join_text_rows`);
+    text_rows_unruled: also in tables without any rules (skipped: no_rules). The entry
+    then carries text_rows_candidates, text_rows_joined (rows removed), rows_after and
+    text_rows_reasons (rejections by reason); the action is unchanged."""
     entry: dict = {"table": table, "page": table.prov[0].page_no if table.prov else None,
                    "rows_before": table.data.num_rows, "cols_before": table.data.num_cols}
     if len(table.prov) != 1:
@@ -996,6 +1335,7 @@ def check_table(table: TableItem, doc: DoclingDocument, pages: PageCache, mode: 
     tokens, matched = locate_tokens(cells, page_h, chars, box)
     entry["text_match"] = round(matched, 4)
     note_gap = header_note_gap if mode == "correct" else None
+    text_rows = text_rows and mode == "correct" and _single_cell_rows(cells)
     try:
         lat = build_lattice(rules, box, chars)
     except IrregularGrid:
@@ -1003,6 +1343,8 @@ def check_table(table: TableItem, doc: DoclingDocument, pages: PageCache, mode: 
         return entry
     if lat is None:
         entry.update(action="skipped", reason="no_rules")
+        if text_rows and text_rows_unruled and matched >= min_text_match:
+            _text_rows(entry, table, cells, tokens, chars, pages, pno, [], rules.fills, page_h)
         return entry
     col_ruled, col_pairs, row_ruled_pairs, row_pairs = _pair_coverage(cells, page_h, lat)
     n_pairs = col_pairs + row_pairs
@@ -1024,6 +1366,8 @@ def check_table(table: TableItem, doc: DoclingDocument, pages: PageCache, mode: 
         if row_ruled and row_pairs and col_cov <= max_col_rule_coverage:
             _check_rows(entry, table, cells, tokens, chars, rules, box, lat, page_h, mode, note_gap,
                         row_ruled_pairs / row_pairs, row_pairs, min_row_rule_coverage)
+        if text_rows and entry["action"] == "disagree_not_ruled":
+            _text_rows(entry, table, cells, tokens, chars, pages, pno, lat.h, rules.fills, page_h)
     elif mode == "verify":
         entry["action"] = "disagree"
     else:
@@ -1078,7 +1422,8 @@ def correct_tables_with_lattice(doc: DoclingDocument, pdf: pdfium.PdfDocument, l
                                 mode: str = "correct", *, min_rule_coverage: float = 0.9,
                                 min_text_match: float = 0.9, header_note_gap: float | None = 1.0,
                                 row_ruled: bool = True, min_row_rule_coverage: float = 0.9,
-                                max_col_rule_coverage: float = 0.1) -> dict:
+                                max_col_rule_coverage: float = 0.1, text_rows: bool = True,
+                                text_rows_unruled: bool = False) -> dict:
     """Verify every single-page table fragment against the PDF's ruling lines and, in
     mode "correct", rebuild disagreeing fully ruled ones from the lattice.
 
@@ -1093,6 +1438,10 @@ def correct_tables_with_lattice(doc: DoclingDocument, pdf: pdfium.PdfDocument, l
     ("rows" for the row-ruled check) and counts, never text. Returns counts per
     action and skip reason; "corrected" includes row-ruled corrections, which are
     also counted under "corrected_rows" (likewise "verified_ok_rows" etc.).
+    text_rows / text_rows_unruled: join wrapped continuation lines that TableFormer made
+    rows of their own in tables whose rules do not separate the body rows (see
+    `check_table`, `join_text_rows`); counted as "text_rows_tables" (tables changed) and
+    "text_rows_joined" (rows removed).
     """
     if mode not in ("verify", "correct"):
         raise ValueError(f"unknown lattice mode: {mode}")
@@ -1105,7 +1454,8 @@ def correct_tables_with_lattice(doc: DoclingDocument, pdf: pdfium.PdfDocument, l
         try:
             entry = check_table(table, doc, pages, mode, min_rule_coverage, min_text_match, header_note_gap,
                                 row_ruled=row_ruled, min_row_rule_coverage=min_row_rule_coverage,
-                                max_col_rule_coverage=max_col_rule_coverage)
+                                max_col_rule_coverage=max_col_rule_coverage, text_rows=text_rows,
+                                text_rows_unruled=text_rows_unruled)
         except Exception as exc:  # noqa: BLE001 - one odd table must not stop the conversion
             entry = {"table": table, "page": table.prov[0].page_no, "action": "skipped",
                      "reason": f"error:{type(exc).__name__}"}
@@ -1117,4 +1467,7 @@ def correct_tables_with_lattice(doc: DoclingDocument, pdf: pdfium.PdfDocument, l
         if entry.get("lattice_mode") == "rows":
             counts[entry["action"] + "_rows"] += 1
         counts["header_notes_split"] += entry.get("header_notes_split", 0)
+        if entry.get("text_rows_joined"):
+            counts["text_rows_tables"] += 1
+            counts["text_rows_joined"] += entry["text_rows_joined"]
     return dict(counts)

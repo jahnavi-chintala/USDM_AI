@@ -29,7 +29,7 @@ doc.call_tool("quote_check", {"quote": "have a hemoglobin A1c value ≤10% at th
 
 | Tool | Returns | Use it for |
 |---|---|---|
-| `document_info()` | <ul><li>Official and brief title, acronym.</li><li>Sponsor protocol number.</li><li>NCT / EudraCT / EU CT / IND / WHO UTN, **each with the verbatim line it was found in**, page and ref.</li><li>Version, amendment and date.</li><li>Sponsor name, with the method used to find it.</li><li>Cover-page label/value pairs.</li><li>Page, section and SoA-table counts.</li><li>The outermost section of each ICH M11 role.</li><li>Reading-order repairs.</li></ul> | First call: the identity of the study and a plan of where things are. |
+| `document_info()` | <ul><li>Official and brief title, acronym.</li><li>Sponsor protocol number.</li><li>NCT / EudraCT / EU CT / IND / WHO UTN, **each with the verbatim line it was found in**, page and ref.</li><li>Version, amendment and date.</li><li>Sponsor name, with the method used to find it.</li><li>Cover-page label/value pairs.</li><li>Page, section and SoA-table counts.</li><li>The outermost section of each ICH M11 role.</li><li>Reading-order repairs made at read time (outputs converted before post-processing did them; otherwise empty).</li></ul> | First call: the identity of the study and a plan of where things are. |
 | `outline(max_level)` | The section tree. Per section: id, number, title, level, role, first/last page, tokens (subtree and own text), children, number of tables/figures. | Planning which sections to read, and how big they are. |
 | `find_sections(role, query)` | Ranked sections by ICH M11 role and/or fuzzy title. Section numbers work too ("6.2"). | Finding a section whose role tagging is uncertain. |
 | `read_section(section)` | Complete Markdown of a section and its subsections, with per-block provenance. `section` can be an id (`S6.1`), a number (`6.1`) or a role (`inclusion`). | **Every enumeration.** This is complete; `search` is not. |
@@ -89,6 +89,7 @@ Roles follow ICH M11 and the TransCelerate CPT; `structure.ROLE_INFO` lists them
 - Headings end with `{#<section_id>}`.
 - `<!-- p. N -->` (or `<!-- pp. N-M -->`) marks content that starts on a new page.
 - Tables are full GFM tables: caption first, then every row, then `Notes:` with the footnotes.
+- Footnote and reference markers are written with a caret, attached to the word they follow, in text and table cells: `Response^a`, `X^b,c`, `Treatment Phase^a`; exponents too (`10^9/L`). Markers drawn as smaller raised glyphs and markers drawn full size but raised are both detected from the PDF's glyph geometry. `quote_check` ignores the caret in its `normalized` tier.
 - A figure shows:
   - the title;
   - `Text in figure (OCR)`;
@@ -107,16 +108,15 @@ Roles follow ICH M11 and the TransCelerate CPT; `structure.ROLE_INFO` lists them
 
 ### Reading-order repair
 
-Sometimes the converter reads part of a page before that page's heading, even though the text sits below the heading. On Lilly p. 26, criteria `[1b]`, `[2]` and `[3]` ended up under 5.5.
+Sometimes the converter reads part of a page before that page's heading, even though the text sits below the heading. On Lilly p. 26, criteria `[1b]`, `[2]` and `[3]` ended up under 5.5; Lilly's centred chapter headings ("1. Protocol Synopsis", "3. Introduction", "5. Study Design") were read after the text below them.
 
-Post-processing puts such text back under the heading it lies below, in the document itself (`structure.repair_reading_order`, the last post-processing step). The document, the chunks, the parents, the section index and every tool therefore agree. The moves are listed under `reading_order` in the converter's decisions log (`<name>.decisions.json`).
+Post-processing repairs this in the document itself (`structure.repair_reading_order`, the last post-processing step). The document, the chunks, the parents, the section index and every tool therefore agree. The moves are listed under `reading_order` in the converter's decisions log (`<name>.decisions.json`). Two phases:
+1. A heading with a section-number label that was read after text lying below it on its page moves up, before that text. On pages with side-by-side boxes (columns, label/value layouts) only text in the heading's own column counts. Kept only if no accepted section number is lost and the heading's own number is accepted.
+2. Text and list units (never tables or figures), and unnumbered sections as a block with their content, move under the numbered heading they lie below, after that section's text above them on the page. Only on the same page, in the left half of the page, backwards, and under a heading with an accepted section number.
 
-The repair only applies under all of these conditions:
-- text and list units only (never tables or figures), plus unnumbered sections, which move as a block with their content (on Lilly p. 9 the "1. Protocol Synopsis" heading was read after the synopsis fields);
-- the same page;
-- the left half of the page;
-- backwards moves only, and only under a heading with an accepted section number;
-- the rebuilt section index must agree: a move that would not put the text in the target section is undone.
+Every move is checked against the rebuilt section index and undone if the text would not end up where it lies.
+
+A "Label:" heading (such as Lilly's synopsis field "Objectives/Endpoints:") never outranks the numbered heading it follows: it nests one level below it (`structure.nest_colon_labels`).
 
 Outputs converted before this step get the same repair at read time instead (units only). `read_section`, `outline` and the provenance of every tool then use the repaired assignment, and every move is reported:
 - in `document_info().reading_order_repairs`;
@@ -188,9 +188,14 @@ The main protocol (`output/`) is confidential: run the CLI on it locally only, a
 
 - **Content is only as complete as the conversion.**
   - Text the converter dropped cannot be returned.
-  - Reading-order defects that the conservative repair does not cover can still leave text in the wrong section, for example across pages or in two-column layouts. If a list looks short, `quote_check` the missing item's wording, or read the neighbouring sections.
+  - The reading-order repair is conservative: text displaced across pages, in two-column layouts or under an unnumbered heading stays where the converter put it. If a list looks short, `quote_check` the missing item's wording, or read the neighbouring sections.
+- **Table grids are only checked where the PDF draws rules.**
+  - Fully ruled tables are verified against the ruling lines and rebuilt from them when TableFormer's grid disagrees.
+  - Tables ruled with horizontal lines only take their rows from the rules and their columns from TableFormer (row-ruled mode), when the rules separate at least 90% of the rows.
+  - Booktabs-style tables (rules only at the top, under the header and at the bottom) keep TableFormer's grid, except that a one-cell row the text layer shows to be the wrapped continuation of the row above (same style, aligned, tighter than the row spacing, not numbered) is joined to it.
+  - Unruled tables keep TableFormer's grid. A wrapped label with text in two cells can still come out as an extra row. Check a doubtful row with `get_table(id, format="rows")` and `quote_check`.
 - **Roles are tagged automatically** (`role_score` < 0.7 means inherited or weak).
-  - Some headings get the wrong role. For example, Lilly's 3.1–3.2 inherit `soa` because heading 3 is missing.
+  - A heading the converter missed or mis-levelled can make the sections under it inherit the previous section's role.
   - When a role read returns something unexpected, use `outline` and read by section id.
 - **The sponsor name comes from heuristics.**
   - The methods, in order: a cover-page label, a copyright or "property of" line, then a company-name pattern (marked "unverified").

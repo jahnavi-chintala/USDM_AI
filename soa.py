@@ -15,7 +15,7 @@ Contract (one dict per SoA; merged multi-page tables are one table; tables linke
                + "table_id", "epoch_hint", "footnote_markers"}],
    "activities": [{"id": "A1", "label", "section", "notes", "footnote_markers", "row", + "table_id"}],
    "cells": [{"activity", "visit", "mark", "text", "qualifier", "footnote_markers"}],
-   "footnotes": {"a": str, ...}, "header_notes": [str], "warnings": [str]}
+   "footnotes": {"a": str, ...}, "header_notes": [str], "section_rows": [{"table_id", "row"}], "warnings": [str]}
   label = the leaf header text; epoch_hint = the outermost group header spanning >= 2 columns; timing = the
   timing expressions of the header path ('Cycle 1, D8'; bare numbers take the stub's unit: 'W2 15' under
   'Week [W] Study day' -> 'W2 Day 15'), else a pure timing in the window row ('Day -28 to Day -1');
@@ -44,7 +44,8 @@ Structure of one table (all from the grid):
     ('D1 (+-1)', 'W2 15+-4') go to visits[].window too;
   * adjacent grid columns under one header cell whose entries never conflict are one visit;
   * section rows: one cell across the table, a row repeating one text, or (in tables without such rows) a
-    label-only row followed by a filled row -> activities[].section;
+    label-only row followed by a filled row -> activities[].section; the label-only ones are also listed in
+    section_rows (grid row of each source table), so the chunk serializer writes them as sections too;
   * header rows repeated inside the body (each page repeats the header) are dropped.
 Footnote markers: '^a' / '^b,c' (text_reconcile's convention), symbols ('X*', 'Day 1*', 'Phase £ (...)', a
 literal '^'), and, when the letter is a footnote key, bare letters ('X c', 'Xa', 'Screening a', 'b AP00').
@@ -908,12 +909,13 @@ def _build(doc, parts: list[_Part], modes: list[str], index) -> dict:
     # ---- label-only rows: in tables without sections across the table, a row with no entry anywhere that is
     # followed by a filled row is a section heading for the rows below it
     any_spanning = any(p.spanning_sections for p in parts)
-    kept, cur = [], None
+    kept, cur, section_rows = [], None, []
     for k, rec in enumerate(alist):
         a = rec["a"]
         if not any_spanning:
             if rec["blank"] and k + 1 < len(alist) and not alist[k + 1]["blank"]:
                 cur = a["label_raw"]
+                section_rows += [{"table_id": parts[pi].ref, "row": pa["row"]} for pi, pa in rec["src"]]
                 continue
             rec["section_raw"] = cur
         else:
@@ -968,7 +970,8 @@ def _build(doc, parts: list[_Part], modes: list[str], index) -> dict:
             "caption": next((p.caption for p in parts if p.caption), None),
             "section_id": section_id, "pages": sorted({pg for p in parts for pg in p.pages}),
             "visits": visits_out, "activities": activities_out, "cells": cells_out, "footnotes": fn,
-            "header_notes": list(dict.fromkeys(n for p in parts for n in p.header_notes)), "warnings": warnings}
+            "header_notes": list(dict.fromkeys(n for p in parts for n in p.header_notes)),
+            "section_rows": section_rows, "warnings": warnings}
 
 
 def extract_soa(doc, index=None) -> list[dict]:
@@ -1030,7 +1033,7 @@ def extract_soa(doc, index=None) -> list[dict]:
         except Exception as exc:  # noqa: BLE001  fail soft: the caller still sees the table and why it is empty
             out.append({"table_id": parts[0].ref, "table_ids": [q.ref for q in parts], "caption": parts[0].caption or None,
                         "section_id": None, "pages": sorted({pg for q in parts for pg in q.pages}), "visits": [],
-                        "activities": [], "cells": [], "footnotes": {}, "header_notes": [],
+                        "activities": [], "cells": [], "footnotes": {}, "header_notes": [], "section_rows": [],
                         "warnings": [f"extraction failed: {type(exc).__name__}"]})
         i = j
     return out

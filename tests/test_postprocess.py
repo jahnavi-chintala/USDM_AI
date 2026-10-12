@@ -569,6 +569,72 @@ def test_a16_glyphs_fixed_after_list_repair() -> None:
     assert counts["list_items_repaired"] == 1 and li.text == "Criterion 9 age ≥ 18", li.text
 
 
+def test_hyphen_split_paragraph_joined() -> None:
+    # The layout model cut a paragraph into two items at a line ending with a hyphen.
+    d = new_doc(1)
+    a = text(d, "Participants must not have received prior EGFR-", pv(t=700, b=688))
+    text(d, "directed therapy within 4 weeks.", pv(t=685, b=673, r=300))  # the next line, 3 pt below
+    text(d, "A new paragraph.", pv(t=650, b=638))
+    log = {}
+    assert pp.join_hyphen_split_items(d, log) == 1
+    assert a.text == "Participants must not have received prior EGFR- directed therapy within 4 weeks.", a.text
+    assert [t.text for t in d.texts] == [a.text, "A new paragraph."]
+    assert a.prov[0].bbox.b == 673 and a.prov[0].bbox.t == 700  # one box over both lines
+    assert log["hyphen_joins"] == [{"item": a, "page": 1}]
+    # a list item continued on its next line (no marker of its own) is joined too
+    d = new_doc(1)
+    g = d.add_group(label="list")
+    li = d.add_list_item(text="Have received Days 1-", marker="", parent=g, prov=pv(t=700, b=688, l=108))
+    d.add_list_item(text="7 of treatment", marker="", parent=g, prov=pv(t=685, b=673, l=72))
+    assert pp.join_hyphen_split_items(d) == 1 and li.text == "Have received Days 1- 7 of treatment"
+
+
+def test_hyphen_split_not_joined() -> None:
+    cases = [
+        (("Range 1-", pv(t=700, b=688)), ("3 more text", pv(t=670, b=658))),                  # a gap: new paragraph
+        (("Range 1-", pv(t=700, b=688, r=200)), ("3 side note", pv(t=685, b=673, l=300))),    # beside, not below
+        (("Range 1 -", pv(t=700, b=688)), ("3 more text", pv(t=685, b=673))),                 # a dash, not attached
+        (("Range 1-", pv(t=700, b=688)), ("(3) more text", pv(t=685, b=673))),                # not a word
+        (("Range 1-", pv(t=700, b=688)), ("3 more text", pv(2, t=780, b=768))),               # next page
+    ]
+    for (sa, pa), (sb, pb) in cases:
+        d = new_doc(2)
+        text(d, sa, pa)
+        text(d, sb, pb)
+        assert pp.join_hyphen_split_items(d) == 0, (sa, sb)
+    # never past an item with its own list marker
+    d = new_doc(1)
+    g = d.add_group(label="list")
+    d.add_list_item(text="first item ends EGFR-", marker="a)", parent=g, prov=pv(t=700, b=688))
+    d.add_list_item(text="directed agents", marker="b)", parent=g, prov=pv(t=685, b=673))
+    assert pp.join_hyphen_split_items(d) == 0
+    # a heading below is never joined
+    d = new_doc(1)
+    text(d, "Range 1-", pv(t=700, b=688))
+    d.add_heading(text="3 Results", prov=pv(t=685, b=673))
+    assert pp.join_hyphen_split_items(d) == 0
+
+
+def test_single_page_headers_restored_unless_noise() -> None:
+    d = new_doc(4)
+
+    def furn(s: str, page: int, label=DocItemLabel.PAGE_HEADER):
+        return d.add_text(label=label, text=s, prov=pv(page, t=780, b=770), content_layer=ContentLayer.FURNITURE)
+
+    for p in (2, 3, 4):
+        furn("CONFIDENTIAL Clinical Study Protocol No. ABC 1234", p)
+        furn(f"Page {p} of 4", p, DocItemLabel.PAGE_FOOTER)
+    nct = furn("Study ABC-12 NCT #: NCT01234567", 1)  # title-page identifier: content
+    fragment = furn("CONFIDENTIAL Clinical Study Protocol", 1)  # the running header, split differently
+    paging = furn("Version 1.0 Page: 1 of 4", 1)  # a page-number line
+    field = furn("Data Monitoring Committee: Yes", 1, DocItemLabel.PAGE_FOOTER)
+    log = {}
+    assert pp.restore_unique_headers(d, log) == 2
+    assert nct.content_layer == field.content_layer == ContentLayer.BODY
+    assert fragment.content_layer == paging.content_layer == ContentLayer.FURNITURE
+    assert log["restored_headers"] == [{"page": 1, "reason": "single_page_header"}] * 2
+
+
 def test_a17_running_header_heading_kept() -> None:
     d = new_doc(3)
     for p in (1, 2, 3):

@@ -8,6 +8,10 @@ tool API with provenance and quote checks.
 This repository holds code only. Protocol PDFs, converted outputs, caches, embeddings, evaluation
 gold sets and reports stay local and are never committed (see `.gitignore`).
 
+**As a service:** one Docker container with a REST API, an MCP server (HTTP at `/mcp` and stdio) and a
+background worker: upload a PDF, poll the job, call the tools. Build, run, configuration, backups, MCP
+setup, data handling and the pre-hosting checklist: [DEPLOY.md](DEPLOY.md). The code is in `service/`.
+
 ## Setup
 
 - Python 3.13 (tested), CPU is enough (float32). `python -m venv .venv`, then
@@ -44,7 +48,7 @@ Set `OPENROUTER_OFFLINE=1` to forbid any API call: cache misses then raise inste
 | Text repair | `text_reconcile.py` | superscripts / subscripts / footnote markers ("10^9/L", "Response^a"), dropped line-end hyphens, merged words, cover-page label/value pairs, all from pdfium glyph geometry |
 | Tables | `table_lattice.py`, `table_merge.py` | TableFormer grids verified against the PDF's ruling lines and rebuilt on fully ruled (and row-ruled) tables; page-split tables merged |
 | Structure | `structure.py` | heading levels from outline / numbering / TOC, section tree with stable ids and ICH M11 roles, reading-order repair |
-| Figures | `figure_vlm.py` | optional AI figure descriptions and Mermaid, attached from a cache (the pipeline never calls a model itself) |
+| Figures | `figure_vlm.py` | AI figure descriptions and Mermaid, cached per image; the service describes uncached figures at ingest, the command-line conversion only attaches cached ones |
 | Chunking | `chunk_protocol.py`, `parents.py`, `glossary.py` | 512-token chunks with section ids and roles, structural parent units, self-describing table rows, abbreviation glossary |
 | Retrieval | `retrieve.py`, `embed_chunks.py` | BM25 + dense (qwen3-embedding-8b) + qwen3-reranker-8b; parent-aware context builder (`production_builder`) |
 | Schedule of Activities | `soa.py` | visits with windows, activities, marks with qualifiers and footnotes |
@@ -54,15 +58,19 @@ Set `OPENROUTER_OFFLINE=1` to forbid any API call: cache misses then raise inste
 
 ## Tests
 
-No pytest needed: `.venv\Scripts\python tests\test_<name>.py` for each file in `tests/`. Most
-tests build synthetic documents and PDFs; `test_protocol_api.py`, `test_soa.py` and
-`test_usdm_gold.py` also read converted public protocols from `output_public/` when present.
+No pytest needed: `.venv\Scripts\python tests\test_<name>.py` for each file in `tests/`.
+- Most tests build synthetic documents and PDFs.
+- `test_protocol_api.py`, `test_soa.py` and `test_usdm_gold.py` also read converted public protocols from `output_public/` when present.
+- The service suites (`test_service_*.py`) also run inside the image (`docker run --rm --network none protocol-service:test`).
+- `scripts/smoke_test.py` tests a running service end to end.
 
 ## Data handling
 
 - Documents and everything derived from them (outputs, chunks, embeddings, caches, gold sets,
   reports) are local only.
-- Steps that send content off-machine (figure descriptions, embeddings, answers, judging) are
-  explicit commands, use OpenRouter with `{"data_collection": "deny", "zdr": true,
-  "allow_fallbacks": false}`, and refuse to run under `OPENROUTER_OFFLINE=1`.
+- Content leaves the machine only through OpenRouter, always with `{"data_collection": "deny",
+  "zdr": true, "allow_fallbacks": false}`, and never under `OPENROUTER_OFFLINE=1`.
+  - On the command line these are explicit commands: figure descriptions, embeddings, answers, judging.
+  - The service does it automatically: figure descriptions and chunk embeddings at ingest, the query and
+    reranking at search. See [DEPLOY.md](DEPLOY.md#6-data-handling).
 - `test_protocols.py` reports private protocols as P1, P2, ... with aggregate numbers only.

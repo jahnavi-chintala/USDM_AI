@@ -30,6 +30,7 @@ sent anywhere.
 import hashlib
 import json
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -38,7 +39,7 @@ from pathlib import Path
 import numpy as np
 
 RRF_K = 60  # standard RRF constant
-RERANK_MODEL = "qwen/qwen3-reranker-8b"
+RERANK_MODEL = os.environ.get("RERANK_MODEL") or "qwen/qwen3-reranker-8b"  # the service's RERANK_MODEL setting
 RERANK_URL = "https://openrouter.ai/api/v1/rerank"
 CANDIDATES_PER_RANKER = 20
 _TOKEN = re.compile(r"[a-z0-9]+")
@@ -52,25 +53,33 @@ _IDENTIFIER = re.compile(r"\b([a-z]+)\s+(\d+(?:\.\d+)*[a-z]?)\b")
 RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 
 
+class OfflineRefused(RuntimeError):
+    """OPENROUTER_OFFLINE is set and the operation would have called OpenRouter."""
+
+
+def offline() -> bool:
+    return os.environ.get("OPENROUTER_OFFLINE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def require_online() -> None:
     """Refuse API calls when OPENROUTER_OFFLINE=1 (cache-only runs: a cache miss is an error)."""
-    import os
-
-    if os.environ.get("OPENROUTER_OFFLINE") == "1":
-        raise RuntimeError("OPENROUTER_OFFLINE=1: this run would call OpenRouter (cache miss); refusing")
+    if offline():
+        raise OfflineRefused("OPENROUTER_OFFLINE=1: this run would call OpenRouter (cache miss); refusing")
 
 
 def post_with_retry(url: str, body: dict, key: str, attempts: int = 6, timeout: int = 300):
-    """POST to OpenRouter, retrying rate limits and provider overloads with backoff."""
+    """POST to OpenRouter (the process's shared client), retrying rate limits and provider overloads with backoff."""
     import time
 
     import httpx
+
+    from openrouter_http import post_json
 
     require_online()
 
     for attempt in range(1, attempts + 1):
         try:
-            resp = httpx.post(url, json=body, timeout=timeout, headers={"Authorization": f"Bearer {key}"})
+            resp = post_json(url, body, key, timeout=timeout)
         except httpx.TransportError:
             if attempt == attempts:
                 raise

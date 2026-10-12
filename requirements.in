@@ -1,0 +1,35 @@
+# Direct dependencies of the protocol service image: the third-party imports of service.runtime.runtime_files()
+# (tests/test_docker_packaging.py checks that each one is listed here), the packages the service needs without
+# importing them, and the image build's own (docker/fetch_models.py).
+#
+# requirements.lock pins these and everything they need for the Linux image (CPython 3.13, x86_64): the versions
+# of the host venv (requirements.txt, a pip freeze on Windows) without the Windows-only packages (colorama,
+# pywin32, tzdata). torch and torchvision are installed from the PyTorch CPU index, never from PyPI (Dockerfile).
+# A package that only Linux needs is resolved by pip during the build (the build log lists it); fold it into
+# the lock from the built image:
+#   docker run --rm protocol-service pip freeze > freeze.txt
+#   python docker/lock_report.py freeze.txt --write
+docling              # PDF conversion; `import docling` comes from docling-slim[standard], which this pulls in
+docling-core         # DoclingDocument, chunking, serialisers
+docling-ibm-models   # layout model, TableFormer, picture classifier (no direct import: Docling's model stages)
+docling-parse        # text layer of the hybrid backend (hybrid_backend.py)
+rapidocr             # bitmap OCR, torch backend (convert_protocol.py, figure_ocr.py)
+pypdfium2            # page rendering, figure crops, PDF inspection
+torch                # CPU build from https://download.pytorch.org/whl/cpu (RapidOCR torch backend, Docling models)
+torchvision          # CPU build, same index (Docling models)
+transformers         # Qwen3 tokenizer (chunk_protocol, protocol_api, retrieve), Docling models
+huggingface-hub      # model cache (docker/fetch_models.py, offline lookups)
+numpy
+pillow
+PyYAML               # protocol_settings.py
+semchunk             # chunk_protocol.py
+httpx                # OpenRouter calls (figure descriptions, embeddings, reranking)
+jsonschema           # tool argument validation (protocol_api.py, service/mcp_server.py)
+pydantic
+fastapi              # REST API (service/api.py)
+starlette
+uvicorn              # `python -m service.api`
+python-multipart     # FastAPI multipart uploads (POST /documents); not imported directly
+mcp                  # MCP server: Streamable HTTP at /mcp and stdio (service/mcp_server.py, service/mcp_stdio.py)
+mcp-types
+anyio
