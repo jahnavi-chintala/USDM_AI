@@ -377,15 +377,26 @@ class ContextBuilder:
         left out when nothing new remains; a synopsis parent is considered after the body parent that
         repeats it, so the body copy is the one shown whole;
       * definitions of abbreviations as in chunk mode; page-split table chains stay together.
+
+    The keyword-only doc / serializer / tok / index / tables take what the caller already holds for this document
+    (a ProtocolDocument's own objects; index as parents.section_index returns it, tables as {table_id: record} of
+    tables.jsonl) instead of loading or building it again. The tokenizer, when not given, is the process-wide one
+    of tokenizer_cache.
+
+    Not thread-safe: use one lock per document, as service.app_service does (the document, its section index and the
+    search builder share lazily built state).
     """
+
+    _index = None  # the section index given to __init__; None: the parent store builds it from self.doc
 
     def __init__(self, retriever: Retriever, doc_json: str | Path | None = None,
                  tokenizer: str = "Qwen/Qwen3-Embedding-8B", budget: int = CONTEXT_BUDGET,
-                 mode: str = "chunks", identity: bool = True, section_expand: bool = True):
+                 mode: str = "chunks", identity: bool = True, section_expand: bool = True, *,
+                 doc=None, serializer=None, tok=None, index=None, tables: dict | None = None):
         from docling_core.types.doc import DoclingDocument
-        from transformers import AutoTokenizer
 
         from chunk_protocol import ProtocolSerializerProvider
+        from tokenizer_cache import shared_tokenizer
 
         if mode not in ("chunks", "parents"):
             raise ValueError(f"mode must be 'chunks' or 'parents', not {mode!r}")
@@ -406,12 +417,17 @@ class ContextBuilder:
         if retriever.source_sha256 and sha != retriever.source_sha256:
             raise RuntimeError(f"{path} (sha {sha}) is not the JSON these chunks were made from "
                                f"(sha {retriever.source_sha256}); re-run chunk_protocol.py or pass the right file")
-        self.doc = DoclingDocument.load_from_json(path)
-        self.serializer = ProtocolSerializerProvider().get_serializer(self.doc)
-        self.tok = AutoTokenizer.from_pretrained(tokenizer)
-        tables_file = retriever.cache_dir / "tables.jsonl"
-        self.tables = {t["table_id"]: t for t in map(
-            json.loads, tables_file.read_text(encoding="utf-8").splitlines())}
+        # What the caller already holds (a ProtocolDocument: its document, serializer, tokenizer, section index and
+        # tables) replaces the load or build; the SHA check above covers doc_json in every case.
+        self.doc = doc if doc is not None else DoclingDocument.load_from_json(path)
+        self.serializer = (serializer if serializer is not None
+                           else ProtocolSerializerProvider().get_serializer(self.doc))
+        self.tok = tok if tok is not None else shared_tokenizer(tokenizer)
+        self._index = index
+        if tables is None:
+            tables_file = retriever.cache_dir / "tables.jsonl"
+            tables = {t["table_id"]: t for t in map(json.loads, tables_file.read_text(encoding="utf-8").splitlines())}
+        self.tables = tables
         # Page-split fragments that could not be merged (column layout differs per page) are
         # expanded together (table_merge.continuation_chains, stored per table by the chunker).
         self.chain_of = {ref: t["chain"] for ref, t in self.tables.items() if t.get("chain")}
@@ -555,8 +571,8 @@ class ContextBuilder:
 
     # ------------------------------------------------------------------ parent-aware mode
     def with_mode(self, mode: str = "parents", **opts) -> "ContextBuilder":
-        """A copy of this builder in another mode / with other options (the Docling JSON, tokenizer and
-        tables are shared), e.g. builder.with_mode("parents", budget=12000)."""
+        """A copy of this builder in another mode / with other options (the Docling JSON, serializer, tokenizer,
+        section index and tables are shared), e.g. builder.with_mode("parents", budget=12000)."""
         import copy
 
         if mode not in ("chunks", "parents"):
@@ -580,7 +596,8 @@ class ContextBuilder:
 
             from parents import ParentStore, section_index
 
-            self._store = ParentStore(self.doc, section_index(self.doc), self.retriever.chunks, self.tok,
+            index = self._index if self._index is not None else section_index(self.doc)
+            self._store = ParentStore(self.doc, index, self.retriever.chunks, self.tok,
                                       self.parent_min, self.parent_max, serializer=self.serializer)
             stale = sum(1 for c in self.retriever.chunks if c.get("parent_id")
                         and c["parent_id"] != self._store.parent_of_chunk.get(c["chunk_id"]))
@@ -866,6 +883,7 @@ PRODUCTION_K = 8
 PRODUCTION_BUDGET = 12000
 
 
-def production_builder(retriever: "Retriever", doc_json: str | Path | None = None) -> "ContextBuilder":
-    """The context builder the answering / USDM agent path should use."""
-    return ContextBuilder(retriever, doc_json).with_mode("parents", budget=PRODUCTION_BUDGET)
+def production_builder(retriever: "Retriever", doc_json: str | Path | None = None, **shared) -> "ContextBuilder":
+    """The context builder the answering / USDM agent path should use. `shared`: objects the caller already holds
+    for this document (doc=, serializer=, tok=, index=, tables=; see ContextBuilder), used instead of loading them."""
+    return ContextBuilder(retriever, doc_json, **shared).with_mode("parents", budget=PRODUCTION_BUDGET)

@@ -664,10 +664,12 @@ class SectionIndex:
     def children(self, section_id: str | None) -> list[Section]:
         """Direct sub-sections in document order (section_id None: the top-level sections)."""
         if self._children is None:
-            self._children = defaultdict(list)
+            # built aside and published whole: a thread never sees a half-filled map (two threads may both build it)
+            children: dict[str | None, list[Section]] = defaultdict(list)
             for s in self.sections:
                 if s.section_id != "S0":
-                    self._children[s.parent_id].append(s)
+                    children[s.parent_id].append(s)
+            self._children = children
         return list(self._children.get(section_id, []))
 
     def path(self, section_id: str) -> list[Section]:

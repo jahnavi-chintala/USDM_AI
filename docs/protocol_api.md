@@ -25,12 +25,14 @@ doc.call_tool("quote_check", {"quote": "have a hemoglobin A1c value ≤10% at th
 
 `open()` refuses a Docling JSON whose sha differs from the one the chunks were made from. Item refs are positional, so a regenerated JSON would otherwise return other text without any error.
 
+Every field of every tool result, with examples, is described in [api_reference.md](api_reference.md#5-protocol-tools).
+
 ## The tools
 
 | Tool | Returns | Use it for |
 |---|---|---|
 | `document_info()` | <ul><li>Official and brief title, acronym.</li><li>Sponsor protocol number.</li><li>NCT / EudraCT / EU CT / IND / WHO UTN, **each with the verbatim line it was found in**, page and ref.</li><li>Version, amendment and date.</li><li>Sponsor name, with the method used to find it.</li><li>Cover-page label/value pairs.</li><li>Page, section and SoA-table counts.</li><li>The outermost section of each ICH M11 role.</li><li>Reading-order repairs made at read time (outputs converted before post-processing did them; otherwise empty).</li></ul> | First call: the identity of the study and a plan of where things are. |
-| `outline(max_level)` | The section tree. Per section: id, number, title, level, role, first/last page, tokens (subtree and own text), children, number of tables/figures. | Planning which sections to read, and how big they are. |
+| `outline(max_level)` | The section tree. Per section: `section_id`, number, title, level, role, first/last page, tokens (subtree and own text), `parent_id`, children, number of tables/figures (`id` / `parent` remain as older names). | Planning which sections to read, and how big they are. |
 | `find_sections(role, query)` | Ranked sections by ICH M11 role and/or fuzzy title. Section numbers work too ("6.2"). | Finding a section whose role tagging is uncertain. |
 | `read_section(section)` | Complete Markdown of a section and its subsections, with per-block provenance. `section` can be an id (`S6.1`), a number (`6.1`) or a role (`inclusion`). | **Every enumeration.** This is complete; `search` is not. |
 | `get_table(table)` | One whole table, chosen by id (`#/tables/5`) or by caption/heading words. Markdown, grid, merged cells, footnotes; page-split chains joined. `format="rows"` gives one line per row. | Intervention tables, objective/endpoint tables, lab panels, wide SoA tables. |
@@ -45,7 +47,7 @@ Tool definitions:
 
 The schemas are JSON Schema and are tested against Draft 2020-12 and Draft 7.
 
-`doc.call_tool(name, args)` validates the arguments and runs the tool. **It never raises**: errors come back as `{"error", "error_type"}`, so you can pass the result straight back to the model. Through `call_tool`, `read_section` returns at most 16,000 tokens per call; the rest comes through `cursor`.
+`doc.call_tool(name, args)` validates the arguments and runs the tool. **It never raises**: errors come back as `{"error", "error_type"}` (`error_type` `UnknownTool` for an unknown tool name, `InvalidArguments` for arguments that fail the schema), so you can pass the result straight back to the model. Through `call_tool`, `read_section` returns at most 16,000 tokens per call; the rest comes through `cursor`.
 
 ## Which tool for which USDM class
 
@@ -133,13 +135,20 @@ In that case the chunks keep the converter's order: `search` blocks keep the chu
 | `compact` | All punctuation and spacing; letters, digits and `≥≤<>=%±` only. Used for quotes with at least 12 such characters. |
 
 - Markdown markers (`{#S..}`, `<!-- p. -->`, leading `#`, table pipes) are stripped from the quote.
-- `...` or `…` in a quote means elision: every part must occur.
-- Table cells are matched row by row: a row is its cells joined with ` | `.
-- Headers and footers are searched too; they appear with `layer: "furniture"`.
+- `...` or `…` in a quote means elision: the parts must occur in order, in the same layer and at the same tier,
+  each starting within 2,000 characters after the end of the previous one. `parts` still reports each part on its
+  own.
+- The tier reported is the first one that matches document text; text found only in an AI-generated figure
+  description is reported as `found_in_ai_text`, never as a match.
+- Table cells are matched row by row: a row is its cells joined with ` | `. Figure OCR text carries its figure's
+  pages.
+- Headers and footers are searched too; they appear with `layer: "furniture"`. `count` counts every match and
+  `count_by_layer` splits it into body and furniture; when both layers match, header/footer matches get at least
+  2 of the 10 listed places (all of them if there are fewer).
 
 ### `search`
 
-- It is the production path: `retrieve.production_builder`, top `PRODUCTION_K = 8` passages, a 12K-token budget, parent-aware, with the identity block. Its `blocks` are the context blocks an answering model sees; `rendered=True` adds the context string itself.
+- It is the production path: `retrieve.production_builder`, top `PRODUCTION_K = 8` passages, a 12K-token budget, parent-aware, with the identity block. Its `blocks` are the context blocks an answering model sees; `rendered: true` adds the context string itself (`context`).
 - Python callers can get the raw `retrieve.Result` and `retrieve.Context` from `doc.search_context(q)`.
 - Network use:
   - `search` sends the question and the candidate chunk texts to OpenRouter (qwen3-embedding-8b, qwen3-reranker-8b) with zero-data-retention routing.

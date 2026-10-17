@@ -3,11 +3,13 @@
 Run: `python tests/test_structure.py`. Covers: stable section ids, front matter "S0", minor headings
 kept inline, roles from heading synonyms and from content cues, scheme-aware numbering (Roman,
 "Section N", letters), TOC parsing and level-1 consensus, and that assign_heading_levels equals
-protocol_postprocess.fix_heading_levels whenever the PDF outline is used.
+protocol_postprocess.fix_heading_levels whenever the PDF outline is used; children() of a fresh index
+used from several threads at once.
 """
 
 import json
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -141,6 +143,42 @@ def test_tree_api_and_json_round_trip() -> None:
     assert again.section_of(li.self_ref) == "S2.1" == idx.section_of(li.self_ref)
     assert idx.section_of(li.parent.cref) == "S2.1"  # the list group too
     assert idx.section_of("#/texts/99999") is None
+
+
+def test_children_from_threads_on_a_fresh_index() -> None:
+    # children() builds its parent -> children map on first use: threads that call it on a fresh index at the same
+    # time must all get complete results (never a map another thread is still filling)
+    sections = [S.Section("S0", None, "Front matter", 0, None, None)]
+    want: dict[str | None, list[str]] = {None: [], "S0": []}
+    for i in range(1, 41):
+        sections.append(S.Section(f"S{i}", str(i), f"{i}. Chapter", 1, None, None))
+        want[None].append(f"S{i}")
+        want[f"S{i}"] = [f"S{i}.{j}" for j in range(1, 6)]
+        for j in range(1, 6):
+            sections.append(S.Section(f"S{i}.{j}", f"{i}.{j}", f"{i}.{j}. Part", 2, f"S{i}", None))
+            want[f"S{i}.{j}"] = []
+    ids = list(want)[::-1]  # the last-filled entries first
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads as often as possible, also while the map is being built
+    try:
+        for trial in range(30):
+            idx = S.SectionIndex(list(sections))
+            start = threading.Barrier(8)
+            got: list[dict | None] = [None] * 8
+
+            def work(t: int, idx=idx, start=start, got=got) -> None:
+                start.wait()
+                got[t] = {sid: [s.section_id for s in idx.children(sid)] for sid in ids}
+
+            threads = [threading.Thread(target=work, args=(t,)) for t in range(8)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            for t, g in enumerate(got):
+                assert g == want, (trial, t, None if g is None else [k for k in ids if g[k] != want[k]][:3])
+    finally:
+        sys.setswitchinterval(interval)
 
 
 def test_table_and_picture_children_map_to_section() -> None:

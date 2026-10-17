@@ -9,8 +9,9 @@ config.worker_concurrency threads that claim queued jobs FIFO (atomically, in th
   2. on success: write work/<job_id>/publish.json (job id + PipelineResult), publish the workdir atomically
      into documents/<doc_id>/ and record the result (done / done_with_warnings, related documents);
   3. on an exception: record "failed" with the exception type and our own file:line (frames inside the
-     project, never the message: it can quote document text), append the full traceback to
-     work/<job_id>/logs/error.log; a previously published result stays untouched.
+     project, never the message: it can quote document text) and the stages the exception carries
+     (`pipeline_stages`, see service.contracts), append the full traceback to work/<job_id>/logs/error.log;
+     a previously published result stays untouched.
 
 Recovery at start: an interrupted publish is finished (storage.recover()); a job left running whose result
 was already published (publish.json in the document carries its job id) is recorded; any other running job
@@ -74,12 +75,16 @@ def describe_exception(exc: BaseException) -> tuple[str, str | None]:
     return type(exc).__name__, where
 
 
+def stages_from_json(items: list[dict] | None) -> list[StageResult]:
+    """StageResults from their asdict() form."""
+    names = {f.name for f in fields(StageResult)}
+    return [StageResult(**{k: v for k, v in s.items() if k in names}) for s in items or []]
+
+
 def result_from_json(data: dict) -> PipelineResult:
     """PipelineResult from its to_json() form (publish.json)."""
     names = {f.name for f in fields(PipelineResult)} - {"stages"}
-    stage_names = {f.name for f in fields(StageResult)}
-    stages = [StageResult(**{k: v for k, v in s.items() if k in stage_names}) for s in data.get("stages") or []]
-    return PipelineResult(**{k: v for k, v in data.items() if k in names}, stages=stages)
+    return PipelineResult(**{k: v for k, v in data.items() if k in names}, stages=stages_from_json(data.get("stages")))
 
 
 class Worker:
@@ -253,6 +258,9 @@ class Worker:
             self.storage.write_error_log(job_id, "".join(traceback.format_exception(exc)))
         except OSError:
             log.warning("job %s: error.log could not be written", job_id)
-        self.registry.record_failure(job_id, error_type, where)
+        stages = getattr(exc, "pipeline_stages", None)  # see service.contracts; anything else is ignored
+        if not (isinstance(stages, list) and all(isinstance(s, StageResult) for s in stages)):
+            stages = []
+        self.registry.record_failure(job_id, error_type, where, stages)
         log.warning("job %s failed: %s at %s", job_id, error_type, where or "?")
         return "failed"

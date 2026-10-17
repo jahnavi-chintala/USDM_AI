@@ -16,7 +16,8 @@ Stages (contracts.STAGES), all writing into `workdir` in the final documents/<do
 
 OPENROUTER_OFFLINE: the figures and embed stages never call out; what they would have needed is reported as
 "skipped_offline" with a warning, and the document still finishes ("done_with_warnings"). A fatal error (the
-conversion itself, chunking) raises; the caller records the exception type and our file:line only.
+conversion itself, chunking) raises; the caller records the exception type and our file:line only, and the
+stages so far from the exception's `pipeline_stages` (completed ones, then the failing one with status "failed").
 Logs: workdir/logs/pipeline.log (this thread's records) and workdir/logs/convert.log (batch subprocesses).
 """
 
@@ -62,35 +63,51 @@ def _job_log(path: Path):
         handler.close()
 
 
-def _identifiers(workdir: Path) -> dict:
-    """NCT / sponsor protocol id / version / date as document_info reports them (values only)."""
-    out = {"nct": None, "sponsor_protocol_id": None, "eudract": None, "eu_ct": None, "ind": None, "who_utn": None,
-           "version": None, "amendment": None, "date": None}
+IDENTIFIER_KINDS = ("nct", "sponsor_protocol_id", "eudract", "eu_ct", "ind", "who_utn")
+IDENTIFIER_KEYS = (*IDENTIFIER_KINDS, "version", "amendment", "date", "acronym", "sponsor")
+
+
+def _value(field):
+    """A field's value: document_info reports {"value", "source", ...}, stats.json the bare value."""
+    return field.get("value") if isinstance(field, dict) else field
+
+
+def _identifiers_from_info(info: dict) -> dict:
+    ids, version = info.get("identifiers") or {}, info.get("version") or {}
+    return {**{kind: _value(ids.get(kind)) for kind in IDENTIFIER_KINDS},
+            "version": version.get("label"), "amendment": version.get("amendment"), "date": _value(version.get("date")),
+            "acronym": _value((info.get("titles") or {}).get("acronym")),
+            "sponsor": (info.get("sponsor") or {}).get("name")}
+
+
+def _identifiers_from_stats(meta: dict) -> dict:
+    """The same values from chunks/stats.json's "document" block (no sponsor: only document_info finds it)."""
+    ids = meta.get("identifiers") or {}
+    out = {kind: _value(ids.get(kind)) for kind in IDENTIFIER_KINDS}
+    out["sponsor_protocol_id"] = out["sponsor_protocol_id"] or meta.get("protocol_id")
+    return {**out, "version": meta.get("version_label"), "amendment": meta.get("amendment"),
+            "date": meta.get("version_date"), "acronym": meta.get("acronym"), "sponsor": None}
+
+
+def document_identifiers(out_dir: Path) -> dict:
+    """The identifiers of a finished document folder (protocol.json + chunks/), values only: nct,
+    sponsor_protocol_id, eudract, eu_ct, ind, who_utn, version, amendment, date, acronym, sponsor (IDENTIFIER_KEYS;
+    str or None). The pipeline records them in its result and the import of an existing folder in the registry.
+
+    From ProtocolDocument.document_info; when the folder cannot be opened, from chunks/stats.json (best effort:
+    a folder with neither gives all None). Only the exception type is logged."""
+    out_dir = Path(out_dir)
     try:
         from protocol_api import ProtocolDocument
 
-        info = ProtocolDocument.open(workdir).document_info()
-        for key, value in (info.get("identifiers") or {}).items():
-            if key in out and isinstance(value, dict):
-                out[key] = value.get("value")
-        version = info.get("version") or {}
-        out["version"] = version.get("label")
-        out["amendment"] = version.get("amendment")
-        date = version.get("date")
-        out["date"] = date.get("value") if isinstance(date, dict) else date
+        return _identifiers_from_info(ProtocolDocument.open(out_dir).document_info())
     except Exception as exc:  # noqa: BLE001 - identity is best effort; stats.json is the fallback
         log.warning("document_info unavailable (%s); using chunks/stats.json", type(exc).__name__)
-        try:
-            meta = json.loads((workdir / "chunks" / "stats.json").read_text(encoding="utf-8"))["document"]
-            ids = meta.get("identifiers") or {}
-            for key in out:
-                v = ids.get(key)
-                out[key] = v.get("value") if isinstance(v, dict) else v
-            out["sponsor_protocol_id"] = out["sponsor_protocol_id"] or meta.get("protocol_id")
-            out["date"] = out["date"] or meta.get("version_date")
-        except Exception:  # noqa: BLE001
-            pass
-    return out
+    try:
+        return _identifiers_from_stats(
+            json.loads((out_dir / "chunks" / "stats.json").read_text(encoding="utf-8"))["document"])
+    except Exception:  # noqa: BLE001
+        return dict.fromkeys(IDENTIFIER_KEYS)
 
 
 def process_document(pdf_path: Path, workdir: Path, config: ServiceConfig, *, settings=None, progress=None,
@@ -130,7 +147,24 @@ def process_document(pdf_path: Path, workdir: Path, config: ServiceConfig, *, se
         seconds = (min(later) if later else time.time()) - begin if begin is not None else 0.0
         stages.append(StageResult(name, status, round(seconds, 1), detail))
 
-    with _job_log(workdir / "logs" / "pipeline.log"):
+    @contextmanager
+    def stages_on_failure():
+        """A failure carries the stages so far (exc.pipeline_stages, see service.contracts): those finished, then
+        the failing one, the last stage reported and not finished, with status "failed". A stage reported
+        before it and never finished ran through (the conversion runs convert, postprocess, figures and save
+        in one call)."""
+        try:
+            yield
+        except Exception as exc:
+            pending = [name for name in starts if name not in {s.name for s in stages}]
+            for name in pending[:-1]:
+                finish(name)
+            if pending:
+                finish(pending[-1], "failed")
+            exc.pipeline_stages = list(stages)
+            raise
+
+    with _job_log(workdir / "logs" / "pipeline.log"), stages_on_failure():
         log.info("Pipeline %s for %s", PIPELINE_VERSION, pdf_path.name)
         report("hash")
         sha = file_sha256(pdf_path)
@@ -201,7 +235,7 @@ def process_document(pdf_path: Path, workdir: Path, config: ServiceConfig, *, se
         result = PipelineResult(
             status=status, pipeline_version=PIPELINE_VERSION,
             fingerprint=pipeline_fingerprint(settings, config.models()), sha256=sha, pages=conv["pages"],
-            identifiers=_identifiers(workdir), quality=summary, warnings=warnings, stages=stages)
+            identifiers=document_identifiers(workdir), quality=summary, warnings=warnings, stages=stages)
         (workdir / "quality.json").write_text(json.dumps({**quality, "summary": summary, "warnings": warnings,
                                                           "stages": [s.__dict__ for s in stages]},
                                                          indent=1), encoding="utf-8")
@@ -214,11 +248,13 @@ def process_document(pdf_path: Path, workdir: Path, config: ServiceConfig, *, se
 
 class PipelineFailed(RuntimeError):
     """The pipeline failed in its child process. error_type / error_where: the original exception's type and
-    our own file:line (never its message); the traceback is in workdir/logs/error.log."""
+    our own file:line (never its message); the traceback is in workdir/logs/error.log. pipeline_stages: the
+    stages the child got through (service.contracts), none when it died without reporting."""
 
-    def __init__(self, error_type: str, error_where: str | None):
+    def __init__(self, error_type: str, error_where: str | None, stages: list[StageResult] | None = None):
         super().__init__(f"{error_type} at {error_where or 'library code'}")
         self.error_type, self.error_where = error_type, error_where
+        self.pipeline_stages = list(stages or [])
 
 
 _MARK = "@@pipeline "
@@ -231,7 +267,8 @@ def process_document_isolated(pdf_path: Path, workdir: Path, config: ServiceConf
     pdfium and the models are not thread-safe and native code can crash: a child process per job keeps the
     service (API, MCP, other jobs) alive and lets WORKER_CONCURRENCY > 1 run safely. Settings, configuration
     and the password go to the child on stdin (never on the command line or in the environment); progress
-    and the outcome come back as marked stdout lines; the child's other output goes to workdir/logs/."""
+    and the outcome come back as marked stdout lines (a failure with the stages the child got through); the child's
+    other output goes to workdir/logs/."""
     import os
     import subprocess
     import sys
@@ -266,11 +303,11 @@ def process_document_isolated(pdf_path: Path, workdir: Path, config: ServiceConf
             elif kind == "error":
                 error = data
         rc = proc.wait()
+    from service.worker import result_from_json, stages_from_json
+
     if rc != 0 or error is not None:
         error = error or {"type": f"ChildExit{rc}", "where": None}
-        raise PipelineFailed(error["type"], error.get("where"))
-    from service.worker import result_from_json
-
+        raise PipelineFailed(error["type"], error.get("where"), stages_from_json(error.get("stages")))
     return result_from_json(json.loads((workdir / "pipeline.json").read_text(encoding="utf-8")))
 
 
@@ -278,6 +315,7 @@ def _child_main() -> int:
     """Entry point of the child process: payload on stdin, marked lines on stdout."""
     import sys
     import traceback
+    from dataclasses import asdict
 
     from protocol_settings import ProtocolSettings
 
@@ -289,7 +327,7 @@ def _child_main() -> int:
     logging.basicConfig(level=getattr(logging, config.log_level, logging.INFO), stream=sys.stderr)
 
     def emit(kind: str, data: dict) -> None:
-        sys.stdout.write(f"{_MARK}{kind} {json.dumps(data)}\n")
+        sys.stdout.write(f"{_MARK}{kind} {json.dumps(data, default=str)}\n")
         sys.stdout.flush()
 
     try:
@@ -304,7 +342,8 @@ def _child_main() -> int:
         etype, where = describe_exception(exc)
         with open(workdir / "logs" / "error.log", "a", encoding="utf-8") as fh:
             traceback.print_exc(file=fh)
-        emit("error", {"type": etype, "where": where})
+        emit("error", {"type": etype, "where": where,
+                       "stages": [asdict(s) for s in getattr(exc, "pipeline_stages", None) or []]})
         return 1
 
 

@@ -455,6 +455,12 @@ def test_files() -> None:
                                     "protocol.md"], listing["files"]
         assert listing["images"] == ["images/image_000.png"]
         assert listing["aliases"]["chunks.jsonl"] == "chunks/chunks.jsonl" and listing["aliases"]["md"] == "protocol.md"
+        # only the aliases of files this result has: no quality.json, so no "quality"; no sections.json, ...
+        assert listing["aliases"] == {
+            "chunks.jsonl": "chunks/chunks.jsonl", "decisions": "protocol.decisions.json",
+            "decisions.json": "protocol.decisions.json", "html": "protocol.html", "json": "protocol.json",
+            "markdown": "protocol.md", "md": "protocol.md"}, listing["aliases"]
+        assert set(listing["aliases"].values()) <= set(listing["files"])
         expect = {
             "md": ("text/markdown; charset=utf-8", RESULT_FILES["protocol.md"]),
             "protocol.md": ("text/markdown; charset=utf-8", RESULT_FILES["protocol.md"]),
@@ -476,6 +482,11 @@ def test_files() -> None:
         assert r.headers["content-security-policy"] == api.HTML_CSP and r.headers["x-content-type-options"] == "nosniff"
         assert "inline" in r.headers["content-disposition"] and "protocol.html" in r.headers["content-disposition"]
         error_of(client.get(f"/documents/{doc}/files/quality.json"), 404, "file_not_found")  # exposed, not written
+        error_of(client.get(f"/documents/{doc}/files/quality"), 404, "file_not_found")  # every alias is accepted
+        (folder / "quality.json").write_text('{"coverage": {}}', encoding="utf-8")  # a result with one lists it
+        assert client.get(f"/documents/{doc}/files").json()["aliases"]["quality"] == "quality.json"
+        assert client.get(f"/documents/{doc}/files/quality").json() == {"coverage": {}}
+        (folder / "quality.json").unlink()
         error_of(client.get(f"/documents/{doc}/files/nothing.txt"), 404, "file_not_found")
         secrets_on_disk = [service.config.registry_path.read_bytes()[:16], (folder / "source.pdf").read_bytes()[:8]]
         assert secrets_on_disk[0].startswith(b"SQLite format 3")
@@ -536,11 +547,34 @@ def test_errors_cancel_delete() -> None:
         error_of(client.get(f"/documents/{running['doc_id']}"), 404, "document_not_found")
         error_of(client.get(f"/documents/{running['doc_id']}/files/md"), 404, "document_not_found")
         error_of(client.get(f"/jobs/{running['job_id']}"), 404, "job_not_found")
-        assert client.get(f"/documents/{running['doc_id']}/jobs").json()["jobs"] == []
+        error_of(client.get(f"/documents/{running['doc_id']}/jobs"), 404, "document_not_found")
         assert service.storage.document_dir(running["doc_id"]) is None
         assert client.delete(f"/documents/{queued['doc_id']}").status_code == 200
         assert service.storage.list_workdirs() == [] and service.storage.list_documents() == []
         assert client.get("/documents").json()["documents"] == []
+
+
+def test_jobs_of_unknown_document() -> None:
+    """GET /documents/{doc_id}/jobs: the document's jobs; 404 document_not_found (as GET /documents/{doc_id}) for a
+    well-formed id without a document; 400 invalid_id for a malformed one. Without a doc_id, every job."""
+    with app_env() as (client, service):
+        d = upload(client, make_pdf("Jobs study")).json()
+        wait_job(client, d["job_id"])
+        assert [j["job_id"] for j in client.get(f"/documents/{d['doc_id']}/jobs").json()["jobs"]] == [d["job_id"]]
+        missing = "e" * 64
+        body = error_of(client.get(f"/documents/{missing}/jobs"), 404, "document_not_found")
+        assert body == error_of(client.get(f"/documents/{missing}"), 404, "document_not_found")
+        error_of(client.get("/documents/xyz/jobs"), 400, "invalid_id")
+        error_of(client.get(f"/documents/{missing.upper()}/jobs"), 400, "invalid_id")
+        assert [j["job_id"] for j in client.get("/jobs").json()["jobs"]] == [d["job_id"]]
+        assert service.list_jobs()["jobs"][0]["job_id"] == d["job_id"]
+        for call in (lambda: service.list_jobs(doc_id=missing), lambda: service.get_document(missing)):
+            try:
+                call()
+            except Exception as exc:  # noqa: BLE001
+                assert (type(exc).__name__, exc.code, exc.status) == ("NotFound", "document_not_found", 404)
+            else:
+                raise AssertionError("expected NotFound")
 
 
 # ---------------------------------------------------------------- 6. passwords
@@ -610,6 +644,106 @@ def test_password_never_stored_logged_or_echoed() -> None:
                                None)
     assert api.RedactPasswordFilter().filter(record) and password not in record.getMessage()
     assert "reprocess=1&password=***" in record.getMessage()
+
+
+def test_reprocess_password() -> None:
+    """reprocess(password=...) holds the password like an upload's: in memory until the reprocess job starts, handed
+    to the pipeline once, never in SQLite, files, logs or responses; dropped when no job is queued; refused in a
+    process without a worker (nothing there would hand it to the job)."""
+    from service.app_service import BadRequest, NotFound
+    from test_service_core import expect
+
+    password = "pw-" + secrets.token_hex(12)
+    calls: list[dict] = []
+    root, capture = logging.getLogger(), Capture()
+    old_level = root.level
+    root.addHandler(capture)
+    root.setLevel(logging.DEBUG)
+    try:
+        with temp_dir() as tmp:
+            # the worker is not started: the test runs its queue by hand to look at what is held in between
+            service = make_service(tmp / "data", pipeline=make_pipeline(calls=calls))
+            vault = service.registry.pdf_passwords
+            responses: list[str] = []
+            try:
+                first = service.ingest(make_pdf("Reprocess password study"), "locked.pdf")
+                doc = first["doc_id"]
+                assert service.worker.run_until_idle() == [first["job_id"]]
+                # a current result without force: no job, the password is dropped
+                current = service.reprocess(doc, password=password)
+                assert current["job_id"] is None and not current["queued"] and len(vault) == 0
+                # errors: nothing is held
+                assert expect(NotFound, service.reprocess, "d" * 64, force=True, password=password).code == \
+                    "document_not_found"
+                assert expect(BadRequest, service.reprocess, "xyz", password=password).code == "invalid_id"
+                assert len(vault) == 0
+                # forced: queued, held until the job starts
+                queued = service.reprocess(doc, force=True, password=password)
+                assert queued["queued"] and queued["job_id"] and len(vault) == 1 and password not in repr(vault)
+                # a second request while that job waits: the same job, and no second copy is held
+                again = service.reprocess(doc, force=True, password=password)
+                assert again["job_id"] == queued["job_id"] and not again["queued"] and len(vault) == 1
+                responses += [json.dumps(r) for r in (current, queued, again, service.get_job(queued["job_id"]),
+                                                      service.get_document(doc), service.list_jobs())]
+                files = [p for p in service.config.data_dir.rglob("*") if p.is_file()]  # the registry and its WAL
+                assert files and not any(password.encode() in p.read_bytes() for p in files)
+                # the job starts: the pipeline receives it, then nothing holds it
+                assert service.worker.run_until_idle() == [queued["job_id"]]
+                assert calls[-1]["password"] == password and len(vault) == 0
+                assert service.get_job(queued["job_id"])["state"] == "done"
+                # without a password the job gets none
+                plain = service.reprocess(doc, force=True)
+                service.worker.run_until_idle()
+                assert plain["queued"] and calls[-1]["password"] is None
+                responses += [json.dumps(service.get_job(queued["job_id"])), json.dumps(service.list_jobs())]
+            finally:
+                service.stop()
+            files = [p for p in service.config.data_dir.rglob("*") if p.is_file()]
+            assert files and not any(password.encode() in p.read_bytes() for p in files)
+            assert not any(password in text for text in responses)
+            # no worker in this process: a password is refused, like an upload's, and nothing is queued
+            idle = make_service(tmp / "data2", run_worker=False)
+            try:
+                refused = expect(BadRequest, idle.reprocess, "a" * 64, password=password)
+                assert refused.code == "password_unsupported_here" and refused.status == 400
+                assert password not in json.dumps(refused.to_json())
+                assert len(idle.registry.pdf_passwords) == 0 and idle.list_jobs()["jobs"] == []
+                assert expect(NotFound, idle.reprocess, "a" * 64).code == "document_not_found"  # no password: as before
+            finally:
+                idle.stop()
+        assert capture.lines and not any(password in line for line in capture.lines)
+    finally:
+        root.removeHandler(capture)
+        root.setLevel(old_level)
+
+
+def test_reprocess_password_route() -> None:
+    """POST /documents/{id}/reprocess takes the password in its JSON body only: refused in the URL, never echoed
+    (not even by a 422), handed to the reprocess job's pipeline."""
+    password = "pw-" + secrets.token_hex(12)
+    calls: list[dict] = []
+    with temp_dir() as tmp:
+        service = make_service(tmp / "data", pipeline=make_pipeline(calls=calls))
+        with client_for(service) as client:
+            first = upload(client, make_pdf("Reprocess route study"))
+            doc = first.json()["doc_id"]
+            assert wait_job(client, first.json()["job_id"])["state"] == "done"
+            responses = []
+            r = client.post(f"/documents/{doc}/reprocess", params={"force": "true", "password": password})
+            error_of(r, 400, "password_in_query")
+            responses.append(r.content)
+            r = client.post(f"/documents/{doc}/reprocess", json={"force": True, "password": 123})
+            no_inputs(error_of(r, 422, "validation_error"))
+            r = client.post(f"/documents/{doc}/reprocess", json={"force": True, "password": password})
+            assert r.status_code == 202 and r.json()["queued"], r.text
+            responses.append(r.content)
+            job = wait_job(client, r.json()["job_id"])
+            assert job["state"] == "done" and calls[-1]["password"] == password
+            responses.append(client.get(f"/jobs/{job['job_id']}").content)
+            assert len(service.registry.pdf_passwords) == 0
+            prop = client.get("/openapi.json").json()["components"]["schemas"]["ReprocessOptions"]["properties"]
+            assert "password" in prop
+        assert not any(password.encode() in body for body in responses)
 
 
 # ---------------------------------------------------------------- 7. unexpected exceptions
@@ -925,6 +1059,91 @@ def test_protocol_tools() -> None:
                 assert not any(f in json.dumps(result) for f in forms), name
             info = client.post(f"/documents/{doc}/tools/document_info").json()
             assert info.get("out_dir") == "<document>", "document_info out_dir is redacted"
+
+
+def test_search_unavailable_message() -> None:
+    """A document processed offline has no embeddings: search is 409 search_unavailable with the service's own way
+    out (reprocess it online), not protocol_api's command line, and no path; the other tools work."""
+    if not tokenizer_cached():
+        print(f"   (skipped: tokenizer {TOKENIZER} not in the local Hugging Face cache)")
+        return
+    from service.app_service import Conflict
+    from service.import_existing import import_folder
+
+    with temp_dir() as tmp:
+        folder, pdf = tmp / "src" / "Quillmore", tmp / "src" / "quillmore.pdf"
+        build_converted_folder(folder)
+        for name in ("embeddings.npy", "embeddings_meta.json"):
+            (folder / "chunks" / name).unlink()
+        pdf.write_bytes(make_pdf("Quillmore study protocol", "Made-up text for an offline test"))
+        service = make_service(tmp / "data", embed_fn=fake_vector, rerank_fn=fake_rerank, run_worker=False)
+        doc = import_folder(service.config, folder, pdf=pdf, version=VERSION, registry=service.registry,
+                            storage=service.storage)["doc_id"]
+        expected = ("this document has no embeddings, so search is unavailable (it was processed offline): "
+                    f"reprocess it online with POST /documents/{doc}/reprocess?force=true")
+        with client_for(service) as client:
+            r = client.post(f"/documents/{doc}/tools/search", json=TOOL_CALLS["search"])
+            body = error_of(r, 409, "search_unavailable")
+            assert body["message"] == expected and body["details"] == {"tool": "search"}, body
+            assert client.post(f"/documents/{doc}/tools/read_section", json={"section": "inclusion"}).status_code == 200
+            try:  # the service layer, which REST and MCP share
+                service.call_tool(doc, "search", TOOL_CALLS["search"])
+            except Conflict as exc:
+                assert (exc.message, exc.code, exc.status) == (expected, "search_unavailable", 409)
+            else:
+                raise AssertionError("expected Conflict")
+
+
+def test_tool_error_types() -> None:
+    """protocol_api.call_tool types its own errors (UnknownTool, InvalidArguments): through the service layer, which
+    REST and MCP share, a schema failure is still 400 invalid_arguments naming the tool, an unknown tool 404, and a
+    ValidationError raised inside a tool 500 without its message."""
+    if not tokenizer_cached():
+        print(f"   (skipped: tokenizer {TOKENIZER} not in the local Hugging Face cache)")
+        return
+    from service.app_service import BadRequest, NotFound, ServiceError
+    from service.import_existing import import_folder
+
+    with temp_dir() as tmp:
+        folder, pdf = tmp / "src" / "Quillmore", tmp / "src" / "quillmore.pdf"
+        build_converted_folder(folder)
+        pdf.write_bytes(make_pdf("Quillmore study protocol", "Made-up text for an error type test"))
+        service = make_service(tmp / "data", embed_fn=fake_vector, rerank_fn=fake_rerank, run_worker=False)
+        doc = import_folder(service.config, folder, pdf=pdf, version=VERSION, registry=service.registry,
+                            storage=service.storage)["doc_id"]
+        for name, args in (("quote_check", {"quote": 5}), ("find_sections", {"role": "no_such_role"}),
+                           ("read_section", {"max_tokens": 10})):
+            try:
+                service.call_tool(doc, name, args)
+            except BadRequest as exc:
+                assert (exc.status, exc.code, exc.details) == (400, "invalid_arguments", {"tool": name}), name
+                assert exc.message.startswith(f"invalid arguments for {name}: "), exc.message
+            else:
+                raise AssertionError(f"{name}: expected BadRequest")
+            assert service._slot(doc).doc.call_tool(name, args)["error_type"] == "InvalidArguments"
+        # an unknown name never reaches the document (the service checks it first); its type maps to 404 alike
+        unknown = service._slot(doc).doc.call_tool("no_such_tool", {})
+        assert unknown["error_type"] == "UnknownTool"
+        exc = service._tool_error(doc, "no_such_tool", unknown)
+        assert isinstance(exc, NotFound) and (exc.status, exc.code) == (404, "unknown_tool")
+        # a ValidationError raised inside a tool is the tool failing, not the caller's arguments: 500, type only
+
+        class ValidationError(ValueError):
+            pass
+
+        def broken(**kwargs):
+            raise ValidationError("SECRET text quoted from a document")
+
+        opened = service._slot(doc).doc
+        opened.outline = broken
+        try:
+            service.call_tool(doc, "outline", {})
+        except ServiceError as exc:
+            assert (exc.status, exc.code) == (500, "tool_failed") and "SECRET" not in json.dumps(exc.to_json()), exc
+        else:
+            raise AssertionError("expected ServiceError")
+        finally:
+            del opened.outline
 
 
 def generic_call(route, service, doc: str, name: str, args) -> tuple[int, bytes | dict]:

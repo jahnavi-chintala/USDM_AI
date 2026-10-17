@@ -1,20 +1,28 @@
 """Self-test for protocol_api.py: `python tests/test_protocol_api.py` (no pytest).
 
 Public protocols only: output_public/LZZT_CDISC_Pilot and output_public/Lilly_NCT03421379 (their USDM keys are in
-public_protocols/). Offline: OPENROUTER_OFFLINE=1 is forced, so search() runs on an eval question whose query
+public_protocols/); the identity checks run on all six public outputs. Offline: OPENROUTER_OFFLINE=1 is forced, so search() runs on an eval question whose query
 embedding and rerank are cached (reports/eval/public/<name>.json), an uncached question must raise OfflineCacheMiss,
 and a fake client (embed_fn / rerank_fn) covers the uncached path without any network call.
 
-Checks: the source-sha guard; every tool and its provenance; read_section of the inclusion / exclusion roles holds
-every criterion of the USDM key (usdm_gold's reader); continuation cursors lose nothing; table chains are joined;
-get_soa with and without soa.py; quote_check positive / normalised / table / cross-item / furniture / negative /
-section-scoped / elided; the reading-order repair (Lilly p. 26); tool schemas are valid JSON Schema; call_tool never
-raises; the CLI.
+Checks: the source-sha guard; every tool and its provenance; the sponsor's "property of" line and source; document_info
+and search's identity block read the identity record (identity.py), not a search: every identifier source and every
+identity-block ref is the item holding the quoted line, Lilly's running header is its protocol id source, document_info
+values equal the stored ones, the record is built once and each call returns its own copy; outline ids; read_section of the inclusion / exclusion roles holds every criterion of the USDM key (usdm_gold's reader);
+continuation cursors lose nothing and keep with_blocks; find_sections hints; table chains are joined; get_soa with and
+without soa.py; quote_check positive / normalised / table / cross-item / furniture / negative / section-scoped /
+elided (in order, within 2,000 characters; with 3+ parts a later occurrence in the window completes a chain) / figure
+OCR text pages / uncapped count by layer / document text before AI-generated text at any tier / header-footer slots;
+the reading-order repair (Lilly p. 26); tool schemas are valid JSON Schema; call_tool never raises and types its own
+errors; the CLI.
 """
 
+import copy
 import hashlib
 import json
 import os
+import random
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +43,13 @@ import protocol_api as api  # noqa: E402
 
 LZZT = ROOT / "output_public" / "LZZT_CDISC_Pilot"
 LILLY = ROOT / "output_public" / "Lilly_NCT03421379"
+ALEXION = ROOT / "output_public" / "Alexion_NCT04573309"
+PUBLIC = {  # the six public protocols -> the sponsor name document_info gives
+    "LZZT_CDISC_Pilot": "Eli Lilly and Company", "Lilly_NCT03421379": "Eli Lilly and Company",
+    "Alexion_NCT04573309": "Alexion Pharmaceuticals, Inc", "Bayer_NCT04304508": "Bayer AG",
+    "PrECOG_NCT01797120": "PrECOG, LLC", "Sanofi_NCT03637764": "Sanofi",
+}
+SOURCE_KEYS = {"page", "layer", "text", "ref", "refs", "row", "section_id"}
 PROV_KEYS = {"section_id", "section_number", "title", "pages", "refs"}
 CASES = []
 _DOCS: dict[str, api.ProtocolDocument] = {}
@@ -55,6 +70,14 @@ def has_prov(d: dict, where: str = "") -> None:
     assert isinstance(d.get("provenance"), dict), f"{where}: no provenance in {sorted(d)}"
     missing = PROV_KEYS - set(d["provenance"])
     assert not missing, f"{where}: provenance lacks {missing}"
+
+
+def public(*paths: Path) -> bool:
+    """True when these output_public/ folders exist; otherwise the test says it is skipped."""
+    missing = [p.name for p in paths if not (p / "chunks" / "stats.json").is_file()]
+    if missing:
+        print(f"   (skipped: output_public/{', '.join(missing)} absent)")
+    return not missing
 
 
 def raises(exc, fn, *a, **kw) -> Exception:
@@ -95,6 +118,81 @@ def key_criteria(name: str, category: str) -> list:
 
     st = usdm_gold.load_study(name)
     return [c for c in st.of("EligibilityCriterion") if category in (c.attrs.get("category") or "").lower()]
+
+
+_FAKE_DOCS: dict[str, api.ProtocolDocument] = {}
+_FAKE_SEARCH: dict[str, dict] = {}
+
+
+def public_docs() -> dict[str, Path]:
+    """The public protocols whose output_public/ folder is there (a missing one is named and skipped)."""
+    base = ROOT / "output_public"
+    present = {n: base / n for n in PUBLIC if (base / n / "chunks" / "stats.json").is_file()}
+    if len(present) < len(PUBLIC):
+        print(f"   (output_public/{', '.join(sorted(set(PUBLIC) - set(present)))} absent: not checked)")
+    return present
+
+
+def keep_order(query: str, chunks: list, model: str) -> list[tuple[int, float]]:
+    """A stand-in reranker: keeps the retrieval order."""
+    return [(i, 1.0 / (i + 1)) for i in range(len(chunks))]
+
+
+def fake_doc(name: str) -> api.ProtocolDocument:
+    """A public protocol opened with stand-in embedding / rerank functions: search runs without any network."""
+    if name not in _FAKE_DOCS:
+        path = ROOT / "output_public" / name
+        dim = np.load(path / "chunks" / "embeddings.npy", mmap_mode="r").shape[1]
+
+        def embed_fn(text):
+            seed = int(hashlib.sha256(text.encode()).hexdigest()[:8], 16)
+            return np.random.default_rng(seed).standard_normal(dim).astype(np.float32)
+
+        _FAKE_DOCS[name] = api.ProtocolDocument.open(path, embed_fn=embed_fn, rerank_fn=keep_order)
+    return _FAKE_DOCS[name]
+
+
+def fake_search(name: str) -> dict:
+    if name not in _FAKE_SEARCH:
+        _FAKE_SEARCH[name] = fake_doc(name).search("What is the planned number of participants?", k=1)
+    return _FAKE_SEARCH[name]
+
+
+def item_problem(d: api.ProtocolDocument, ref: str, page: int | None, layer: str | None, quoted: str,
+                 row: int | None = None) -> str:
+    """"ok" when the item at ref is on the page, in the layer (body / furniture / table) and holds the quoted line
+    (a table: the row's text, or every row's when no row is given); else what differs."""
+    from docling_core.types.doc import ContentLayer, TableItem
+
+    item = d._resolve(ref)
+    if isinstance(item, TableItem):
+        rows = [row] if row is not None else range(len(item.data.grid))
+        text = " ".join(" ".join(c.text.split()) for r in rows for c in {id(c): c for c in item.data.grid[r]}.values()
+                        if c.text)
+        got = "table"
+    else:
+        text = " ".join(item.text.split())
+        got = "furniture" if item.content_layer == ContentLayer.FURNITURE else "body"
+    problems = []
+    if page is not None and page not in api._pages_of(item):
+        problems.append(f"page {api._pages_of(item)} != {page}")
+    if layer is not None and got != layer:
+        problems.append(f"layer {got} != {layer}")
+    line = " ".join(quoted.split()).strip("…").strip()
+    if line not in text and line.replace(" | ", " ") not in text.replace(" | ", " "):
+        problems.append("the item does not hold the quoted line")
+    return "; ".join(problems) or "ok"
+
+
+def identity_lines(text: str) -> list[tuple[str, int | None, str, str]]:
+    """(label, page, layer, quoted line) of every '(source ...)' line of search's identity block."""
+    out = []
+    for line in text.splitlines():
+        m = re.search(r'\(source(?: p\. (\d+))?(?:, (header/footer|table))?: "(.+)"\)$', line)
+        if m:
+            out.append((line.split(":", 1)[0], int(m.group(1)) if m.group(1) else None,
+                        {"header/footer": "furniture", "table": "table"}.get(m.group(2), "body"), m.group(3)))
+    return out
 
 
 def coverage(text: str, markdown_tokens: set) -> float:
@@ -164,6 +262,216 @@ def repaired_in_postprocessing(path: Path) -> bool:
     return True
 
 
+@case
+def test_sponsor_property_line_and_source():
+    # "and" / "&" inside the name leave the space the next word needs
+    import identity
+
+    for text, name in (("This document is the property of Eli Lilly and Company.", "Eli Lilly and Company"),
+                       ("Property of the Acme & Sons Group, all rights reserved", "Acme & Sons Group")):
+        assert identity._PROPERTY.search(text).group("name").strip(" .,") == name, text
+    if not public(LILLY, ALEXION):
+        return
+    d = doc(LILLY)
+    sp = d.document_info()["sponsor"]
+    assert sp["name"] == sp["value"] == "Eli Lilly and Company" and sp["method"] == "'property of' line"
+    src = sp["source"]
+    assert set(src) == SOURCE_KEYS
+    assert src["layer"] == "body" and src["section_id"] == d._section_of(src["ref"]) is not None
+    assert src["refs"] == [src["ref"]] and src["row"] is None and "property of Eli Lilly and Company" in src["text"]
+    assert sp["provenance"]["refs"] == src["refs"] and sp["provenance"]["pages"] == [src["page"]]
+    assert sp["provenance"]["section_id"] == src["section_id"]
+    a = doc(ALEXION)
+    sp = a.document_info()["sponsor"]
+    assert sp["method"] == "cover-page label" and sp["source"]["layer"] == "body"
+    assert sp["source"]["section_id"] == a._section_of(sp["source"]["ref"]) is not None
+    assert sp["name"] == "Alexion Pharmaceuticals, Inc" and sp["name"] in sp["value"] != sp["name"]  # value: verbatim
+    # a sponsor line in a page header/footer is read from the furniture layer
+    from docling_core.types.doc import ContentLayer
+
+    item = d._resolve(src["ref"])
+    saved = item.content_layer
+    try:
+        item.content_layer = ContentLayer.FURNITURE
+        loc = identity.detect_sponsor(d.doc, {})["loc"]
+        assert (loc["ref"], loc["layer"]) == (src["ref"], "furniture")
+    finally:
+        item.content_layer = saved
+
+
+@case
+def test_document_info_sources_resolve_and_identity_block_refs():
+    """Every identifier source and every search identity-block ref is the item holding the quoted line (page, layer,
+    item text): the record names the item a value was read from, no search for it; 16/16 and 16/16 on the public set."""
+    docs = public_docs()
+    if not docs:
+        return
+    from retrieve import IDENTITY_FIELDS
+
+    n_sources = n_lines = n_ok_sources = n_ok_lines = 0
+    for name in docs:
+        d = fake_doc(name)
+        info = d.document_info()
+        sourced = [k for k, _ in IDENTITY_FIELDS if info["identifiers"][k]]
+        for key in sourced:
+            v = info["identifiers"][key]
+            assert v["source"] and set(v["source"]) == SOURCE_KEYS and v["method"] and v["label"], (name, key)
+            n_sources += 1
+            src = v["source"]
+            bad = item_problem(d, src["ref"], src["page"], src["layer"], src["text"], src["row"])
+            n_ok_sources += bad == "ok"
+            assert bad == "ok", (name, key, src["ref"], bad)
+        ident = fake_search(name)["identity"]
+        lines = identity_lines(ident["text"])
+        assert len(lines) == len(sourced), (name, lines, sourced)  # one "(source ...)" line per identifier
+        refs = []
+        for (label, page, layer, quoted), key in zip(lines, sourced):
+            ref = info["identifiers"][key]["source"]["ref"]  # the line's ref is its identifier's source item
+            bad = item_problem(d, ref, page, layer, quoted)
+            n_lines += 1
+            n_ok_lines += bad == "ok"
+            assert bad == "ok", (name, label, ref, bad)
+            refs.append(ref)
+        assert ident["provenance"]["refs"] == list(dict.fromkeys(refs)), name
+        first = next((s for s in (d._section_of(r) for r in refs) if s), None)
+        assert ident["provenance"]["section_id"] == first, name
+    print(f"   identifier sources {n_ok_sources}/{n_sources}, identity-block lines {n_ok_lines}/{n_lines}")
+    assert n_sources == n_ok_sources and n_lines == n_ok_lines and n_sources == n_lines > 0
+
+
+@case
+def test_lilly_running_header_is_the_protocol_id_source():
+    """Lilly's page-1 running header "I8R-JE-IGBJ(a) Clinical Pharmacology Protocol" (#/texts/0) is the source of the
+    protocol id, not the title paragraph (#/texts/1) that holds the id too; the identity block is not placed in
+    Appendix 1 (a table row there holds an id-like string)."""
+    if not public(LILLY):
+        return
+    d = fake_doc("Lilly_NCT03421379")
+    info = d.document_info()
+    pid = info["identifiers"]["sponsor_protocol_id"]
+    assert pid["value"] == "I8R-JE-IGBJ"
+    assert pid["source"]["ref"] == "#/texts/0" and pid["source"]["layer"] == "furniture" and pid["source"]["page"] == 1
+    assert pid["source"]["text"] == "I8R-JE-IGBJ(a) Clinical Pharmacology Protocol"
+    assert pid["source"]["section_id"] is None  # a page header belongs to no section
+    assert "I8R-JE-IGBJ" in d._resolve("#/texts/0").text
+    assert info["sponsor"]["name"] == "Eli Lilly and Company"
+    prov = fake_search("Lilly_NCT03421379")["identity"]["provenance"]
+    assert prov["refs"][0] == "#/texts/0" and prov["title"] != "Appendix 1"
+    assert prov["section_id"] == d._section_of(info["identifiers"]["nct"]["source"]["ref"]) is not None
+
+
+@case
+def test_document_info_values_equal_the_stored_values():
+    """Titles, identifiers, version, sponsor and cover page are the values of the stored stats.json and the cover
+    page on the six public protocols (the source items changed, the values did not)."""
+    docs = public_docs()
+    if not docs:
+        return
+    from retrieve import IDENTITY_FIELDS, identity_block
+
+    methods = {"cover-page label", "title page", "running header", "labelled pattern", "header/footer frequency",
+               "history table", "registry pattern"}  # a rule's method; never "stored" on the public outputs
+    for name in docs:
+        d = fake_doc(name)
+        info, stored = d.document_info(), d.meta
+        ids, cover = stored["identifiers"], info["cover_page"]
+        t = info["titles"]
+        assert (t["detected_title"] or {}).get("value") == stored["title"], name
+        assert (t["official_title"] or {}).get("value") == (cover["official_title"]["value"] if "official_title" in cover
+                                                            else stored["title"]), name
+        assert (t["brief_title"] or {}).get("value") == (cover["brief_title"]["value"] if "brief_title" in cover
+                                                         else None), name
+        assert (t["acronym"] or {}).get("value") == (cover["acronym"]["value"] if "acronym" in cover
+                                                     else stored["acronym"]), name
+        for key, label in IDENTITY_FIELDS:
+            v = info["identifiers"][key]
+            assert (v or {}).get("value") == ids[key], (name, key)
+            if v:
+                assert v["label"] == label and v["method"] in methods and v["source"], (name, key, v["method"])
+        ver = info["version"]
+        assert (ver["label"], ver["amendment"]) == (stored["version_label"], stored["amendment"]), name
+        assert (ver["date"] or {}).get("value") == stored["version_date"], name
+        for key, field_name in (("cover_amendment", "amendment"), ("cover_version", "version"),
+                                ("cover_approval_date", "approval_date")):
+            assert (ver[key] or {}).get("value") == (cover[field_name]["value"] if field_name in cover else None), \
+                (name, key)
+        for v in [*t.values(), ver["date"]]:  # every sourced title / date: value, method, source
+            if v:
+                assert set(v) == {"value", "method", "source"} and v["method"] in methods, (name, v)
+                assert v["source"] is None or set(v["source"]) == SOURCE_KEYS, (name, v)
+        assert info["sponsor"]["name"] == PUBLIC[name], name
+        assert info["sponsor"]["name"] in info["sponsor"]["value"], name
+        assert info["other_identifiers_cited"] == (ids.get("others") or {}), name
+        assert info["identity_block"] == identity_block(stored, ids).text, name
+        for key, c in cover.items():  # the cover page: label values read from the items they name
+            assert set(c) == {"value", "page", "text", "refs"} and c["refs"], (name, key)
+            assert c["text"] == " / ".join(" ".join(d._resolve(r).text.split()) for r in c["refs"]), (name, key)
+        for key in ("cover_amendment", "cover_version", "cover_approval_date"):
+            v = ver[key]
+            if v:  # the shape of the cover values: no method, no row
+                src = v["source"]
+                assert set(v) == {"value", "source"}, (name, key)
+                assert set(src) == {"page", "layer", "text", "refs", "ref", "section_id"}, (name, key)
+                assert src["layer"] == "body" and src["ref"] == src["refs"][0], (name, key)
+                assert src["section_id"] == d._section_of(src["ref"]), (name, key)
+        assert info["provenance"]["pages"] and info["provenance"]["refs"], name
+
+
+@case
+def test_document_info_computed_once_and_copied():
+    """The identity record is built once per open document (also for search); document_info is built once and
+    each call returns its own copy with the warnings of that moment."""
+    matrix = np.load(LZZT / "chunks" / "embeddings.npy")
+    d = api.ProtocolDocument.open(LZZT, embed_fn=lambda text: matrix[7], rerank_fn=keep_order)
+    real, builds, opening_warnings = api.build_identity, [], list(d.warnings)
+
+    def counting(*args, **kwargs):
+        builds.append(kwargs.get("section_of"))
+        return real(*args, **kwargs)
+
+    api.build_identity = counting
+    try:
+        first = d.document_info()
+        second = d.document_info()
+        assert first == second and first is not second
+        assert d.search("uncached question about the study design", k=4)["identity"]["provenance"]["refs"]
+        assert len(builds) == 1 and builds[0] == d._section_of  # the repaired section assignment, not the default
+    finally:
+        api.build_identity = real
+    # a warning added between two calls (other tools append them) appears in the second
+    d.warnings.append("a warning added between the calls")
+    third = d.document_info()
+    assert third["warnings"] == first["warnings"] + ["a warning added between the calls"]
+    assert {k: v for k, v in third.items() if k != "warnings"} == {k: v for k, v in first.items() if k != "warnings"}
+    assert first["warnings"] == second["warnings"] == opening_warnings
+    # mutating a returned result (values, nested lists, whole keys) does not change the next one
+    snapshot = copy.deepcopy(third)
+    third["warnings"].append("x")
+    third["titles"]["official_title"]["value"] = "changed"
+    third["titles"]["official_title"]["source"]["refs"].append("#/texts/99999")
+    third["identifiers"]["sponsor_protocol_id"]["source"]["text"] = "changed"
+    third["sponsor"]["provenance"]["refs"].clear()
+    third["cover_page"].clear()
+    third["soa_tables"].clear()
+    third["provenance"]["pages"].append(999)
+    del third["identity_block"]
+    assert d.document_info() == snapshot
+    # one result holds no list twice: changing the refs of one value cannot change another's
+    seen: list[int] = []
+
+    def list_ids(x: object) -> None:
+        if isinstance(x, dict):
+            for v in x.values():
+                list_ids(v)
+        elif isinstance(x, list):
+            seen.append(id(x))
+            for v in x:
+                list_ids(v)
+
+    list_ids(d.document_info())
+    assert len(seen) == len(set(seen))
+
+
 # =========================================================================== outline / find
 
 @case
@@ -188,6 +496,18 @@ def test_outline():
 
 
 @case
+def test_outline_section_and_parent_ids():
+    if not public(LZZT):
+        return
+    d = doc(LZZT)
+    secs = d.outline()["sections"]
+    for s in secs:  # section_id / parent_id as in every other tool; id / parent stay (the demo UI reads them)
+        assert s["section_id"] == s["id"] and s["parent_id"] == s["parent"], s["id"]
+        assert s["parent_id"] == d.index.by_id[s["section_id"]].parent_id
+    assert next(s for s in secs if s["section_id"] == "S3.4.2.1")["parent_id"] == "S3.4.2"
+
+
+@case
 def test_find_sections():
     d = doc(LZZT)
     r = d.find_sections(role="inclusion")
@@ -201,6 +521,29 @@ def test_find_sections():
     assert doc(LILLY).find_sections(query="schedule of activities")["sections"][0]["section_id"] == "S2"
     raises(api.ProtocolAPIError, d.find_sections, role="no_such_role")
     raises(api.ProtocolAPIError, d.find_sections)
+
+
+@case
+def test_find_sections_hint():
+    if not public(LZZT):
+        return
+    d = doc(LZZT)
+    # sections with the role exist, the query matches none of them: say so, and how to list them
+    n = sum(s.role == "inclusion" for s in d.index.sections)
+    r = d.find_sections(role="inclusion", query="zqxv nothing matches")
+    assert r["count"] == 0 and n >= 1
+    assert r["hint"] == (f"no section with role 'inclusion' matches the query 'zqxv nothing matches'; {n} "
+                         "section(s) have this role: call find_sections with role='inclusion' and no query to list them")
+    # no section has the role: where its content usually sits (with or without a query), as before
+    present = {s.role for s in d.index.sections}
+    absent = [x for x in api.ROLE_FALLBACK if x not in present]
+    assert absent, "LZZT has a section for every role of ROLE_FALLBACK"
+    want = f"no section has role {absent[0]!r}; its content usually sits under {' / '.join(api.ROLE_FALLBACK[absent[0]])}"
+    for query in (None, "zqxv nothing matches"):
+        r = d.find_sections(role=absent[0], query=query)
+        assert r["count"] == 0 and r["hint"] == want, query
+    for role in (x for x in api.ROLES if x not in present and x not in api.ROLE_FALLBACK):
+        assert "hint" not in d.find_sections(role=role), role
 
 
 # =========================================================================== read_section
@@ -283,6 +626,22 @@ def test_read_section_cursor_and_resolution():
         est = d.read_section("estimands")
         assert est["section_id"] in d._role_roots("objectives_endpoints")
         assert any("objectives_endpoints" in w for w in est["warnings"])
+
+
+@case
+def test_read_section_next_keeps_with_blocks():
+    if not public(LILLY):
+        return
+    d = doc(LILLY)
+    for with_blocks in (False, True):
+        r = d.read_section("S2", max_tokens=600, with_blocks=with_blocks)
+        assert r["next"]["arguments"] == {"cursor": r["cursor"], "max_tokens": 600, "with_blocks": with_blocks}
+        assert ("blocks" in d.read_section(**r["next"]["arguments"])) is with_blocks
+    # an agent that passes "next" back as it is: every part of a with_blocks=False read comes without blocks
+    parts = [d.call_tool("read_section", {"section": "S2", "max_tokens": 600, "with_blocks": False})]
+    while parts[-1]["cursor"]:
+        parts.append(d.call_tool(parts[-1]["next"]["tool"], parts[-1]["next"]["arguments"]))
+    assert len(parts) >= 2 and not any("blocks" in p for p in parts)
 
 
 @case
@@ -456,6 +815,218 @@ def test_quote_check():
     assert r["found"] and r["locations"][0]["provenance"]["section_id"] == "S6.1"
 
 
+@case
+def test_quote_check_figure_text_pages():
+    if not public(LZZT, LILLY):
+        return
+    d = doc(LILLY)
+    item = d._resolve("#/texts/822")
+    assert item.prov == [] and item.parent.cref == "#/pictures/0"  # flattened figure OCR text: no pages of its own
+    loc = d.quote_check(" ".join(item.text.split())[:60])["locations"][0]
+    assert loc["kind"] == "figure_text" and loc["provenance"]["refs"] == ["#/texts/822"]
+    assert loc["provenance"]["pages"] == [24] == api._pages_of(d._resolve("#/pictures/0"))  # the picture's
+    for path in (LZZT, LILLY):
+        figs = [s for s in doc(path)._segments()["body"] if s.kind == "figure_text"]
+        assert figs and all(s.pages for s in figs), path.name
+
+
+@case
+def test_quote_check_count_uncapped_by_layer():
+    if not public(LZZT, LILLY):
+        return
+    d = doc(LZZT)
+    exact = d._text_streams()["exact"]
+    want = {"body": exact[0].text.count("the"), "furniture": exact[1].text.count("the")}
+    r = d.quote_check("the")
+    assert r["count"] == sum(want.values()) > 200 and r["count_by_layer"] == want  # no cap at 200 per layer
+    assert len(r["locations"]) == api.MAX_LOCATIONS and r["more_locations"] == r["count"] - api.MAX_LOCATIONS
+    s = d.quote_check("the", section_id="S3")
+    assert 0 < s["count"] < r["count"] and s["count_by_layer"] == {"body": s["count"], "furniture": 0}
+    assert s["more_locations"] == s["count"] - api.MAX_LOCATIONS and len(s["found_elsewhere"]) == api.MAX_LOCATIONS
+    none = d.quote_check("zqxv completely absent text here")
+    assert none["count"] == 0 and none["count_by_layer"] == {"body": 0, "furniture": 0}
+    # AI-generated figure descriptions are not counted (the public outputs have none: one is added here)
+    d = api.ProtocolDocument.open(LZZT)
+    segs = d._segments()
+    ai = api._Seg("Flow chart: zqxv unicorn visit. Males and postmenopausal females at least 50 years of age.",
+                  "#/pictures/0", [5], "ai_generated", "figure_description")
+    d._segments = lambda: {**segs, "ai_generated": [ai]}
+    r = d.quote_check("zqxv unicorn visit")
+    assert not r["found"] and r["count"] == 0 and r["count_by_layer"] == {"body": 0, "furniture": 0}
+    assert [x["layer"] for x in r["found_in_ai_text"]] == ["ai_generated"] and r["warning"]
+    r = d.quote_check("Males and postmenopausal females at least 50 years of age")
+    assert r["found"] and r["count"] == 1 and r["count_by_layer"] == {"body": 1, "furniture": 0}
+    assert len(r["found_in_ai_text"]) == 1
+    r = d.quote_check("Flow chart … unicorn visit")  # an elided quote only in AI text
+    assert not r["found"] and r["count"] == 0 and r["found_in_ai_text"] and r["warning"]
+
+
+@case
+def test_quote_check_document_text_before_ai_text():
+    if not public(LZZT):
+        return
+    # a single quote: the first tier with a match in the document text wins, although an earlier tier matches an
+    # AI-generated figure description; only when no tier matches document text is the AI match reported (not found)
+    d = api.ProtocolDocument.open(LZZT)
+    q, ai = "Zqxv Unicorn Visit at Week 4", "Flow chart: Zqxv Unicorn Visit at Week 4, then follow-up."
+
+    def check(body: str) -> dict:
+        segs = {"body": [api._Seg(body, "#/texts/90001", [3], "body", "text")], "furniture": [],
+                "ai_generated": [api._Seg(ai, "#/pictures/0", [5], "ai_generated", "figure_description")]}
+        d._segments, d._streams, d._words = (lambda: segs), None, None
+        return d.quote_check(q)
+
+    for body, tier in (("Each participant attends the ZQXV UNICORN VISIT AT WEEK 4.", "normalized"),
+                       ("Each participant attends the zqxv-unicorn (visit) at week 4.", "compact"),
+                       ("Each participant attends the Zqxv Unicorn Visit at Week 4.", "exact")):
+        r = check(body)
+        assert r["found"] and r["match"] == tier and r["count"] == 1, (tier, r["found"], r["match"])
+        assert r["count_by_layer"] == {"body": 1, "furniture": 0} and r["locations"][0]["layer"] == "body"
+        assert [(x["layer"], x["match"]) for x in r["found_in_ai_text"]] == [("ai_generated", tier)] and r["warning"]
+    r = check("Each participant attends the screening visit.")  # only the AI text holds it
+    assert not r["found"] and r["match"] is None and r["count"] == 0 and r["locations"] == []
+    assert [(x["layer"], x["match"]) for x in r["found_in_ai_text"]] == [("ai_generated", "exact")] and r["warning"]
+
+
+@case
+def test_quote_check_furniture_slots():
+    if not public(LILLY):
+        return
+    d = doc(LILLY)
+    q = "I8R-JE-IGBJ"  # 11 times in the body, 72 times in page headers/footers
+    r = d.quote_check(q)
+    nb, nf = r["count_by_layer"]["body"], r["count_by_layer"]["furniture"]
+    assert nb >= 9 and nf >= 2 and r["count"] == nb + nf
+    every = d.quote_check(q, max_locations=1000)["locations"]
+    assert [x["layer"] for x in every] == ["body"] * nb + ["furniture"] * nf
+    assert r["locations"] == every[:api.MAX_LOCATIONS - 2] + every[nb:nb + 2]  # 2 furniture ones replace the last body ones
+    assert r["more_locations"] == r["count"] - api.MAX_LOCATIONS
+    assert d.quote_check(q, max_locations=3)["locations"] == every[:3]  # fewer than 4 slots: as found
+    # found_elsewhere follows the same rule (a section without the identifier: every match is elsewhere)
+    sid = next(s.section_id for s in d.index.sections
+               if not d._children(s.section_id) and d.quote_check(q, section_id=s.section_id)["count"] == 0)
+    e = d.quote_check(q, section_id=sid)
+    assert [x["layer"] for x in e["found_elsewhere"]] == ["body"] * (api.MAX_LOCATIONS - 2) + ["furniture"] * 2
+
+
+@case
+def test_quote_check_elided_in_order():
+    a, b, c = "Males and postmenopausal females", "MMSE score of 10 to 23", "Alupent"
+    if public(LZZT):
+        d = doc(LZZT)
+        r = d.quote_check(f"{a} … {b}")
+        assert r["found"] and r["match"] == "elided" and r["count"] == 1 and r["section_id"] is None
+        assert r["count_by_layer"] == {"body": 1, "furniture": 0} and len(r["locations"]) == 1
+        loc = r["locations"][0]  # one location from the first part's start to the last part's end
+        assert loc["provenance"]["refs"][0] == "#/texts/85" and len(loc["provenance"]["refs"]) >= 3
+        assert a in loc["text"] and b in loc["text"] and r["provenance"] == loc["provenance"]
+        assert [(p["part"], p["found"]) for p in r["parts"]] == [(a, True), (b, True)]
+        # both parts occur once (at every tier), close together, but not in this order
+        e, compact = "Large vessel strokes", d._text_streams()["compact"][0].text
+        assert compact.count(api._compact_form(a)) == compact.count(api._compact_form(e)) == 1
+        assert 0 < compact.find(api._compact_form(e)) - compact.find(api._compact_form(a)) < 2000
+        assert d.quote_check(f"{a} … {e}")["found"]
+        r = d.quote_check(f"{e} ... {a}")
+        assert not r["found"] and r["match"] is None and r["count"] == 0 and all(p["found"] for p in r["parts"])
+        # not found: the passage closest to the parts joined
+        r = d.quote_check("Males and postmenopausal females at least … 60 years of age")
+        assert not r["found"] and r["closest"]["provenance"]["refs"] == ["#/texts/85"]
+        assert r["closest"] == d._closest("Males and postmenopausal females at least 60 years of age", None)
+        # in order, but more than 2,000 characters apart
+        norm, na, nc = d._text_streams()["normalized"][0].text, api._norm_form(a), api._norm_form(c)
+        assert norm.count(na) == norm.count(nc) == 1 and norm.find(nc) - (norm.find(na) + len(na)) > 2000
+        r = d.quote_check(f"{a} [...] {c}")  # (no compact tier: "Alupent" has fewer than 12 letters)
+        assert not r["found"] and all(p["found"] for p in r["parts"])
+        # section_id: sequences outside the section are found_elsewhere
+        r = d.quote_check(f"{a} … {b}", section_id="S3.4.2.1")
+        assert r["found"] and r["section_id"] == "S3.4.2.1" and r["count"] == 1
+        r = d.quote_check(f"{a} … {b}", section_id="S2")
+        assert not r["found"] and r["section_id"] == "S2" and r["count"] == 0
+        assert [x["provenance"]["section_id"] for x in r["found_elsewhere"]] == ["S3.4.2.1"]
+        # three objectives start with the same words, one ends so: one tight sequence, in that objective only
+        r = d.quote_check("To assess the dose-dependent … assessment (see Attachment LZZT.2).")
+        assert r["count"] == 1 and [x["provenance"]["refs"] for x in r["locations"]] == [["#/texts/38"]]
+        # an elided result follows the listing rules: every sequence counted, header/footer slots, more_locations
+        d = api.ProtocolDocument.open(LZZT)
+        seg = [api._Seg("alpha beta gamma delta", f"#/texts/9{i:04d}", [i + 1], "body" if i < 9 else "furniture",
+                        "text") for i in range(12)]
+        d._segments = lambda: {"body": seg[:9], "furniture": seg[9:], "ai_generated": []}
+        r = d.quote_check("alpha beta … gamma delta")
+        assert r["found"] and r["count"] == 12 and r["count_by_layer"] == {"body": 9, "furniture": 3}
+        assert [x["layer"] for x in r["locations"]] == ["body"] * (api.MAX_LOCATIONS - 2) + ["furniture"] * 2
+        assert r["more_locations"] == 12 - api.MAX_LOCATIONS and r["provenance"] == r["locations"][0]["provenance"]
+
+    def stream(*texts: str) -> api._Stream:
+        return api._Stream([api._Seg(t, f"#/texts/{i}", [1], "body", "text") for i, t in enumerate(texts)],
+                           api._exact_form, " ")
+
+    ab, gd = "alpha beta", "gamma delta"
+    # the 2,000-character rule at its boundary (stream offsets from the end of one part to the start of the next)
+    assert api._sequences(stream(ab, "z" * 1998, gd), [ab, gd]) == [(0, 2021)]
+    assert api._sequences(stream(ab, "z" * 1999, gd), [ab, gd]) == []
+    assert api._sequences(stream(ab, "z" * 48, gd), [gd, ab]) == []
+    # tight, never overlapping: part-1 occurrences before one later part give one sequence, from the last of them
+    st = stream("alpha beta one", "alpha beta two", "alpha beta three", gd)
+    assert api._sequences(st, [ab, gd]) == [(st.text.rindex(ab), len(st.text))]
+    st = stream(ab, "alpha beta", gd, ab, "epsilon zeta")  # the third part-1 occurrence lies inside the sequence
+    assert api._sequences(st, [ab, gd, "epsilon zeta"]) == [(len(ab) + 1, len(st.text))]
+    st = stream(ab, gd, "filler text", ab, gd)  # two separate places
+    assert api._sequences(st, [ab, gd]) == [(0, len(f"{ab} {gd}")), (st.text.rindex(ab), len(st.text))]
+    # 3 or more parts: when a part's first occurrence in the window completes no chain, a later one inside the
+    # window can. A, B 1 character later, a second B 1,507 after A, C 1,502 after the second B (3,008 after the first)
+    ez, et = "epsilon zeta", "eta theta"
+    st = stream(ab, gd, "z" * 1493, gd, "z" * 1500, ez)
+    b1, b2, c = st.text.index(gd), st.text.rindex(gd), st.text.index(ez)
+    assert (b1 - len(ab), b2 - len(ab), c - (b2 + len(gd)), c - (b1 + len(gd))) == (1, 1507, 1502, 3008)
+    assert api._sequences(st, [ab, gd, ez]) == [(0, len(st.text))]
+    st = stream(ab, gd, "z" * 1480, ab, gd, "z" * 1500, ez)  # the anchor: the last A that ends before the chosen B
+    assert api._sequences(st, [ab, gd, ez]) == [(st.text.rindex(ab), len(st.text))]
+    st = stream(ab, gd, ez, "z" * 1200, ez, "z" * 1200, et)  # a later third part, the fourth from it
+    assert api._sequences(st, [ab, gd, ez, et]) == [(0, len(st.text))]
+
+    def spelled_out(text: str, needles: list[str], later: bool = True) -> list[tuple[int, int]]:
+        """The rule as stated: from each first-needle occurrence, each next needle tries its occurrences inside the
+        window in order and takes the first that completes the chain (later=False: only its first occurrence there,
+        the rule before this fix); the anchor is the last first-needle occurrence ending by the chosen second needle;
+        the next anchor starts at or after the sequence's end."""
+        occ = [[m.start() for m in re.finditer(f"(?={re.escape(n)})", text)] for n in needles]
+
+        def chain(k: int, end: int) -> list[int] | None:
+            if k == len(needles):
+                return []
+            for s in [s for s in occ[k] if s >= end][:None if later else 1]:
+                if s - end > api.ELIDED_GAP:
+                    break
+                rest = chain(k + 1, s + len(needles[k]))
+                if rest is not None:
+                    return [s, *rest]
+            return None
+
+        out, i = [], 0
+        while i < len(occ[0]):
+            got = chain(1, occ[0][i] + len(needles[0]))
+            if got is None:
+                i += 1
+                continue
+            end = got[-1] + len(needles[-1])
+            out.append((max(f for f in occ[0] if f + len(needles[0]) <= got[0]), end))
+            i = next((j for j, f in enumerate(occ[0]) if f >= end), len(occ[0]))
+        return out
+
+    rng, changed = random.Random(11), 0
+    for _ in range(300):  # random streams of the parts and filler: 2 parts as before, 3 or more as spelled out
+        st = stream(*[rng.choice([ab, gd, ez, et]) if rng.random() < 0.6 else "z" * rng.randrange(1300)
+                      for _ in range(rng.randrange(2, 16))])
+        for needles in ([ab, gd], [gd, ab], [ab, ab], [ab, gd, ez], [ab, gd, ab], [ab, gd, ez, et]):
+            got = api._sequences(st, needles)
+            assert got == spelled_out(st.text, needles), (needles, st.text)
+            if len(needles) == 2:
+                assert got == spelled_out(st.text, needles, later=False), (needles, st.text)
+            else:
+                changed += got != spelled_out(st.text, needles, later=False)
+    assert changed > 0  # the streams do exercise the later occurrences
+
+
 # =========================================================================== tool layer / CLI
 
 @case
@@ -494,6 +1065,44 @@ def test_tool_schemas_and_call_tool():
     assert "invalid arguments" in d.call_tool("find_sections", {"role": "no_such_role"})["error"]
     assert "unknown tool" in d.call_tool("delete_everything", {})["error"]
     assert d.call_tool("get_table", {"table": "#/tables/999"})["error_type"] == "NotFoundError"
+
+
+@case
+def test_search_schema_rendered():
+    import jsonschema
+
+    schema = next(t for t in api.tool_schemas() if t["name"] == "search")["input_schema"]
+    assert schema["properties"]["rendered"] == {
+        "type": "boolean", "default": False,
+        "description": "Also return 'context': the context string exactly as an answering model sees it."}
+    jsonschema.validate({"query": "dose", "rendered": True}, schema)
+    if not public(LZZT):
+        return
+    r = doc(LZZT).call_tool("search", {"query": cached_question("LZZT_CDISC_Pilot"), "rendered": True})
+    assert "error" not in r and r["context"].strip(), r.get("error")
+
+
+@case
+def test_quote_check_description():
+    desc = next(t for t in api.tool_schemas() if t["name"] == "quote_check")["description"]
+    for words in ("count of every match", "count_by_layer", f"up to {api.MAX_LOCATIONS} locations",
+                  "up to 2 listed places are kept for header/footer matches when both layers match", "in this order",
+                  "within 2,000 characters"):
+        assert words in desc, words
+
+
+@case
+def test_call_tool_error_types():
+    if not public(LZZT):
+        return
+    d = doc(LZZT)
+    assert d.call_tool("delete_everything", {}) == {"error": "unknown tool 'delete_everything'",
+                                                    "error_type": "UnknownTool", "tools": [t["name"] for t in api.TOOLS]}
+    for name, args in (("quote_check", {"quote": 5}), ("quote_check", {"quote": "x", "bogus": 1}),
+                       ("find_sections", {"role": "no_such_role"})):
+        r = d.call_tool(name, args)
+        assert set(r) == {"error", "error_type", "tool"} and (r["error_type"], r["tool"]) == ("InvalidArguments", name)
+        assert r["error"].startswith(f"invalid arguments for {name}: "), r["error"]
 
 
 @case

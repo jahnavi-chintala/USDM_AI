@@ -10,7 +10,9 @@ Pipeline entry point (service.pipeline.process_document; the worker takes any ca
     worker can publish workdir as a whole. Nothing is written elsewhere except the shared caches under
     config.cache_dir.
   - A fatal error raises; the worker records the exception type and our own file:line only (never the
-    message: it can quote document text) and keeps the full traceback in workdir/logs/.
+    message: it can quote document text) and keeps the full traceback in workdir/logs/. The exception may carry
+    `pipeline_stages`, a list of StageResult: the stages that completed, then the failing one with status
+    "failed"; the worker records them on the failed job (without it the job has no stages).
   - Non-fatal problems (a figure the model could not describe, a stage skipped because OPENROUTER_OFFLINE is
     set) come back as warnings with status "done_with_warnings".
 """
@@ -52,7 +54,7 @@ class PipelineResult:
     fingerprint: str
     sha256: str                    # of the PDF bytes (= doc_id)
     pages: int
-    identifiers: dict              # {"nct", "sponsor_protocol_id", "version", "date", ...}: values or None
+    identifiers: dict              # pipeline.IDENTIFIER_KEYS (nct, sponsor_protocol_id, ..., sponsor): values or None
     quality: dict                  # summary; the full report is workdir/quality.json
     warnings: list[str] = field(default_factory=list)
     stages: list[StageResult] = field(default_factory=list)

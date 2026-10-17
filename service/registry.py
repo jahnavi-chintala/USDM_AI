@@ -15,7 +15,7 @@ Tables
   jobs              seq (FIFO order), job_id, doc_id, state, kind ("process" | "reprocess" | "import"),
                     reprocess (0/1), filename, stage, progress_done/total, attempts, created/started/finished_at,
                     error_type + error_where (our file:line only, never an exception message), warnings (JSON),
-                    stages (JSON StageResult list)
+                    stages (JSON StageResult list; a failed job: the stages that completed, then the failing one)
   related_documents doc_a < doc_b, reason ("same nct" | "same sponsor_protocol_id")
 
 Upload decision (Registry.ingest, the one entry point for REST and MCP uploads):
@@ -25,7 +25,10 @@ Upload decision (Registry.ingest, the one entry point for REST and MCP uploads):
     reprocess job is queued (caches seeded, the old result stays served until the new one is published)
   - no published result (new, failed or cancelled)          -> a new job is queued
   - always: another doc_id with the same text_fingerprint   -> warning "same text as <doc_id>" (never merged)
-A PDF password is held in memory only (Registry.pdf_passwords), never in SQLite, files or logs.
+duplicate=True means these bytes were already known (they have a result or an active job), also when a reprocess
+job was just queued for a document with a result; clients branch on queued / job_id, not on duplicate.
+A PDF password (an upload's, or a reprocess's) is held in memory only (Registry.pdf_passwords), never in SQLite,
+files or logs.
 """
 
 from __future__ import annotations
@@ -389,9 +392,11 @@ class Registry:
         return decision
 
     def request_reprocess(self, storage: Storage, doc_id: str, *, pipeline_version: str, fingerprint: str,
-                          force: bool = False) -> dict:
+                          force: bool = False, password: str | None = None) -> dict:
         """Reprocess a published document from its stored source.pdf (no new upload). Queues a job when the
-        result is stale (or force=True); returns the same dict as ingest(). NotFound without a stored source."""
+        result is stale (or force=True); returns the same dict as ingest(). NotFound without a stored source.
+        password: of an encrypted source.pdf, held in memory for the queued job (as in ingest()), dropped when
+        no job was queued."""
         check_doc_id(doc_id)
         doc = self._one("SELECT filenames FROM documents WHERE doc_id=?", (doc_id,))
         if doc is None:
@@ -400,15 +405,18 @@ class Registry:
         if not storage.seed_reprocess(doc_id, job_id):
             storage.remove_workdir(job_id)
             raise NotFound(f"{doc_id}: no stored source.pdf")
+        self.pdf_passwords.put(job_id, password)
         try:
             with self._tx() as c:
                 names = json.loads(doc["filenames"] or "[]")
                 decision = self._decide(c, doc_id, job_id, pipeline_version=pipeline_version, fingerprint=fingerprint,
                                         reprocess=True, filename=names[0] if names else None, force=force)
         except BaseException:
+            self.pdf_passwords.discard(job_id)
             storage.remove_workdir(job_id)
             raise
         if decision["job_id"] != job_id:
+            self.pdf_passwords.discard(job_id)
             storage.remove_workdir(job_id)
         return decision
 
@@ -510,16 +518,19 @@ class Registry:
             self._link_related(c, doc_id)
             return self._job_dict(c.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())
 
-    def record_failure(self, job_id: str, error_type: str, error_where: str | None) -> None:
-        """The job failed: exception type and our own file:line only. A published result stays as it is."""
+    def record_failure(self, job_id: str, error_type: str, error_where: str | None,
+                       stages: list | None = None) -> None:
+        """The job failed: exception type and our own file:line only. stages: the StageResults the pipeline got
+        through (completed ones, then the failing one with status "failed"). A published result stays as it is."""
         error_type, error_where = _short(error_type, 120) or "Error", _short(error_where, 300)
         with self._tx() as c:
             job = c.execute("SELECT doc_id FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             if job is None:
                 raise NotFound(job_id)
             now = utcnow()
-            c.execute("UPDATE jobs SET state='failed', finished_at=?, error_type=?, error_where=? "
-                      "WHERE job_id=? AND state IN ('queued','running')", (now, error_type, error_where, job_id))
+            c.execute("UPDATE jobs SET state='failed', finished_at=?, error_type=?, error_where=?, stages=? "
+                      "WHERE job_id=? AND state IN ('queued','running')",
+                      (now, error_type, error_where, _stages_json(stages), job_id))
             c.execute("UPDATE documents SET status='failed', error=?, updated_at=? WHERE doc_id=? AND current_job_id=?",
                       (json.dumps({"type": error_type, "where": error_where, "job_id": job_id}), now,
                        job["doc_id"], job_id))

@@ -27,6 +27,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from service.config import ROOT, ServiceConfig
 from service.contracts import PipelineResult
+from service.pipeline import document_identifiers
 from service.registry import (IMPORTED_VERSION, DocumentBusy, Registry, inspect_pdf_in_process)
 from service.storage import LocalStorage, SOURCE_NAME, Storage, check_doc_id, new_job_id, utcnow
 
@@ -120,17 +121,6 @@ def referenced_image_dirs(json_path: Path) -> list[str]:
     return sorted(dirs)
 
 
-def identifiers_from_stats(stats: dict) -> dict:
-    """Identifiers from chunk_protocol.py's stats.json ("document": doc_metadata + registry identifiers)."""
-    meta = stats.get("document") or {}
-    ids = meta.get("identifiers") or {}
-    out = {"nct": ids.get("nct"), "sponsor_protocol_id": ids.get("sponsor_protocol_id") or meta.get("protocol_id"),
-           "version": meta.get("version_label"), "date": meta.get("version_date"), "acronym": meta.get("acronym")}
-    for key in ("eudract", "eu_ct", "ind", "who_utn"):
-        out[key] = ids.get(key)
-    return out
-
-
 def _copy_outputs(folder: Path, stem: str, work: Path) -> list[str]:
     copied = []
     for suffix in MAIN_SUFFIXES:
@@ -199,15 +189,11 @@ def import_folder(config: ServiceConfig, folder: Path | str, *, pdf: Path | str 
             storage.remove_workdir(job_id)
             raise
         try:
-            stats = json.loads((work / "chunks" / "stats.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            stats = {}
-        try:
             quality = (json.loads((work / "quality.json").read_text(encoding="utf-8")) or {}).get("summary") or {}
         except (OSError, ValueError, AttributeError):
             quality = {}
         result = PipelineResult(status="done", pipeline_version=version[0], fingerprint=version[1], sha256=doc_id,
-                                pages=info.get("pages") or 0, identifiers=identifiers_from_stats(stats),
+                                pages=info.get("pages") or 0, identifiers=document_identifiers(work),
                                 quality=quality, warnings=[])
         try:
             storage.write_publish_record(job_id, {"job_id": job_id, "doc_id": doc_id, "published_at": utcnow(),

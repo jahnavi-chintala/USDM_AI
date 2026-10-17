@@ -12,6 +12,7 @@
 !figure_vlm.py
 !glossary.py
 !hybrid_backend.py
+!identity.py
 !keyterm_match.py
 !openrouter_http.py
 !parents.py
@@ -39,6 +40,7 @@
 !table_lattice.py
 !table_merge.py
 !text_reconcile.py
+!tokenizer_cache.py
 !usdm_gold.py
 !validate_output.py
 !tools/mermaid_validate/package.json

@@ -122,8 +122,11 @@ SERVICE_TOOLS: list[dict] = [
          "additionalProperties": False}},
 ]
 READ_ONLY = types.ToolAnnotations(read_only_hint=True, open_world_hint=False)
+# open world: these call OpenRouter (search: the query embedding and the reranker; ingest_document: the processing)
+SEARCH = types.ToolAnnotations(read_only_hint=True, open_world_hint=True)
 INGEST = types.ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
-                               open_world_hint=False)
+                               open_world_hint=True)
+ANNOTATIONS = {"search": SEARCH, "ingest_document": INGEST}   # every other tool: READ_ONLY
 
 ServiceGetter = Callable[[], "ProtocolService | None"]
 
@@ -244,7 +247,7 @@ def build_server(get_service: ServiceGetter) -> Server:
     validators = {name: Draft202012Validator(schema) for name, schema in schemas.items()}
     listing = types.ListToolsResult(tools=[
         types.Tool(name=t["name"], description=t["description"], input_schema=t["input_schema"],
-                   annotations=INGEST if t["name"] == "ingest_document" else READ_ONLY) for t in definitions])
+                   annotations=ANNOTATIONS.get(t["name"], READ_ONLY)) for t in definitions])
 
     async def list_tools(ctx, params) -> types.ListToolsResult:
         return listing

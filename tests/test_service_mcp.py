@@ -201,6 +201,10 @@ def test_tool_listing() -> None:
                 assert t.input_schema == by_name[t.name]["input_schema"], t.name
                 assert t.description == by_name[t.name]["description"], t.name
                 assert t.annotations.read_only_hint is (t.name != "ingest_document"), t.name
+                # the tools that call OpenRouter (search: query embedding and rerank; ingest_document: processing)
+                assert t.annotations.open_world_hint is (t.name in ("search", "ingest_document")), t.name
+            ingest = next(t for t in tools if t.name == "ingest_document").annotations
+            assert ingest.destructive_hint is False and ingest.idempotent_hint is True
             assert client.server_info.name == "protocol-service" and client.server_info.version == PIPELINE_VERSION
             assert "quote_check" in client.instructions and "get_document" in client.instructions
             err(await client.call_tool("list_documents", {}), "not_started")  # the getter returns no service

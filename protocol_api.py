@@ -9,8 +9,10 @@ trace and verify every value it extracts, so every tool returns complete content
 
     doc = ProtocolDocument.open("output_public/LZZT_CDISC_Pilot")   # folder with the Docling JSON + chunks/
     doc.document_info()                      titles, acronym, sponsor protocol id, registry ids (with their verbatim
-                                             source line), version/amendment/date, sponsor, page/section/SoA counts
-    doc.outline(max_level=None)              section tree: id, number, title, level, ICH M11 role, pages, tokens, children
+                                             source line), version/amendment/date, sponsor, page/section/SoA counts;
+                                             each value with its method and the item it was read from (identity.py)
+    doc.outline(max_level=None)              section tree: section_id, number, title, level, ICH M11 role, pages, tokens,
+                                             parent_id, children
     doc.find_sections(role=None, query=None) sections by role and/or fuzzy title match, ranked
     doc.read_section("inclusion")            complete Markdown of a section (id, number or role), tables as Markdown,
                                              figures with OCR text + AI description (labelled), lists with their own
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import copy
 import hashlib
 import json
 import logging
@@ -50,7 +53,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from structure import ROLE_INFO, ROLES, _norm, _tokens as _title_tokens, _w, heading_role
+from identity import build_identity
+from structure import ROLE_INFO, ROLES, SectionIndex, _norm, _tokens as _title_tokens, _w, heading_role
+from tokenizer_cache import shared_tokenizer
 
 log = logging.getLogger("protocol_api")
 
@@ -59,6 +64,7 @@ TOKENIZER = "Qwen/Qwen3-Embedding-8B"  # the embedding model's tokenizer, as eve
 DEFAULT_TOOL_MAX_TOKENS = 16000  # read_section via call_tool: longer content comes with a continuation cursor
 QUOTE_CONTEXT = 160  # characters of verbatim text kept on each side of a quote_check match
 MAX_LOCATIONS = 10
+ELIDED_GAP = 2000  # quote_check "a … b": b starts at most this many characters (stream offsets) after a ends
 
 # A role a protocol may not have as its own section, and where its content then lives.
 ROLE_FALLBACK = {
@@ -169,9 +175,9 @@ class _Stream:
             pos += len(t) + len(sep)
         self.text = sep.join(parts)
 
-    def find_all(self, needle: str, limit: int = 200) -> list[tuple[int, int]]:
+    def find_all(self, needle: str) -> list[tuple[int, int]]:
         out, i = [], self.text.find(needle)
-        while i >= 0 and len(out) < limit:
+        while i >= 0:
             out.append((i, i + len(needle)))
             i = self.text.find(needle, i + 1)
         return out
@@ -182,6 +188,7 @@ class _Stream:
         return [i for i in range(i0, i1 + 1) if self.lens[i] > 0 or i == i0]
 
 
+_LAYERS = ("body", "furniture", "ai_generated")  # quote_check's text streams, in this order
 _WS = re.compile(r"\s+")
 _COMPACT_DROP = re.compile(r"[^\w≥≤<>=%±]|_")
 _WORD = re.compile(r"[^\W_]+")
@@ -203,59 +210,88 @@ def _compact_form(s: str) -> str:
     return _COMPACT_DROP.sub("", _norm_form(s))
 
 
-# =========================================================================== cover page
-
-_COVER_FIELDS = [  # (field, label regex); order matters ("short title" before "title")
-    ("brief_title", r"(?:short|brief|public|lay)\s+(?:protocol\s+|study\s+)?title"),
-    ("official_title", r"(?:official|full|scientific|protocol|study|trial)\s+title|title\s+of\s+(?:the\s+)?(?:study|trial|protocol)|title"),
-    ("acronym", r"(?:study\s+|trial\s+)?acronym"),
-    ("sponsor_protocol_number", r"(?:sponsor\s+)?(?:protocol|study|trial)\s+(?:number|no\.?|code|identifier|id)"),
-    ("amendment", r"amendment\s+(?:number|no\.?)|amendment"),
-    ("version", r"(?:protocol\s+|document\s+)?version(?:\s+(?:number|no\.?))?"),
-    ("sponsor", r"sponsor(?:\s+name)?(?:\s+and\s+(?:legal\s+)?(?:registered\s+)?address)?"),
-    ("sponsor_address", r"(?:sponsor\s+)?legal\s+registered\s+address"),
-    ("phase", r"(?:study\s+|trial\s+|clinical\s+)?phase"),
-    ("compound", r"compound(?:\s+(?:number|name|code))?|investigational\s+(?:medicinal\s+)?product"),
-    ("indication", r"(?:study\s+)?indication"),
-    ("approval_date", r"(?:protocol\s+)?(?:approval|issue|release|effective|version|document|protocol)\s+date|date\s+of\s+(?:protocol|issue|approval)"),
-]
-_COVER_RX = [(f, re.compile(rf"(?i)^\s*(?:{rx})\s*(?:\([^)]{{0,40}}\))?\s*[:：]\s*(?P<value>.*)$")) for f, rx in _COVER_FIELDS]
-_COPYRIGHT = re.compile(r"(?i:copyright)\s*(?:©|\((?i:c)\))?\s*(?:\d{4}(?:\s*[-–,]\s*\d{4})?\s*)?(?:(?i:by)\s+)?"
-                        r"(?P<name>[A-Z][\w&'.-]*(?:\s+(?:[A-Z][\w&'.-]*|and|&|of))*)")
-_PROPERTY = re.compile(r"(?i:property\s+of)\s+(?:(?i:the)\s+)?"
-                       r"(?P<name>[A-Z][\w&'.-]*(?:\s+(?:[A-Z][\w&'.-]*|and\s+(?=[A-Z])|&\s+(?=[A-Z]))){0,5})")
-_COMPANY = re.compile(r"\b(?P<name>[A-Z][A-Za-z&'.-]+(?:\s+(?:[A-Z][A-Za-z&'.-]+|and|&|de|of)){0,5},?\s+"
-                      r"(?:Inc|Incorporated|Ltd|Limited|GmbH|AG|S\.A|SA|N\.V|LLC|plc|PLC|Company|Corporation|Corp|"
-                      r"K\.K|KK|Co\.,?\s*Ltd|Pharmaceuticals?|Pharma|Therapeutics|Biosciences|Biotech|Oncology)\b\.?)")
+def _quote_forms(quote: str) -> dict[str, str]:
+    """The quote at each match tier, without Markdown page markers / section ids / heading marks / table pipes."""
+    q = _MD_NOISE.sub(" ", quote)
+    q = re.sub(r"(?m)^\s*#{1,6}\s+", "", q).strip().strip("|").strip()
+    return {"exact": _exact_form(q), "normalized": _norm_form(q), "compact": _compact_form(q)}
 
 
-def _sponsor_name(value: str) -> str:
-    """'Non-US: Bayer AG, 51368 Leverkusen, Germany' -> 'Bayer AG' (the verbatim value is kept separately)."""
-    v = re.sub(r"^[\w\- ]{1,15}:\s*", "", value.strip())
-    m = re.match(r"(.+?)(?:,\s*(?=\d)|\s+\d{4,}|\s*;|$)", v)
-    return (m.group(1) if m else v).strip(" ,.")
+def _sequences(st: _Stream, needles: list[str]) -> list[tuple[int, int]]:
+    """(start of the first needle, end of the last) of the in-order sequences of the needles in one stream, tight and
+    never overlapping. First-needle occurrences are tried in order: from one, each next needle tries its occurrences
+    starting at or after the end of the previous one and at most ELIDED_GAP characters after it, in order, and takes
+    the first from which the remaining needles complete the chain (a depth-first search over these windows, decided
+    once per occurrence, from the last needle back). A complete chain starts at the LATEST first-needle occurrence
+    that ends by the chosen second needle's start (from there the chain picks the same later occurrences); the next
+    sequence starts at or after its end."""
+    occ = [st.find_all(n) for n in needles]
+    if not all(occ):
+        return []
+    starts = [[a for a, _ in o] for o in occ]
+    # last[k][j]: the end of the last needle of the chain that continues from occurrence j of needle k (None: none
+    # completes); ok[k][j]: the first occurrence >= j of needle k from which a chain completes (None: no such one)
+    last: list[list[int | None]] = [[] for _ in needles]
+    ok: list[list[int | None]] = [[] for _ in needles]
+
+    def link(k: int, end: int) -> int | None:
+        """The first occurrence of needle k inside the window after `end` from which the chain completes."""
+        j = ok[k][bisect.bisect_left(starts[k], end)]
+        return j if j is not None and starts[k][j] - end <= ELIDED_GAP else None
+
+    for k in range(len(needles) - 1, 0, -1):
+        if k == len(needles) - 1:
+            last[k] = [b for _, b in occ[k]]
+        else:
+            for _, b in occ[k]:
+                j = link(k + 1, b)
+                last[k].append(None if j is None else last[k + 1][j])
+        ok[k] = [None] * (len(occ[k]) + 1)
+        for j in range(len(occ[k]) - 1, -1, -1):
+            ok[k][j] = j if last[k][j] is not None else ok[k][j + 1]
+    first_starts, first_ends = starts[0], [b for _, b in occ[0]]
+    out, i = [], 0
+    while i < len(first_starts):
+        j = link(1, first_ends[i])
+        if j is None:
+            i += 1
+            continue
+        end = last[1][j]
+        out.append((first_starts[bisect.bisect_right(first_ends, starts[1][j]) - 1], end))
+        i = bisect.bisect_left(first_starts, end)
+    return out
+
+
+def _listed(matches: list[tuple], k: int) -> list[tuple]:
+    """The matches (layer, ...) quote_check lists, at most k: body before furniture, as found; when both layers
+    matched and k >= 4, at least min(2, furniture matches) page header/footer ones, in place of the last body ones."""
+    body = [m for m in matches if m[0] == "body"]
+    furniture = [m for m in matches if m[0] == "furniture"]
+    n = min(len(body), k - min(2, len(furniture)) if body and furniture and k >= 4 else k)
+    return body[:n] + furniture[:k - n]
 
 
 # =========================================================================== the document
 
 class ProtocolDocument:
     """One converted protocol: Docling JSON + chunks/ (chunks.jsonl, parents.jsonl, sections.json, tables.jsonl,
-    glossary.json, stats.json; embeddings for search). Open with ProtocolDocument.open(out_dir)."""
+    glossary.json, stats.json; embeddings for search). Open with ProtocolDocument.open(out_dir).
+    Not thread-safe: use one lock per document, as service.app_service does (the document, its section index and the
+    search builder share lazily built state)."""
 
     def __init__(self, out_dir: Path, chunks_dir: Path, doc_path: Path, doc: Any, stats: dict, *,
                  embed_fn: Callable[[str], Any] | None = None,
                  rerank_fn: Callable[[str, list[dict], str], list[tuple[int, float]]] | None = None,
                  tokenizer: str = TOKENIZER):
         from chunk_protocol import ProtocolSerializerProvider
-        from parents import owned_refs, section_index
+        from parents import owned_refs
 
         self.out_dir, self.chunks_dir, self.doc_path, self.doc = out_dir, chunks_dir, doc_path, doc
         self.stats = stats
         self.meta: dict = stats.get("document") or {}
         self.source_sha256: str | None = self.meta.get("source_sha256")
         self.warnings: list[str] = []
-        self.index = section_index(doc)  # the same function retrieve's parent store uses
-        self._check_sections_json()
+        self.index = self._load_section_index()
         self.glossary = None
         gpath = next((p for p in (chunks_dir / "glossary.json", chunks_dir / "abbreviations.json") if p.exists()), None)
         if gpath is not None:
@@ -274,7 +310,8 @@ class ProtocolDocument:
         self._sizes: dict[str, tuple[int, int]] | None = None
         self._streams: dict[str, list[_Stream]] | None = None
         self._words: tuple[list[str], list[int], list[_Seg]] | None = None
-        self._cover: dict | None = None
+        self._identity: dict | None = None  # identity.build_identity record, built on first use
+        self._info: dict | None = None  # document_info's result (without the call-time warnings)
         self._soa: list[dict] | None = None
         self._builder = None
         self._qcache: dict | None = None
@@ -320,30 +357,31 @@ class ProtocolDocument:
         doc = DoclingDocument.load_from_json(path)
         return cls(out, chunks, path, doc, stats, embed_fn=embed_fn, rerank_fn=rerank_fn, tokenizer=tokenizer)
 
-    def _check_sections_json(self) -> None:
+    def _load_section_index(self):
+        """The section index stored in chunks/sections.json: the one the chunk records were made with (it equals
+        parents.section_index(doc) for the same code). Absent, unreadable or of another format: rebuilt from the
+        document (with a warning unless the file is absent)."""
+        from parents import FallbackSectionIndex, section_index
+
         f = self.chunks_dir / "sections.json"
         if not f.exists():
-            return
+            return section_index(self.doc)
         try:
-            stored = [s["section_id"] for s in json.loads(f.read_text(encoding="utf-8")).get("sections", [])]
-        except (ValueError, KeyError, AttributeError):
-            return
-        if stored != [s.section_id for s in self.index.sections]:
-            self.warnings.append("sections.json differs from the section index of the current code (structure.py "
-                                 "changed since chunking); the current index is used; chunk records may carry "
-                                 "older section ids - re-run chunk_protocol.py")
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "version" in data:
+                return SectionIndex.from_json(data)
+            if isinstance(data, dict) and "source" in data:
+                return FallbackSectionIndex.from_json(data)
+        except Exception:  # noqa: BLE001 - unreadable, or not a format this code writes
+            pass
+        self.warnings.append("sections.json could not be loaded; the section index was rebuilt from the Docling JSON")
+        return section_index(self.doc)
 
     # ------------------------------------------------------------------ tokens
     @property
     def tokenizer(self):
         if self._tok is None:
-            from transformers import AutoTokenizer
-
-            logging.getLogger("transformers").setLevel(logging.ERROR)
-            try:
-                self._tok = AutoTokenizer.from_pretrained(self._tokenizer_name, local_files_only=True)
-            except Exception:  # noqa: BLE001 - not cached locally: allow the download
-                self._tok = AutoTokenizer.from_pretrained(self._tokenizer_name)
+            self._tok = shared_tokenizer(self._tokenizer_name)  # one per process, shared with the context builders
         return self._tok
 
     def count_tokens(self, text: str) -> int:
@@ -652,9 +690,26 @@ class ProtocolDocument:
 
     # ================================================================== tools
     # ------------------------------------------------------------------ document_info
+    def _identity_record(self) -> dict:
+        """The identity record of the protocol (identity.build_identity): every identity value with the item it was
+        read from. Built once per open document, with this module's section assignment (the reading-order repair)."""
+        if self._identity is None:
+            self._identity = build_identity(self.doc, self.meta, section_of=self._section_of)
+        return self._identity
+
     def document_info(self) -> dict:
         """Identity of the protocol for StudyTitle / StudyIdentifier / StudyVersion / sponsor Organization, each
-        value with its verbatim source (page, layer, text, item ref)."""
+        value with the rule that found it (method) and the item it was read from (page, layer, text, item ref, the
+        refs the text spans, the table row, section): the identity record, no search. Computed once; every call
+        returns its own copy with the document's warnings at that moment."""
+        if self._info is None:
+            self._info = self._build_document_info()
+        out = copy.deepcopy(self._info)
+        out["warnings"] = list(self.warnings)
+        return out
+
+    def _build_document_info(self) -> dict:
+        """document_info's result from the identity record (without the call-time warnings)."""
         from retrieve import IDENTITY_FIELDS, identity_block
 
         meta = self.meta
@@ -663,58 +718,53 @@ class ProtocolDocument:
             from chunk_protocol import registry_identifiers
 
             ids = registry_identifiers(self.doc, meta)
-        cover = self._cover_fields()
+        record = self._identity_record()
+        fields, cover = record["fields"], record["cover_page"]
         prov_refs: list[str] = []
         prov_pages: set[int] = set()
 
-        def sourced(value: Any, src: dict | None = None, page: int | None = None) -> dict | None:
-            if not value:
+        def sourced(key: str) -> dict | None:
+            f = fields[key]
+            if not f:
                 return None
-            loc = None
-            if src is None:
-                loc = self._locate(str(value), prefer_page=page)
-                src = {k: loc[k] for k in ("page", "layer", "text")} if loc else None
-            elif src.get("refs"):
-                loc = {"ref": src["refs"][0], "section_id": self._section_of(src["refs"][0])}
-            else:
-                loc = self._locate(str(value), prefer_page=src.get("page"))
-            out = {"value": value, "source": dict(src) if src else None}
-            if out["source"] is not None and loc:
-                out["source"].update({"ref": loc.get("ref"), "section_id": loc.get("section_id")})
-                if loc.get("ref"):
-                    prov_refs.append(loc["ref"])
-                if src.get("page"):
+            src = f["source"]
+            if src is not None:
+                src = {**src, "refs": list(src["refs"])}
+                if src["ref"]:
+                    prov_refs.append(src["ref"])
+                if src["page"]:
                     prov_pages.add(src["page"])
-            return out
+            return {"value": f["value"], "method": f["method"], "source": src}
 
         def cover_value(key: str) -> dict | None:
             c = cover.get(key)
-            return sourced(c["value"], {"page": c["page"], "layer": "body", "text": c["text"], "refs": c["refs"]}) \
-                if c else None
+            if not c:
+                return None
+            ref = c["refs"][0]
+            prov_refs.append(ref)
+            prov_pages.add(c["page"])
+            return {"value": c["value"], "source": {"page": c["page"], "layer": "body", "text": c["text"],
+                                                    "refs": list(c["refs"]), "ref": ref,
+                                                    "section_id": self._section_of(ref)}}
 
-        titles = {
-            "official_title": cover_value("official_title") or sourced(meta.get("title")),
-            "brief_title": cover_value("brief_title"),
-            "acronym": cover_value("acronym") or sourced(meta.get("acronym")),
-            "detected_title": sourced(meta.get("title")),
-        }
+        titles = {key: sourced(key) for key in ("official_title", "brief_title", "acronym", "detected_title")}
         identifiers = {}
-        sources = ids.get("sources") or {}
         for key, label in IDENTITY_FIELDS:
-            value = ids.get(key)
-            if not value:
-                identifiers[key] = None
-                continue
-            src = sources.get(key)
-            identifiers[key] = sourced(value, {"page": src.get("page"), "layer": src.get("layer"),
-                                               "text": src.get("text")} if src else None, None)
-            identifiers[key]["label"] = label
+            identifiers[key] = sourced(key)
+            if identifiers[key]:
+                identifiers[key]["label"] = label
         version = {
-            "label": meta.get("version_label"), "amendment": meta.get("amendment"),
-            "date": sourced(meta.get("version_date")),
+            "label": (fields["version_label"] or {}).get("value"),
+            "amendment": (fields["amendment"] or {}).get("value"),
+            "date": sourced("version_date"),
             "cover_amendment": cover_value("amendment"), "cover_version": cover_value("version"),
             "cover_approval_date": cover_value("approval_date"),
         }
+        sponsor, sp = None, fields["sponsor"]
+        if sp:  # the name, the sponsor as written, the rule and the item it was read from
+            src = {**sp["source"], "refs": list(sp["source"]["refs"])}
+            sponsor = {"name": sp["value"], "value": sp["verbatim"], "method": sp["method"], "source": src,
+                       "provenance": self._prov(self._section_of(src["ref"]), [src["page"]], src["refs"])}
         soa_tables = self._soa_tables()
         roles: dict[str, list[str]] = {}
         for r in ROLES:
@@ -728,10 +778,10 @@ class ProtocolDocument:
             "source_sha256": self.source_sha256,
             "titles": titles,
             "identifiers": identifiers,
-            "other_identifiers_cited": ids.get("others") or {},
+            "other_identifiers_cited": copy.deepcopy(record["others"]),
             "version": version,
-            "sponsor": self._sponsor(cover),
-            "cover_page": {k: {kk: v[kk] for kk in ("value", "page", "text", "refs")} for k, v in cover.items()},
+            "sponsor": sponsor,
+            "cover_page": copy.deepcopy(cover),
             "page_count": len(self.doc.pages),
             "section_count": len(self.index.sections),
             "soa_table_count": len(soa_tables),
@@ -740,73 +790,7 @@ class ProtocolDocument:
             "reading_order_repairs": self.reading_order_repairs(),
             "identity_block": identity_block(meta, ids).text,
             "provenance": self._prov(title_secs[0], prov_pages or {1}, prov_refs),
-            "warnings": list(self.warnings),
         }
-
-    def _cover_fields(self) -> dict[str, dict]:
-        """Label/value pairs of the title pages ("Short Title: ...", "Sponsor Name:" + next line, ...)."""
-        if self._cover is None:
-            from docling_core.types.doc import TextItem
-
-            items = [(t, _pages_of(t)[0]) for t, _ in self.doc.iterate_items(with_groups=False)
-                     if isinstance(t, TextItem) and t.text.strip() and _pages_of(t) and _pages_of(t)[0] <= 3]
-            out: dict[str, dict] = {}
-
-            def label_of(text: str):
-                for f, rx in _COVER_RX:
-                    m = rx.match(text)
-                    if m:
-                        return f, m
-                return None, None
-
-            for i, (t, page) in enumerate(items):
-                text = _clean(t.text)
-                f, m = label_of(text)
-                if f is None or f in out:
-                    continue
-                value, src = m.group("value").strip(), [t]
-                if not value and i + 1 < len(items) and items[i + 1][1] == page:
-                    nxt = _clean(items[i + 1][0].text)
-                    if label_of(nxt)[0] is None and len(nxt) <= 400:
-                        value, src = nxt, [t, items[i + 1][0]]
-                if value:
-                    out[f] = {"value": value, "page": page, "text": " / ".join(_clean(x.text) for x in src),
-                              "refs": [x.self_ref for x in src]}
-            self._cover = out
-        return self._cover
-
-    def _sponsor(self, cover: dict) -> dict | None:
-        c = cover.get("sponsor")
-        if c:
-            return {"name": _sponsor_name(c["value"]), "value": c["value"], "method": "cover-page label",
-                    "source": {"page": c["page"], "text": c["text"], "ref": c["refs"][0]},
-                    "provenance": self._prov(self._section_of(c["refs"][0]), [c["page"]], c["refs"])}
-        texts = [t for t in self.doc.texts if t.text and _pages_of(t)]
-        early = [t for t in texts if _pages_of(t)[0] <= 3]
-        furniture = [t for t in texts if t.content_layer.value == "furniture"]
-        for method, rx, pool in (("copyright line", _COPYRIGHT, early + furniture),
-                                 ("'property of' line", _PROPERTY, early + furniture)):
-            for t in pool:
-                m = rx.search(_clean(t.text))
-                if m:
-                    name = m.group("name").strip(" .,")
-                    return {"name": name, "value": name, "method": method,
-                            "source": {"page": _pages_of(t)[0], "text": _clean(t.text), "ref": t.self_ref},
-                            "provenance": self._prov(self._section_of(t.self_ref), _pages_of(t)[:1], [t.self_ref])}
-        counts: Counter = Counter()
-        first: dict[str, Any] = {}
-        for t in early + furniture:
-            for m in _COMPANY.finditer(_clean(t.text)):
-                name = m.group("name").strip(" ,")
-                counts[name] += 1
-                first.setdefault(name, t)
-        if counts:
-            name = max(counts, key=lambda n: (counts[n], -list(first).index(n)))
-            t = first[name]
-            return {"name": name, "value": name, "method": "company-name pattern on the title pages (unverified)",
-                    "source": {"page": _pages_of(t)[0], "text": _clean(t.text), "ref": t.self_ref},
-                    "provenance": self._prov(self._section_of(t.self_ref), _pages_of(t)[:1], [t.self_ref])}
-        return None
 
     def _soa_tables(self) -> list[dict]:
         from docling_core.types.doc import DocItemLabel
@@ -823,8 +807,9 @@ class ProtocolDocument:
 
     # ------------------------------------------------------------------ outline
     def outline(self, max_level: int | None = None, with_roles: bool = True) -> dict:
-        """The section tree in document order: id, number, title, level, role, pages [first, last], tokens of the
-        whole subtree and of the section's own text, children ids, tables/figures directly in the section."""
+        """The section tree in document order: section_id, number, title, level, role, pages [first, last], tokens
+        of the whole subtree and of the section's own text, parent_id, children ids, tables/figures directly in the
+        section. "id" and "parent" repeat section_id and parent_id (deprecated aliases)."""
         sizes = self._sizes_all()
         keep = {s.section_id for s in self.index.sections if max_level is None or (s.level or 0) <= max_level}
         out = []
@@ -832,13 +817,14 @@ class ProtocolDocument:
             if s.section_id not in keep:
                 continue
             blocks = self._section_blocks(s.section_id)
-            e: dict[str, Any] = {"id": s.section_id, "number": s.number, "title": s.title, "level": s.level}
+            e: dict[str, Any] = {"id": s.section_id, "section_id": s.section_id, "number": s.number, "title": s.title,
+                                 "level": s.level}
             if with_roles:
                 e["role"] = s.role
                 e["role_score"] = round(float(s.role_score or 0), 2)
             e["pages"] = [s.pages[0], s.pages[-1]] if s.pages else []
             e["tokens"], e["own_tokens"] = sizes[s.section_id][1], sizes[s.section_id][0]
-            e["parent"] = s.parent_id
+            e["parent"] = e["parent_id"] = s.parent_id
             e["children"] = [k for k in self._children(s.section_id) if k in keep]
             nt = sum(b.kind == "table" for b in blocks)
             nf = sum(b.kind == "figure" for b in blocks)
@@ -905,7 +891,10 @@ class ProtocolDocument:
                             "provenance": self._prov(s.section_id, s.pages, [s.heading_ref] if s.heading_ref else [])})
         out: dict[str, Any] = {"role": role, "query": query, "count": len(results), "sections": results,
                                "provenance": results[0]["provenance"] if results else self._prov(None)}
-        if role and not results and ROLE_FALLBACK.get(role):
+        if role and not results and cands:  # the role exists; the query matched none of its sections
+            out["hint"] = (f"no section with role {role!r} matches the query {query!r}; {len(cands)} section(s) have "
+                           f"this role: call find_sections with role={role!r} and no query to list them")
+        elif role and not results and ROLE_FALLBACK.get(role):
             out["hint"] = (f"no section has role {role!r}; its content usually sits under "
                            f"{' / '.join(ROLE_FALLBACK[role])}")
         return out
@@ -1057,7 +1046,8 @@ class ProtocolDocument:
         }
         if next_cursor:
             out["next"] = {"tool": "read_section", "arguments": {"cursor": next_cursor,
-                                                                 **({"max_tokens": max_tokens} if max_tokens else {})}}
+                                                                 **({"max_tokens": max_tokens} if max_tokens else {}),
+                                                                 "with_blocks": with_blocks}}
         if excluded:
             out["excluded_subsections"] = excluded
         if with_blocks:
@@ -1282,7 +1272,9 @@ class ProtocolDocument:
                 return original(query, chunks, model)
 
             r.rerank = guarded
-            self._builder = production_builder(r, self.doc_path)
+            # the builder reuses this document's objects (same JSON, SHA-checked) instead of loading them again
+            self._builder = production_builder(r, self.doc_path, doc=self.doc, serializer=self.serializer,
+                                               tok=self.tokenizer, index=self.index, tables=self.tables)
         return self._builder
 
     def _query_vector(self, text: str, query: str):
@@ -1367,15 +1359,12 @@ class ProtocolDocument:
 
     def _block_refs(self, blk: Any, expanded: Any, chunk_by_id: dict) -> list[str]:
         st = self._builder.store
-        if blk.kind == "document":
-            refs = []
-            for line in blk.text.splitlines():
-                m = re.search(r'source[^"]*"(.+)"\)$', line)
-                if m:
-                    loc = self._locate(m.group(1).strip("…"))
-                    if loc:
-                        refs.append(loc["ref"])
-            return refs
+        if blk.kind == "document":  # one ref per "(source ...)" line: the item the identifier was read from
+            from retrieve import IDENTITY_FIELDS
+
+            fields = self._identity_record()["fields"]
+            sources = [(fields[key] or {}).get("source") for key, _ in IDENTITY_FIELDS]
+            return [src["ref"] for src in sources if src and src["ref"]]
         if blk.kind == "section_full":
             sid = next(expanded, None)
             return list(st.section_block(sid)["refs"]) if sid else []
@@ -1447,9 +1436,9 @@ class ProtocolDocument:
         body: list[_Seg] = []
         ai: list[_Seg] = []
         captions = {r.cref for it in [*self.doc.tables, *self.doc.pictures] for r in [*it.captions, *it.footnotes]}
-        pic_children = {ch.self_ref for p in self.doc.pictures
-                        for ch, _ in self.doc.iterate_items(root=p, with_groups=False, traverse_pictures=True)
-                        if ch is not p and ch.self_ref not in captions}
+        pic_of = {ch.self_ref: p for p in self.doc.pictures  # figure text item -> its picture
+                  for ch, _ in self.doc.iterate_items(root=p, with_groups=False, traverse_pictures=True)
+                  if ch is not p and ch.self_ref not in captions}
         for item, _ in self.doc.iterate_items(with_groups=False, traverse_pictures=True,
                                               included_content_layers={ContentLayer.BODY}):
             ref = item.self_ref
@@ -1476,9 +1465,11 @@ class ProtocolDocument:
                 text = item.text
                 if isinstance(item, ListItem) and item.marker:
                     text = f"{item.marker} {text}"
-                kind = "figure_text" if ref in pic_children else (
+                kind = "figure_text" if ref in pic_of else (
                     "section_header" if isinstance(item, SectionHeaderItem) else item.label.value)
-                body.append(_Seg(text, ref, _pages_of(item), "body", kind))
+                # flattened figure OCR text items have no provenance (prov []): the picture's pages
+                pages = _pages_of(item) or (_pages_of(pic_of[ref]) if kind == "figure_text" else [])
+                body.append(_Seg(text, ref, pages, "body", kind))
         furniture = [_Seg(t.text, t.self_ref, _pages_of(t), "furniture", t.label.value)
                      for t in sorted((t for t in self.doc.texts if t.content_layer == ContentLayer.FURNITURE
                                       and t.text.strip()), key=lambda t: (_pages_of(t) or [10 ** 6])[0])]
@@ -1487,34 +1478,57 @@ class ProtocolDocument:
     def _text_streams(self) -> dict[str, list[_Stream]]:
         if self._streams is None:
             segs = self._segments()
-            self._streams = {tier: [_Stream(segs[layer], fn, sep) for layer in ("body", "furniture", "ai_generated")]
+            self._streams = {tier: [_Stream(segs[layer], fn, sep) for layer in _LAYERS]
                              for tier, fn, sep in (("exact", _exact_form, " "), ("normalized", _norm_form, " "),
                                                    ("compact", _compact_form, ""))}
         return self._streams
 
-    def _find(self, quote: str, max_locations: int = MAX_LOCATIONS) -> tuple[str | None, list[dict], int]:
-        """(match tier, locations, total count) of a quote: exact (whitespace only), normalized (case, dashes,
-        quotes, superscript carets, Unicode), compact (letters/digits only; quotes of >= 12 such characters)."""
+    def _matches(self, quote: str) -> tuple[str | None, list[tuple[str, _Stream, int, int]]]:
+        """(match tier, every match as (layer, stream, start, end): body, then furniture, then ai_generated) of a
+        quote at the first tier with a match in the body or furniture, else the first with one in AI-generated text:
+        exact (whitespace only), normalized (case, dashes, quotes, superscript carets, Unicode), compact (letters/digits
+        only; quotes of >= 12 such characters)."""
         streams = self._text_streams()
-        q = _MD_NOISE.sub(" ", quote)
-        q = re.sub(r"(?m)^\s*#{1,6}\s+", "", q).strip().strip("|").strip()
-        forms = {"exact": _exact_form(q), "normalized": _norm_form(q), "compact": _compact_form(q)}
+        forms = _quote_forms(quote)
+        ai_only: tuple[str | None, list] = (None, [])
         for tier in ("exact", "normalized", "compact"):
             needle = forms[tier]
             if tier == "compact" and len(needle) < 12:  # too short to ignore punctuation and spacing safely
                 break
             if not needle:
                 continue
-            locs, total = [], 0
-            for st in streams[tier]:
-                found = st.find_all(needle)
-                total += len(found)
-                for a, b in found:
-                    if len(locs) < max_locations:
-                        locs.append(self._location(st, a, b, tier))
-            if total:
-                return tier, locs, total
-        return None, [], 0
+            found = [(layer, st, a, b) for layer, st in zip(_LAYERS, streams[tier]) for a, b in st.find_all(needle)]
+            if any(m[0] != "ai_generated" for m in found):
+                return tier, found
+            if found and ai_only[0] is None:
+                ai_only = (tier, found)
+        return ai_only
+
+    def _elided_matches(self, parts: list[str]) -> tuple[str | None, list[tuple[str, _Stream, int, int]]]:
+        """(match tier, every sequence as (layer, stream, start of the first part, end of the last)) of an elided
+        quote's parts: in one layer stream, at one tier, in order and close together (_sequences). The first tier
+        with a sequence in the body or furniture wins, else the first with one in AI-generated text; compact only
+        when every part has >= 12 letters/digits."""
+        streams = self._text_streams()
+        forms = [_quote_forms(p) for p in parts]
+        ai_only: tuple[str | None, list] = (None, [])
+        for tier in ("exact", "normalized", "compact"):
+            needles = [f[tier] for f in forms]
+            if tier == "compact" and min(map(len, needles)) < 12:
+                break
+            if not all(needles):
+                continue
+            found = [(layer, st, a, b) for layer, st in zip(_LAYERS, streams[tier]) for a, b in _sequences(st, needles)]
+            if any(m[0] != "ai_generated" for m in found):
+                return tier, found
+            if found and ai_only[0] is None:
+                ai_only = (tier, found)
+        return ai_only
+
+    def _find(self, quote: str, max_locations: int = MAX_LOCATIONS) -> tuple[str | None, list[dict], int]:
+        """(match tier, the first max_locations locations, total count) of a quote (_matches)."""
+        tier, found = self._matches(quote)
+        return tier, [self._location(st, a, b, tier) for _, st, a, b in found[:max_locations]], len(found)
 
     def _location(self, st: _Stream, a: int, b: int, tier: str) -> dict:
         idx = st.span_segments(a, b)
@@ -1539,20 +1553,6 @@ class ProtocolDocument:
         if rows:
             loc["table_rows"] = rows
         return loc
-
-    def _locate(self, text: str, prefer_page: int | None = None) -> dict | None:
-        """The first (preferably on prefer_page) body/furniture location of a text: page, layer, text, ref, section."""
-        if not (text or "").strip():
-            return None
-        tier, locs, _ = self._find(text, max_locations=MAX_LOCATIONS)
-        locs = [x for x in locs if x["layer"] != "ai_generated"]
-        if not locs:
-            return None
-        if prefer_page is not None:
-            locs.sort(key=lambda x: prefer_page not in x["provenance"]["pages"])
-        x, p = locs[0], locs[0]["provenance"]
-        return {"page": p["pages"][0] if p["pages"] else None, "layer": x["layer"], "text": x["text"],
-                "ref": p["refs"][0] if p["refs"] else None, "section_id": p["section_id"]}
 
     def _closest(self, quote: str, allowed: set[str] | None) -> dict | None:
         """The body window with the highest share of the quote's words (bag of words), when >= 0.6."""
@@ -1597,10 +1597,15 @@ class ProtocolDocument:
 
     def quote_check(self, quote: str, section_id: str | None = None, max_locations: int = MAX_LOCATIONS) -> dict:
         """Does this text occur in the document (verbatim up to whitespace / case / dashes / quotes / superscript
-        carets; "compact" ignores all punctuation and spacing)? Returns every location (section, pages, item refs,
-        verbatim context). With section_id only locations inside that section (and its subsections) count;
-        others are listed as found_elsewhere. Text found only in an AI-generated figure description is NOT
-        document text (found_in_ai_text). "..." / "…" in the quote elides text: each part must occur.
+        carets; "compact" ignores all punctuation and spacing)? Every match is counted (count; count_by_layer: body /
+        page headers-footers); at most max_locations are listed (section, pages, item refs, verbatim context), body
+        first; up to 2 listed places are kept for header/footer matches when both layers match (max_locations >= 4).
+        With section_id only matches inside that section (and its subsections) count; others are listed as
+        found_elsewhere. Text found only in an AI-generated figure description is NOT document text
+        (found_in_ai_text); a match there never hides a normalized or compact match in the document text. "..." / "…"
+        in the quote elides text: the parts must occur in this order, each within ELIDED_GAP (2,000) characters after
+        the end of the previous one; each tight, non-overlapping sequence counts once ("parts" has each part's own
+        result).
         When nothing is found, "closest" shows the most similar passage (share of the quote's words)."""
         quote = quote or ""
         if len(_compact_form(quote)) < 2:
@@ -1611,36 +1616,52 @@ class ProtocolDocument:
                 raise NotFoundError(f"no section {section_id!r}")
             allowed = set(self._subtree(section_id))
         parts = [p for p in _ELLIPSIS.split(quote) if len(_compact_form(p)) >= 2]
-        if len(parts) > 1:
-            results = [self.quote_check(p, section_id, max_locations=3) for p in parts]
-            found = all(r["found"] for r in results)
-            return {"quote": quote, "found": found, "match": "elided" if found else None,
-                    "parts": [{"part": p, "found": r["found"], "match": r["match"], "locations": r["locations"]}
-                              for p, r in zip(parts, results)],
-                    "locations": [loc for r in results for loc in r["locations"][:1]],
-                    "provenance": next((r["provenance"] for r in results if r["found"]), self._prov(section_id))}
-        tier, locs, total = self._find(quote, max_locations=1000)
-        doc_locs = [x for x in locs if x["layer"] != "ai_generated"]
-        ai_locs = [x for x in locs if x["layer"] == "ai_generated"]
-        inside = [x for x in doc_locs if allowed is None or x["provenance"]["section_id"] in allowed
-                  or bool(set(x["provenance"].get("section_ids") or []) & allowed)]
-        outside = [x for x in doc_locs if x not in inside]
+        if len(parts) < 2:
+            tier, found = self._matches(quote)
+            return self._quote_result(quote, section_id, allowed, tier, found, max_locations, quote)
+        results = [self.quote_check(p, section_id, max_locations=3) for p in parts]
+        tier, found = self._elided_matches(parts)
+        out = self._quote_result(quote, section_id, allowed, tier, found, max_locations, " ".join(parts))
+        prov = out.pop("provenance")
+        out["match"] = "elided" if out["found"] else None
+        out["parts"] = [{"part": p, "found": r["found"], "match": r["match"], "locations": r["locations"]}
+                        for p, r in zip(parts, results)]
+        out["provenance"] = prov if out["locations"] else next(
+            (r["provenance"] for r in results if r["found"]), self._prov(section_id))
+        return out
+
+    def _quote_result(self, quote: str, section_id: str | None, allowed: set[str] | None, tier: str | None,
+                      found: list[tuple[str, _Stream, int, int]], max_locations: int, closest_of: str) -> dict:
+        """quote_check's answer from its matches (_matches / _elided_matches). Every match is counted; a location
+        (context text, provenance) is built only for the listed ones."""
+        inside, outside, ai = [], [], []
+        for m in found:
+            layer, st, a, b = m
+            if layer == "ai_generated":
+                ai.append(m)
+            elif allowed is None or not allowed.isdisjoint(self._section_of(st.segs[i].ref)
+                                                           for i in st.span_segments(a, b)):
+                inside.append(m)
+            else:
+                outside.append(m)
+        listed = [self._location(st, a, b, tier) for _, st, a, b in _listed(inside, max_locations)]
         out: dict[str, Any] = {"quote": quote, "section_id": section_id, "found": bool(inside),
                                "match": tier if inside else None, "count": len(inside),
-                               "locations": inside[:max_locations]}
-        if len(inside) > max_locations:
-            out["more_locations"] = len(inside) - max_locations
+                               "count_by_layer": {k: sum(m[0] == k for m in inside) for k in ("body", "furniture")},
+                               "locations": listed}
+        if len(inside) > len(listed):
+            out["more_locations"] = len(inside) - len(listed)
         if outside:
-            out["found_elsewhere"] = outside[:max_locations]
-        if ai_locs:
-            out["found_in_ai_text"] = ai_locs[:3]
+            out["found_elsewhere"] = [self._location(st, a, b, tier) for _, st, a, b in _listed(outside, max_locations)]
+        if ai:
+            out["found_in_ai_text"] = [self._location(st, a, b, tier) for _, st, a, b in ai[:3]]
             out["warning"] = ("matched text in an AI-generated figure description/diagram, which is not document "
                               "text; cite the figure's OCR text or the body instead")
         if not inside:
-            closest = self._closest(quote, allowed)
+            closest = self._closest(closest_of, allowed)
             if closest:
                 out["closest"] = closest
-        out["provenance"] = inside[0]["provenance"] if inside else self._prov(section_id)
+        out["provenance"] = listed[0]["provenance"] if listed else self._prov(section_id)
         return out
 
     # ================================================================== tool layer
@@ -1648,12 +1669,13 @@ class ProtocolDocument:
         return tool_schemas(style)
 
     def call_tool(self, name: str, args: dict | None = None) -> dict:
-        """Run one tool by name with JSON arguments; errors come back as {"error": ...} (never raised), so an
-        agent loop can pass the result straight back to the model."""
+        """Run one tool by name with JSON arguments; errors come back as {"error", "error_type", ...} (never raised),
+        so an agent loop can pass the result straight back to the model. error_type: UnknownTool, InvalidArguments
+        (the arguments against the tool's schema) or the type of the exception the tool raised."""
         args = dict(args or {})
         spec = next((t for t in TOOLS if t["name"] == name), None)
         if spec is None:
-            return {"error": f"unknown tool {name!r}", "tools": [t["name"] for t in TOOLS]}
+            return {"error": f"unknown tool {name!r}", "error_type": "UnknownTool", "tools": [t["name"] for t in TOOLS]}
         try:
             import jsonschema
 
@@ -1661,7 +1683,8 @@ class ProtocolDocument:
         except ImportError:
             pass
         except Exception as exc:  # noqa: BLE001 - jsonschema.ValidationError
-            return {"error": f"invalid arguments for {name}: {getattr(exc, 'message', exc)}", "tool": name}
+            return {"error": f"invalid arguments for {name}: {getattr(exc, 'message', exc)}",
+                    "error_type": "InvalidArguments", "tool": name}
         try:
             if name == "read_section":
                 if not args.get("section") and not args.get("cursor"):
@@ -1742,7 +1765,9 @@ TOOLS: list[dict] = [
                     "passages) with section, pages and item refs. Not for complete lists: use read_section.",
      "input_schema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "A natural-language question."},
-         "k": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Retrieved passages (default 8)."}},
+         "k": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Retrieved passages (default 8)."},
+         "rendered": {"type": "boolean", "default": False,
+                      "description": "Also return 'context': the context string exactly as an answering model sees it."}},
          "required": ["query"], "additionalProperties": False}},
     {"name": "abbreviation", "method": "abbreviation",
      "description": "Glossary lookup in both directions: an abbreviation ('AE') -> definition(s), or a long form "
@@ -1751,9 +1776,12 @@ TOOLS: list[dict] = [
                       "required": ["term"], "additionalProperties": False}},
     {"name": "quote_check", "method": "quote_check",
      "description": "Verify an extracted value: does this verbatim text occur in the document? Returns found, match "
-                    "type (exact / normalized / compact), and every location (section, pages, item refs, verbatim "
-                    "context); with section_id only that section counts. Call it for every quote you attach to a "
-                    "USDM value; if not found, fix the quote using 'closest'.",
+                    "type (exact / normalized / compact), count of every match (count_by_layer: body / page "
+                    f"headers-footers) and up to {MAX_LOCATIONS} locations (section, pages, item refs, verbatim "
+                    "context; up to 2 listed places are kept for header/footer matches when both layers match); "
+                    "with section_id only that section counts. '...' or '…' elides text: the parts must occur in "
+                    f"this order, each within {ELIDED_GAP:,} characters of the previous one. Call it for every quote "
+                    "you attach to a USDM value; if not found, fix the quote using 'closest'.",
      "input_schema": {"type": "object", "properties": {
          "quote": {"type": "string"},
          "section_id": {"type": "string", "description": "Restrict to this section and its subsections."}},

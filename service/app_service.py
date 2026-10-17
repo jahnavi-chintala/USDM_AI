@@ -118,7 +118,12 @@ TOOL_ERRORS: dict[str, tuple[type[ServiceError], str]] = {
     "SearchUnavailable": (Conflict, "search_unavailable"),
     "OfflineCacheMiss": (Unavailable, "offline"),
     "OfflineRefused": (Unavailable, "offline"),
+    "UnknownTool": (NotFound, "unknown_tool"),
+    "InvalidArguments": (BadRequest, "invalid_arguments"),
 }
+# The service's message for SearchUnavailable (protocol_api's names embed_chunks.py, a command line)
+SEARCH_UNAVAILABLE = ("this document has no embeddings, so search is unavailable (it was processed offline): "
+                      "reprocess it online with POST /documents/{doc_id}/reprocess?force=true")
 # httpx transport errors of an OpenRouter call (search: query embedding, rerank)
 NETWORK_ERRORS = {"TransportError", "NetworkError", "ConnectError", "ReadError", "WriteError", "CloseError",
                   "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout",
@@ -267,10 +272,7 @@ class ProtocolService:
         """Save an upload (bytes, a binary file object or an iterable of chunks) and apply the duplicate/version
         rules (registry.Registry.ingest). Returns {doc_id, job_id, status, duplicate, stale, queued, warnings}.
         A password needs the worker of this process: it is held in this process's memory until the job starts."""
-        if password and self.worker is None:
-            raise BadRequest("this process runs no worker, so a PDF password would never reach the job: encrypted "
-                             "PDFs must be uploaded through the REST API or the HTTP MCP endpoint, whose process "
-                             "runs the worker that holds the password in memory", code="password_unsupported_here")
+        self._check_password_here(password)
         try:
             decision = self.registry.ingest(self.storage, source, filename, pipeline_version=self.pipeline_version,
                                             fingerprint=self.fingerprint, reprocess=bool(reprocess),
@@ -315,13 +317,22 @@ class ProtocolService:
         except OSError as exc:
             raise ServiceError(f"the inbox file cannot be read ({type(exc).__name__})", code="read_failed") from None
 
-    def reprocess(self, doc_id: str, *, force: bool = False) -> dict:
+    def _check_password_here(self, password: str | None) -> None:
+        if password and self.worker is None:
+            raise BadRequest("this process runs no worker, so a PDF password would never reach the job: encrypted "
+                             "PDFs must be uploaded through the REST API or the HTTP MCP endpoint, whose process "
+                             "runs the worker that holds the password in memory", code="password_unsupported_here")
+
+    def reprocess(self, doc_id: str, *, force: bool = False, password: str | None = None) -> dict:
         """Queue a reprocess of a stored document from its source.pdf when its result is stale (or force=True);
-        the same dict as ingest()."""
+        the same dict as ingest(). password: of an encrypted source PDF, held like an upload's (needs the worker
+        of this process; dropped when no job is queued)."""
         self._check_doc_id(doc_id)
+        self._check_password_here(password)
         try:
             decision = self.registry.request_reprocess(self.storage, doc_id, pipeline_version=self.pipeline_version,
-                                                       fingerprint=self.fingerprint, force=bool(force))
+                                                       fingerprint=self.fingerprint, force=bool(force),
+                                                       password=password or None)
         except RegistryNotFound:
             raise NotFound("no such document, or no stored source PDF", code="document_not_found") from None
         if decision.get("queued"):
@@ -412,8 +423,10 @@ class ProtocolService:
         return job
 
     def list_jobs(self, *, doc_id: str | None = None, state: str | None = None, limit: int = 100) -> dict:
+        """Jobs, newest first; of one document with doc_id (NotFound for a well-formed id without a document, as
+        get_document), and/or in one state."""
         if doc_id is not None:
-            self._check_doc_id(doc_id)
+            self._record(doc_id)
         if state is not None and state not in JOB_STATES:
             raise BadRequest(f"state must be one of {', '.join(JOB_STATES)}", code="invalid_state")
         limit = max(0, min(int(limit), MAX_LIST))
@@ -438,11 +451,15 @@ class ProtocolService:
         return {"files": files, "images": images}
 
     def list_files(self, doc_id: str) -> dict:
-        """{"files": [...], "images": [...]}: what file() serves for this document (published result only)."""
+        """{"doc_id", "files", "images", "aliases"}: what file() serves for this document (published result only).
+        aliases: the short names of the listed files; file() accepts every alias, a missing file is
+        file_not_found."""
         doc = self._record(doc_id)
         if not doc["has_result"]:
             raise Conflict(f"the document has no result yet (status {doc['status']})", code="not_ready")
-        return {"doc_id": doc_id, **self._files(doc_id), "aliases": dict(sorted(FILE_ALIASES.items()))}
+        files = self._files(doc_id)
+        aliases = {alias: name for alias, name in sorted(FILE_ALIASES.items()) if name in files["files"]}
+        return {"doc_id": doc_id, **files, "aliases": aliases}
 
     def file(self, doc_id: str, name: str) -> tuple[Path, str, str]:
         """(path, media type, canonical name) of an exposed file of the published result: protocol.md / .json /
@@ -546,10 +563,12 @@ class ProtocolService:
     def _tool_error(self, doc_id: str, name: str, result: dict) -> ServiceError:
         error_type, message = result.get("error_type"), str(result.get("error") or "")
         details = {"tool": name}
-        if error_type is None:  # call_tool's own checks: unknown tool (handled above) or schema validation
+        if error_type is None:  # an untyped error (call_tool's own checks are typed: UnknownTool / InvalidArguments)
             return BadRequest(self._clean(doc_id, message), code="invalid_arguments", details=details)
         if error_type in TOOL_ERRORS:
             cls, code = TOOL_ERRORS[error_type]
+            if error_type == "SearchUnavailable":
+                message = SEARCH_UNAVAILABLE.format(doc_id=doc_id)
             return cls(self._clean(doc_id, message), code=code, details=details)
         if error_type in NETWORK_ERRORS:
             return UpstreamError(f"{name}: the OpenRouter request failed ({error_type})", details=details)

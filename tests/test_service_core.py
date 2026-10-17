@@ -1,12 +1,14 @@
 """Self-test for the service core: storage, registry, worker and import (`python tests/test_service_core.py`).
 
 Offline: a temporary DATA_DIR per test, synthetic PDFs written by hand (made-up text) and a fake pipeline
-function in place of service.pipeline (which is not imported here).
+function in place of service.pipeline.process_document (which never runs here; the import reads its identifier
+helper).
 """
 
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -24,6 +26,7 @@ from service import import_existing as imp  # noqa: E402
 from service import storage as st  # noqa: E402
 from service.config import ROOT, ServiceConfig  # noqa: E402
 from service.contracts import STAGES, PipelineResult, StageResult  # noqa: E402
+from service.pipeline import IDENTIFIER_KEYS  # noqa: E402
 from service.registry import (MAX_ATTEMPTS, DocumentBusy, Registry, inspect_pdf, inspect_pdf_in_process,  # noqa: E402
                               normalise_text, page_count, text_fingerprint)
 from service.storage import LocalStorage, UnsafePath, UploadRejected  # noqa: E402
@@ -116,6 +119,22 @@ def failing_pipeline(pdf_path, workdir, config, **kwargs):
 
 def library_failing_pipeline(pdf_path, workdir, config, **kwargs):
     return json.loads("{" + SECRET)  # fails inside the json package
+
+
+def staged_failing_pipeline(pdf_path, workdir, config, *, progress=None, **kwargs):
+    """Two stages complete, the third fails: the exception carries the stage list (service.contracts)."""
+    for stage in ("hash", "convert", "postprocess"):
+        progress(stage)
+    exc = ValueError(SECRET)
+    exc.pipeline_stages = [StageResult("hash", "done", 0.1), StageResult("convert", "done", 12.5, {"pages": 3}),
+                           StageResult("postprocess", "failed", 0.4)]
+    raise exc
+
+
+def junk_stages_pipeline(pdf_path, workdir, config, **kwargs):
+    exc = ValueError(SECRET)
+    exc.pipeline_stages = "not a list of StageResult"
+    raise exc
 
 
 @contextmanager
@@ -412,6 +431,7 @@ def test_failed_job_and_retry() -> None:
         doc = registry.get_document(r["doc_id"])
         assert doc["status"] == "failed" and not doc["has_result"] and storage.document_dir(r["doc_id"]) is None
         assert doc["error"] == {"type": "ValueError", "where": where, "job_id": r["job_id"]}
+        assert job["stages"] == []  # failed before its first stage
         error_log = storage.workdir(r["job_id"]) / "logs" / "error.log"
         assert SECRET in error_log.read_text(encoding="utf-8")  # the full traceback stays in the workdir only
         # an exception raised inside a library is placed at our innermost frame
@@ -435,6 +455,34 @@ def test_failed_job_and_retry() -> None:
         assert "1.0.0/fp-one" in _served(storage, r["doc_id"])
         r4 = ingest(registry, storage, data)  # stale result served, no job unless reprocess
         assert r4["job_id"] is None and r4["stale"]
+
+
+def test_failed_job_keeps_completed_stages() -> None:
+    reset()
+    with env() as (config, storage, registry):
+        r = ingest(registry, storage, make_pdf("Staged failure"))
+        assert worker(config, registry, storage, staged_failing_pipeline).run_once() == r["job_id"]
+        job = registry.get_job(r["job_id"])
+        assert job["state"] == "failed" and job["error"]["type"] == "ValueError", job
+        assert job["error"]["where"].startswith("tests/test_service_core.py:"), job["error"]
+        # the completed stages as a finished job records them, then the failing one
+        assert job["stages"] == [
+            {"name": "hash", "status": "done", "seconds": 0.1, "detail": {}},
+            {"name": "convert", "status": "done", "seconds": 12.5, "detail": {"pages": 3}},
+            {"name": "postprocess", "status": "failed", "seconds": 0.4, "detail": {}}], job["stages"]
+        assert registry.get_document(r["doc_id"])["current_job"]["stages"] == job["stages"]
+        assert SECRET.encode() not in data_bytes(config)  # the message stays out of SQLite
+        # something that is not a list of StageResult is ignored; the failure is still recorded
+        r2 = ingest(registry, storage, make_pdf("Junk stages"))
+        worker(config, registry, storage, junk_stages_pipeline).run_once()
+        junk = registry.get_job(r2["job_id"])
+        assert junk["state"] == "failed" and junk["stages"] == [] and junk["error"]["type"] == "ValueError", junk
+        # a job that fails before the pipeline starts has no stages either
+        r3 = ingest(registry, storage, make_pdf("No source"))
+        (storage.workdir(r3["job_id"]) / "source.pdf").unlink()
+        worker(config, registry, storage).run_once()
+        missing = registry.get_job(r3["job_id"])
+        assert missing["state"] == "failed" and missing["error"]["type"] == "SourceMissing" and missing["stages"] == []
 
 
 def test_same_text_warning() -> None:
@@ -652,6 +700,7 @@ def test_delete_document() -> None:
 
 def test_import_existing() -> None:
     reset()
+    logging.getLogger("service.pipeline").setLevel(logging.ERROR)  # "document_info unavailable" is expected here
     with env() as (config, storage, registry):
         src = Path(tempfile.mkdtemp(prefix="svc_import_"))
         try:
@@ -669,8 +718,8 @@ def test_import_existing() -> None:
                                     ("chunks", "chunks.jsonl", "{}"),
                                     ("chunks", "embedding_cache.test.json", "{}"),
                                     ("chunks", "stats.json", json.dumps({"document": {
-                                        "protocol_id": "SYN-1", "version_label": "Amendment 2",
-                                        "version_date": "1 January 2024",
+                                        "protocol_id": "SYN-1", "version_label": "Amendment 2", "amendment": "2",
+                                        "acronym": "SYN", "version_date": "1 January 2024",
                                         "identifiers": {"nct": "NCT05555555", "sponsor_protocol_id": "SYN-1",
                                                         "sources": {"nct": {"text": "quoted"}}}}}))):
                 (folder / sub).mkdir(exist_ok=True)
@@ -681,6 +730,13 @@ def test_import_existing() -> None:
             doc = registry.get_document(doc_id, pipeline_version="1.0.0", fingerprint="fp-one")
             assert doc["stale"] is True and doc["has_result"] and doc["pages"] == 1
             assert doc["identifiers"]["nct"] == "NCT05555555" and doc["identifiers"]["version"] == "Amendment 2"
+            # the pipeline's key set (service.pipeline.document_identifiers; here from stats.json: the folder's
+            # protocol.json is not a document protocol_api can open)
+            assert doc["identifiers"] == {
+                "nct": "NCT05555555", "sponsor_protocol_id": "SYN-1", "eudract": None, "eu_ct": None, "ind": None,
+                "who_utn": None, "version": "Amendment 2", "amendment": "2", "date": "1 January 2024",
+                "acronym": "SYN", "sponsor": None}, doc["identifiers"]
+            assert set(doc["identifiers"]) == set(IDENTIFIER_KEYS)
             assert doc["filenames"] == ["synthetic.pdf"] and doc["current_job"]["kind"] == "import"
             base = storage.document_dir(doc_id)
             for name in ("source.pdf", "protocol.json", "protocol.md", "protocol.html", "protocol.decisions.json",

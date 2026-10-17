@@ -1545,8 +1545,8 @@ def step_delete_done(ctx: Ctx, q: Doc) -> None:
             f"HTTP {resp.status_code}, deleted {body.get('deleted')}")
     codes = [ctx.http.get(p).status_code for p in (f"/documents/{q.doc_id}", f"/documents/{q.doc_id}/files",
                                                    f"/documents/{q.doc_id}/files/chunks.jsonl",
-                                                   f"/jobs/{q.job_id}")]
-    r.check("7", "the deleted document, its files and its job -> 404", codes == [404, 404, 404, 404], f"{codes}")
+                                                   f"/jobs/{q.job_id}", f"/documents/{q.doc_id}/jobs")]
+    r.check("7", "the deleted document, its files, its job and its job list -> 404", codes == [404] * 5, f"{codes}")
     listing = batch_listing(ctx)
     r.check("7", "a plain delete keeps the conversion batches (shared cache)",
             listing is not None and listing.get(q.doc_id[:16], 0) > 0,

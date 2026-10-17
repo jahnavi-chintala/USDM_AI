@@ -182,14 +182,14 @@ At start the worker re-queues any job that was running when the backup was taken
 
 ## 4. REST API
 
-The interactive documentation, with every route, argument and response, is at http://127.0.0.1:8000/docs; the schema is at `/openapi.json`.
+The interactive documentation, with every route, argument and response, is at http://127.0.0.1:8000/docs; the schema is at `/openapi.json`. What every response field means, for REST, MCP, the protocol tools and the published files, is in [docs/api_reference.md](docs/api_reference.md).
 
 | Route | Purpose |
 |---|---|
 | `GET /health`, `GET /version` | Health (`503` when the registry or worker is down); pipeline version, fingerprint, packages, models, offline flag. |
 | `POST /documents` | Multipart upload: `file` (the PDF), optional `reprocess` (bool), optional `password` (form field only, never in the URL). Answers `{doc_id, job_id, status, duplicate, stale, queued, warnings}`: `202` when a job was queued, `200` otherwise. |
 | `GET /documents`, `GET /documents/{doc_id}`, `DELETE /documents/{doc_id}` | List (`status`, `limit`, `offset`); one document (status, version, stale flag, identifiers, quality summary, warnings, files, related and same-text documents, current job with stage and progress); delete (`purge_caches=true` also removes its cached conversion batches and figure descriptions). |
-| `POST /documents/{doc_id}/reprocess` | Reprocess from the stored PDF when the result is stale, or always with `force=true`. |
+| `POST /documents/{doc_id}/reprocess` | Reprocess from the stored PDF when the result is stale, or always with `force=true`. An encrypted PDF's password goes in the JSON body, `{"password": "…"}`, never in the URL; it is dropped when nothing is queued (a current result without `force`, or a job of the document already queued or running). |
 | `GET /jobs`, `GET /jobs/{job_id}`, `GET /documents/{doc_id}/jobs`, `POST /jobs/{job_id}/cancel` | Jobs: state, stage, progress, per-stage seconds, warnings, error type and location. Only a queued job can be cancelled. |
 | `GET /documents/{doc_id}/files`, `GET /documents/{doc_id}/files/{name}` | The published files: `protocol.md`, `protocol.json`, `protocol.html`, `protocol.decisions.json`, `quality.json`, `chunks/*.jsonl` and `chunks/*.json`, `images/<file>`. Short names such as `chunks.jsonl`, `sections.json`, `decisions` and `md` also work. |
 | `GET /tools` | The 9 protocol tool definitions (`style=anthropic` or `openai`). |
@@ -334,7 +334,7 @@ The fingerprint covers the pipeline version, the settings, the Docling versions,
   - Peak memory is about 5 GB per job while converting (1.7 GB otherwise). The end-to-end test measured 6.0 GB for the whole container with agents querying during a conversion; the 8 GB limit covers that.
   - The converter uses 4 threads per job, so more CPUs only help with more concurrent jobs.
 - **Uploads:** at most `MAX_UPLOAD_MB` (100 MB). MCP `data_base64` uploads are held in memory.
-- **Lost passwords:** a PDF password is lost if the service restarts before its job starts; the job then fails and the PDF must be uploaded again.
+- **Lost passwords:** a PDF password is lost if the service restarts before its job starts; the job then fails. Reprocess the document with its password (`POST /documents/{doc_id}/reprocess` with `{"force": true, "password": "…"}`) or upload it again.
 - **Search needs embeddings,** made online at ingest. A document processed offline must be reprocessed online to search it.
 - **Chunk ids:** `<protocol id>-A<amendment>-0000` when both are detected, else `doc-<12 hex of the PDF's hash>-0000`. The same PDF gets the same ids on every platform and in every run. After a reprocess with a newer pipeline, an id may cover slightly different text: compare `content_hash`. Fresh conversions on Windows and Linux can differ in tiny model floats in `protocol.json` (relative 1e-5); the text content is the same.
 - **Content limits** of the conversion and of the tools (reading order, unruled tables, footnote markers, ...) are listed in [docs/protocol_api.md](docs/protocol_api.md#limits). Tool provenance has section, page and item references, but no bounding boxes.

@@ -2,12 +2,14 @@
 
 Covers: ServiceConfig from the environment and its defaults agreeing with the modules; figure descriptions
 (figure_vlm.describe_missing) with a fake client: described and cached, retried then failed, offline, unsupported
-model; and an end-to-end process_document run on a public protocol (LZZT) from its cached conversion batches,
-offline: every stage, the output layout, and chunks identical to output_public/. The end-to-end test is skipped
-when output_public/LZZT_CDISC_Pilot has no batch cache.
+model; the identifier set of a document folder (document_identifiers, also what the import records); the stages
+a failed run keeps (in process and in the child process); and an end-to-end process_document run on a public
+protocol (LZZT) from its cached conversion batches, offline: every stage, the output layout, and chunks identical
+to output_public/. The end-to-end test is skipped when output_public/LZZT_CDISC_Pilot has no batch cache.
 """
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -18,6 +20,7 @@ from pathlib import Path
 os.environ["OPENROUTER_OFFLINE"] = "1"
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 
 from PIL import Image  # noqa: E402
 
@@ -164,6 +167,10 @@ def test_process_document_end_to_end_offline() -> None:
         assert st["figures"] == "skipped_offline" and st["embed"] == "done" and st["convert"] == "done", st
         assert res.status == "done_with_warnings" and any("OPENROUTER_OFFLINE" in w for w in res.warnings)
         assert res.pages == 97 and len(res.sha256) == 64 and res.identifiers["sponsor_protocol_id"] == "H2Q-MC-LZZT"
+        from service.pipeline import IDENTIFIER_KEYS
+
+        assert set(res.identifiers) == set(IDENTIFIER_KEYS), list(res.identifiers)
+        assert res.identifiers["sponsor"] == "Eli Lilly and Company", res.identifiers["sponsor"]
         for name in ("protocol.json", "protocol.md", "protocol.html", "protocol.decisions.json", "quality.json",
                      "pipeline.json", "images", "tables", "logs/pipeline.log", "chunks/chunks.jsonl",
                      "chunks/embeddings.npy", "chunks/sections.json"):
@@ -290,11 +297,152 @@ def test_isolated_failure_reports_type_and_location_only() -> None:
             etype, where = describe_exception(exc)
             assert etype == "FileNotFoundError" and where and where.split(":")[0].endswith(".py"), (etype, where)
             assert "source.pdf" not in str(exc)  # the message names type and location only
+            assert [(s.name, s.status) for s in exc.pipeline_stages] == [("hash", "failed")]  # the child reports them
         else:
             raise AssertionError("expected PipelineFailed")
         assert (work / "logs" / "error.log").exists()
         assert "secret-pw" not in "".join(p.read_text(encoding="utf-8", errors="replace")
                                           for p in (work / "logs").glob("*"))
+
+
+def test_failed_run_keeps_completed_stages() -> None:
+    """process_document raises with the stages so far on the exception (the worker records them): the completed
+    ones, then the failing one with status "failed". The conversion is replaced by a function that reports
+    progress and fails; a stage reported earlier and never finished ran through."""
+    import convert_protocol
+    from service.config import ServiceConfig
+    from service.pipeline import process_document
+
+    def failing_after(*reported):
+        def convert(src, out, *, progress=None, **kwargs):
+            for stage in reported:
+                progress(stage)
+            raise ValueError("made-up message")
+        return convert
+
+    with tempfile.TemporaryDirectory() as tmp:
+        config = ServiceConfig(data_dir=Path(tmp), offline=True, figure_model="")
+        work = config.work_dir / "job1"
+        work.mkdir(parents=True)
+        (work / "source.pdf").write_bytes(b"%PDF-1.4\nmade-up bytes\n")
+        real = convert_protocol.convert_document
+        try:
+            for reported, expected in (
+                    (("convert",), [("hash", "done"), ("convert", "failed")]),
+                    (("convert", "postprocess"), [("hash", "done"), ("convert", "done"), ("postprocess", "failed")]),
+                    (("convert", "postprocess", "figures"), [("hash", "done"), ("convert", "done"),
+                                                              ("postprocess", "done"), ("figures", "failed")])):
+                convert_protocol.convert_document = failing_after(*reported)
+                try:
+                    process_document(work / "source.pdf", work, config)
+                except ValueError as exc:
+                    stages = exc.pipeline_stages
+                else:
+                    raise AssertionError("expected ValueError")
+                assert [(s.name, s.status) for s in stages] == expected, stages
+                assert all(s.seconds >= 0 for s in stages) and stages[0].detail == {}, stages
+        finally:
+            convert_protocol.convert_document = real
+        # a failure in the first stage: the hash itself
+        try:
+            process_document(work / "missing.pdf", work, config)
+        except FileNotFoundError as exc:
+            assert [(s.name, s.status) for s in exc.pipeline_stages] == [("hash", "failed")]
+        else:
+            raise AssertionError("expected FileNotFoundError")
+
+
+def test_isolated_failure_keeps_completed_stages() -> None:
+    """Through the worker with the real child process: a file that is not a PDF hashes, then fails to convert; the
+    job keeps the completed stage and the failing one, and only the exception type and our file:line as error."""
+    from service.config import ServiceConfig
+    from service.pipeline import process_document_isolated
+    from service.registry import Registry
+    from service.storage import LocalStorage
+    from service.worker import Worker
+
+    with tempfile.TemporaryDirectory() as tmp:
+        config = ServiceConfig(data_dir=Path(tmp), offline=True, figure_model="")
+        storage = LocalStorage(config)
+        registry = Registry(config, inspector=lambda path, password: {"pages": 1, "text_fingerprint": None,
+                                                                      "error": None})
+        try:
+            made_up = b"%PDF-1.4\nthis is not a pdf, only the header is\n"
+            d = registry.ingest(storage, made_up, "broken.pdf", pipeline_version="1.0.0", fingerprint="fp")
+            assert Worker(config, registry, storage, process_document_isolated).run_once() == d["job_id"]
+            job = registry.get_job(d["job_id"])
+            assert job["state"] == "failed" and job["error"]["where"], job
+            assert [(s["name"], s["status"]) for s in job["stages"]] == [("hash", "done"), ("convert", "failed")], job
+            assert all(isinstance(s["seconds"], float) for s in job["stages"]), job["stages"]
+            assert "this is not a pdf" not in json.dumps(job)
+        finally:
+            registry.close()
+
+
+def test_document_identifiers() -> None:
+    """One key set for the pipeline and the import: from document_info, else from chunks/stats.json, else all None;
+    the import of a folder records what document_identifiers returns."""
+    from service.pipeline import IDENTIFIER_KEYS, document_identifiers
+
+    keys = {"nct", "sponsor_protocol_id", "eudract", "eu_ct", "ind", "who_utn", "version", "amendment", "date",
+            "acronym", "sponsor"}
+    assert set(IDENTIFIER_KEYS) == keys and len(IDENTIFIER_KEYS) == len(keys)
+    logged: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            logged.append(record.getMessage())
+
+    handler, pipeline_log = Capture(), logging.getLogger("service.pipeline")
+    pipeline_log.addHandler(handler)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            # fallback: stats.json only (there is no document to open); a field may be {"value": ...}
+            stats = tmp / "stats_only"
+            (stats / "chunks").mkdir(parents=True)
+            (stats / "chunks" / "stats.json").write_text(json.dumps({"document": {
+                "protocol_id": "SYN-1", "acronym": "SYN", "amendment": "2", "version_label": "Amendment 2",
+                "version_date": "1 January 2024",
+                "identifiers": {"nct": "NCT05555555", "eudract": {"value": "2020-000123-45"},
+                                "sources": {"nct": {"text": "quoted"}}}}}), encoding="utf-8")
+            got = document_identifiers(stats)
+            assert got == {"nct": "NCT05555555", "sponsor_protocol_id": "SYN-1", "eudract": "2020-000123-45",
+                           "eu_ct": None, "ind": None, "who_utn": None, "version": "Amendment 2", "amendment": "2",
+                           "date": "1 January 2024", "acronym": "SYN", "sponsor": None}, got
+            assert logged and "FileNotFoundError" in logged[0] and str(tmp) not in logged[0], logged  # type only
+            # nothing readable: every key, all None
+            (tmp / "empty").mkdir()
+            (tmp / "broken" / "chunks").mkdir(parents=True)
+            (tmp / "broken" / "chunks" / "stats.json").write_text("{not json", encoding="utf-8")
+            for folder in ("empty", "broken", "missing"):
+                assert document_identifiers(tmp / folder) == dict.fromkeys(IDENTIFIER_KEYS), folder
+            # a folder protocol_api opens: the values of document_info (the synthetic protocol of test_service_api)
+            from test_service_api import build_converted_folder, make_service, tokenizer_cached
+            from test_service_core import make_pdf, sha
+
+            if not tokenizer_cached():
+                print("   (skipped the document_info part: the chunk tokenizer is not in the local cache)")
+                return
+            folder, pdf = tmp / "Quillmore", tmp / "quillmore.pdf"
+            build_converted_folder(folder)
+            pdf.write_bytes(make_pdf("Quillmore study protocol", "Made-up text for an identifier test"))
+            expected = {"nct": None, "sponsor_protocol_id": "QM-2024-07", "eudract": None, "eu_ct": None, "ind": None,
+                        "who_utn": None, "version": "Version 2.0", "amendment": None, "date": "3 March 2024",
+                        "acronym": None, "sponsor": None}
+            assert document_identifiers(folder) == expected
+            from service.import_existing import import_folder
+
+            service = make_service(tmp / "data", run_worker=False)
+            try:
+                out = import_folder(service.config, folder, pdf=pdf, version=("1.0.0", "fp"),
+                                    registry=service.registry, storage=service.storage)
+                assert out["doc_id"] == sha(pdf.read_bytes())
+                assert service.get_document(out["doc_id"])["identifiers"] == expected
+            finally:
+                service.stop()
+    finally:
+        pipeline_log.removeHandler(handler)
 
 
 def test_service_end_to_end_isolated() -> None:
@@ -330,6 +478,7 @@ def test_service_end_to_end_isolated() -> None:
             doc = registry.get_document(d["doc_id"], pipeline_version=version, fingerprint=fp)
             assert doc["status"] == "done_with_warnings" and doc["has_result"] and not doc["stale"], doc
             assert doc["pages"] == 97 and doc["identifiers"]["sponsor_protocol_id"] == "H2Q-MC-LZZT", doc
+            assert doc["identifiers"]["sponsor"] == "Eli Lilly and Company", doc["identifiers"]
             folder = storage.document_dir(d["doc_id"])
             for name in ("source.pdf", "protocol.json", "quality.json", "chunks/chunks.jsonl"):
                 assert (folder / name).exists(), name

@@ -26,7 +26,9 @@ regenerated. See reports/chunking_design.md for the reasoning. Choices:
     may add) + OCR "Text in figure"; image path kept in metadata; only small,
     confidently classified logos/icons without any text are dropped.
   * Document metadata (id, version, date, acronym) is detected from content
-    (doc_metadata); the prefix holds only fields found. Chunk ids are
+    (doc_metadata, built on detect_metadata, which also names the rule and the
+    source item of each value; identity.py keeps those); the prefix holds
+    only fields found. Chunk ids are
     "{protocol_id}-A{amendment}-NNNN" when both are known, else
     "doc-<source sha>-NNNN". section_number uses only section numbers the
     heading-level step accepted. --quiet-text logs counts only.
@@ -791,97 +793,171 @@ def _most_frequent(counts: Counter, first_seen: list[str], min_count: int = 1) -
     return best if best is not None and counts[best] >= min_count else None
 
 
-def _candidates(texts: list[tuple[int | None, str]], find) -> tuple[Counter, list[str]]:
-    """Candidate -> number of distinct (page, text-source) places it occurs; first-seen order."""
-    counts, order, seen = Counter(), [], set()
-    for page, text in texts:
-        for cand in find(text):
+def _candidates(texts: list[tuple[int | None, str, Any]], find) -> tuple[Counter, list[str], dict[str, tuple]]:
+    """Candidate -> number of distinct (page, text-source) places it occurs; first-seen order; and where each
+    candidate was first seen, (page, text, item, start, end).
+
+    `texts` are (page, text, item); find(text) -> [(candidate, start, end)] with the span in `text`."""
+    counts, order, seen, where = Counter(), [], set(), {}
+    for page, text, item in texts:
+        for cand, a, b in find(text):
             if (page, cand) not in seen:
                 seen.add((page, cand))
                 counts[cand] += 1
             if cand not in order:
                 order.append(cand)
-    return counts, order
+                where[cand] = (page, text, item, a, b)
+    return counts, order, where
+
+
+def _row_text(row: list) -> str:
+    """The text of one table grid row: cells whitespace-normalised, a spanning cell (repeated along the row) once."""
+    return " ".join(" ".join((c.text or "").split()) for c in {id(c): c for c in row}.values() if c.text)
+
+
+def _item_source(item: Any, text: str, start: int, end: int, page: int | None) -> dict[str, Any]:
+    """Where a value was read: text[start:end] of a text item (the text around it, whitespace-normalised, when
+    the item is long): page, layer, text, ref (the item), refs (every item the text spans), row (tables only)."""
+    layer = "furniture" if item.content_layer == ContentLayer.FURNITURE else "body"
+    return {"page": page, "layer": layer, "text": " ".join(_snippet(text, start, end).split()),
+            "ref": item.self_ref, "refs": [item.self_ref], "row": None}
 
 
 _HISTORY_ROW = re.compile(r"(?i)^\s*(original\s+protocol|(amendment|version|edition|revision)\s*"
                           r"(?:no\.?|number)?\s*[:#]?\s*v?(\d+(?:\.\d+)*))")
 
 
-def _history_version(doc: DoclingDocument, max_page: int = 15) -> tuple[tuple[str, str] | None, str | None]:
-    """(version, date) from the last row of an early document-history table, if any.
+def _history_version(doc: DoclingDocument, max_page: int = 15
+                     ) -> tuple[tuple[str, str] | None, str | None, dict[str, Any] | None]:
+    """(version, date, source) from the last row of an early document-history table, if any.
 
     A history table is recognised by first-column labels such as "Original
     protocol" or "Amendment 3"; the last such row is the current version.
+    The source is that row: layer "table", ref = the table, row = its index in table.data.grid.
     """
     for table in doc.tables:
         if not table.prov or table.prov[0].page_no > max_page or not table.data.grid:
             continue
-        rows = [(m, " ".join(c.text for c in row)) for row in table.data.grid
+        rows = [(r, m, " ".join(c.text for c in row)) for r, row in enumerate(table.data.grid)
                 if (m := _HISTORY_ROW.match(row[0].text))]
-        if not rows or not any(m.group(1).lower().startswith("original") for m, _ in rows):
+        if not rows or not any(m.group(1).lower().startswith("original") for _, m, _ in rows):
             continue
-        m, row_text = rows[-1]
+        r, m, row_text = rows[-1]
         version = ("Original", "protocol") if m.group(2) is None else (m.group(2).title(), m.group(3))
         date = _DATE.search(row_text)
-        return version, date.group(0) if date else None
-    return None, None
+        text = _row_text(table.data.grid[r])  # the label and the date, with the row around them when it is long
+        in_row = _DATE.search(text)
+        end = max(len(" ".join(m.group(0).split())), in_row.end() if in_row else 0)
+        source = {"page": table.prov[0].page_no, "layer": "table", "text": " ".join(_snippet(text, 0, end).split()),
+                  "ref": table.self_ref, "refs": [table.self_ref], "row": r}
+        return version, date.group(0) if date else None, source
+    return None, None, None
+
+
+def detect_metadata(doc: DoclingDocument) -> dict[str, dict[str, Any] | None]:
+    """The values doc_metadata detects from content, each with the rule that gave it and the item it came from.
+
+    Keys: protocol_id, acronym, title, version (value ("Amendment", "4")), date; None when not found. Each is
+    {"value", "method", "source"}. method: "title page" (acronym, title), "running header" (the header
+    patterns on pp. 1-3), "labelled pattern" (a labelled id / version / date on the title page or in a
+    header/footer), "header/footer frequency" (an unlabelled id repeated in the headers/footers) or "history
+    table". source: {"page", "layer", "text", "ref", "refs", "row"}, the item (a table: its ref and the grid
+    row) the value was read from, with the text around it.
+    doc_metadata unwraps the values; identity.py keeps the methods and sources (no search for them later).
+    """
+    def found(value: Any, method: str, source: dict[str, Any] | None) -> dict[str, Any] | None:
+        return {"value": value, "method": method, "source": source} if value else None
+
+    # The running header may be split into several items ("PF-00000000 ...",
+    # "Protocol C1234567", "Final Protocol Amendment 4, 5 January 2021").
+    header_items: dict[str, Any] = {}  # header text -> the first item holding it
+    for t in doc.texts:
+        if t.label == DocItemLabel.PAGE_HEADER and t.prov and t.prov[0].page_no <= 3:
+            header_items.setdefault(t.text, t)
+    header = " ".join(header_items)
+
+    def header_source(start: int, end: int) -> dict[str, Any]:
+        """The header item(s) the span header[start:end] lies in (the joined header has one space between items)."""
+        parts, pos = [], 0
+        for text, item in header_items.items():
+            if text and pos < end and pos + len(text) > start:
+                parts.append((item, text, max(start - pos, 0), min(end - pos, len(text))))
+            pos += len(text) + 1
+        item, text, a, b = parts[0]
+        src = _item_source(item, text, a, b, item.prov[0].page_no)
+        if len(parts) > 1:
+            src["refs"] = [p[0].self_ref for p in parts]
+            src["text"] = " / ".join(" ".join(p[1].split()) for p in parts)
+        return src
+
+    def pick(texts: list[tuple[int | None, str, Any]], find, method: str, min_count: int = 1
+             ) -> dict[str, Any] | None:
+        """The most frequent candidate of `find` over `texts` (see _candidates), with where it was first seen."""
+        counts, order, where = _candidates(texts, find)
+        best = _most_frequent(counts, order, min_count)
+        if best is None:
+            return None
+        page, text, item, a, b = where[best]
+        return found(best, method, _item_source(item, text, a, b, page))
+
+    first_page = [t for t in doc.texts if t.prov and t.prov[0].page_no == 1
+                  and t.content_layer == ContentLayer.BODY]
+    heads = [i for i, t in enumerate(first_page) if isinstance(t, SectionHeaderItem | TitleItem)]
+    acr = next((first_page[i] for i in heads if looks_like_acronym(first_page[i].text)), None)
+    # Full title: the first long text after the first heading on the title page.
+    ttl = next((t for t in first_page[(heads[0] if heads else -1) + 1:] if len(t.text) > 40), None)
+    acronym = found(acr.text.strip(), "title page", _item_source(acr, acr.text, 0, len(acr.text), 1)) if acr else None
+    title = found(ttl.text, "title page", _item_source(ttl, ttl.text, 0, len(ttl.text), 1)) if ttl else None
+
+    # 1. The original running-header patterns first, so those documents keep identical values.
+    m_id = re.search(r"Protocol\s+([A-Z]\d{5,})", header)
+    m_am = re.search(r"Amendment\s+(\d+)", header)
+    m_dt = re.search(r"(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})", header)
+    pid = found(m_id.group(1), "running header", header_source(*m_id.span(1))) if m_id else None
+    version = found(("Amendment", m_am.group(1)), "running header", header_source(*m_am.span())) if m_am else None
+    date = found(m_dt.group(1), "running header", header_source(*m_dt.span(1))) if m_dt else None
+
+    # 2./3. Title page + every running header/footer, counted per page.
+    furniture = [(t.prov[0].page_no if t.prov else None, t.text, t) for t in doc.texts
+                 if t.label in (DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER)]
+    labelled = furniture + [(1, t.text, t) for t in first_page]
+    if pid is None:
+        pid = pick(labelled, lambda s: [(m.group(1).rstrip("-_/"), m.start(1), m.end(1))
+                                        for m in _LABELLED_ID.finditer(s)], "labelled pattern")
+    if pid is None:
+        pages = len({p for p, _, _ in furniture})
+        pid = pick(furniture, lambda s: [(m.group(0), m.start(), m.end()) for m in _BARE_ID.finditer(s)
+                                         if len(m.group(0)) >= 6 and not _DATE.fullmatch(m.group(0))],
+                   "header/footer frequency", min_count=max(2, round(0.3 * pages)))
+    if version is None:
+        version = pick(labelled, lambda s: [(f"{m.group(1).title()} {m.group(2)}", m.start(), m.end())
+                                            for m in _VERSION.finditer(s)], "labelled pattern")
+        if version:
+            version["value"] = tuple(version["value"].split(" ", 1))
+    if version is None:
+        # 4. The latest row of a document-history table ("Original protocol" /
+        #    "Amendment N" rows with dates): an unamended protocol has no version
+        #    number anywhere else, only an "Original protocol" row.
+        hist_version, hist_date, hist_source = _history_version(doc)
+        version = found(hist_version, "history table", hist_source)
+        date = date or found(hist_date, "history table", hist_source)
+    if date is None:
+        date = pick(labelled, lambda s: [(m.group(0), m.start(), m.end()) for m in _DATE.finditer(s)],
+                    "labelled pattern")
+    return {"protocol_id": pid, "acronym": acronym, "title": title, "version": version, "date": date}
 
 
 def doc_metadata(doc: DoclingDocument, json_path: Path,
                  explicit: dict[str, str] | None = None) -> dict[str, Any]:
     """Document identity, from content: explicit values > "Protocol <id> ... Amendment <n>" running
     header (pp. 1-3) > labelled fields on the title page and in headers/footers > most frequent
-    header/footer candidate.
+    header/footer candidate (the rules and the item each value comes from: detect_metadata).
 
     Fields not found stay None (never printed: see doc_prefix / chunk_id_base).
     """
-    # The running header may be split into several items ("PF-00000000 ...",
-    # "Protocol C1234567", "Final Protocol Amendment 4, 5 January 2021").
-    header = " ".join(dict.fromkeys(
-        t.text for t in doc.texts
-        if t.label == DocItemLabel.PAGE_HEADER and t.prov and t.prov[0].page_no <= 3
-    ))
-    first_page = [t for t in doc.texts if t.prov and t.prov[0].page_no == 1
-                  and t.content_layer == ContentLayer.BODY]
-    heads = [i for i, t in enumerate(first_page) if isinstance(t, SectionHeaderItem | TitleItem)]
-    acronym = next((first_page[i].text.strip() for i in heads if looks_like_acronym(first_page[i].text)), "")
-    # Full title: the first long text after the first heading on the title page.
-    title = next((t.text for t in first_page[(heads[0] if heads else -1) + 1:] if len(t.text) > 40), "")
-
-    # 1. The original running-header patterns first, so those documents keep identical values.
-    m_id = re.search(r"Protocol\s+([A-Z]\d{5,})", header)
-    m_am = re.search(r"Amendment\s+(\d+)", header)
-    m_dt = re.search(r"(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})", header)
-    pid = m_id.group(1) if m_id else None
-    version = ("Amendment", m_am.group(1)) if m_am else None
-    date = m_dt.group(1) if m_dt else None
-
-    # 2./3. Title page + every running header/footer, counted per page.
-    furniture = [(t.prov[0].page_no if t.prov else None, t.text) for t in doc.texts
-                 if t.label in (DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER)]
-    labelled = furniture + [(1, t.text) for t in first_page]
-    if pid is None:
-        counts, order = _candidates(labelled, lambda s: [m.rstrip("-_/") for m in _LABELLED_ID.findall(s)])
-        pid = _most_frequent(counts, order)
-    if pid is None:
-        counts, order = _candidates(furniture, lambda s: [m for m in _BARE_ID.findall(s)
-                                                          if len(m) >= 6 and not _DATE.fullmatch(m)])
-        pages = len({p for p, _ in furniture})
-        pid = _most_frequent(counts, order, min_count=max(2, round(0.3 * pages)))
-    if version is None:
-        counts, order = _candidates(labelled, lambda s: [f"{k.title()} {n}" for k, n in _VERSION.findall(s)])
-        if label := _most_frequent(counts, order):
-            version = tuple(label.split(" ", 1))
-    if version is None:
-        # 4. The latest row of a document-history table ("Original protocol" /
-        #    "Amendment N" rows with dates): an unamended protocol has no version
-        #    number anywhere else, only an "Original protocol" row.
-        version, hist_date = _history_version(doc)
-        date = date or hist_date
-    if date is None:
-        counts, order = _candidates(labelled, lambda s: [m.group(0) for m in _DATE.finditer(s)])
-        date = _most_frequent(counts, order)
+    detected = detect_metadata(doc)
+    pid, acronym, title, version, date = (detected[k]["value"] if detected[k] else None
+                                          for k in ("protocol_id", "acronym", "title", "version", "date"))
 
     sha = hashlib.sha256(json_path.read_bytes()).hexdigest()[:16]
     # The document key comes from the source PDF (Docling's binary_hash, recorded by convert_protocol): the same
@@ -936,19 +1012,21 @@ _SPONSOR_ID = re.compile(r"\bProtocol\s*(?i:No\.?|Number|ID|Identifier|Code)\s*[
 IDENTIFIER_SNIPPET = 160  # characters of source text kept around a found identifier
 
 
-def _identifier_sources(doc: DoclingDocument) -> list[tuple[int, str, str]]:
-    """(page, layer, text) of every text item (body, furniture, figure text) and table row, by page."""
+def _identifier_sources(doc: DoclingDocument) -> list[tuple[int, str, str, str, int | None]]:
+    """(page, layer, text, ref, row) of every text item (body, furniture, figure text) and table row, by page.
+
+    ref is the item's ref (a table row: the table's), row the index in table.data.grid (None for text items)."""
     out = []
     for t in doc.texts:
         if t.text and t.text.strip():
             layer = "furniture" if t.content_layer == ContentLayer.FURNITURE else "body"
-            out.append((t.prov[0].page_no if t.prov else 10 ** 6, layer, " ".join(t.text.split())))
+            out.append((t.prov[0].page_no if t.prov else 10 ** 6, layer, " ".join(t.text.split()), t.self_ref, None))
     for table in doc.tables:
         page = table.prov[0].page_no if table.prov else 10 ** 6
-        for row in table.data.grid:  # a spanning cell repeats along the row: once
-            text = " ".join(" ".join((c.text or "").split()) for c in {id(c): c for c in row}.values() if c.text)
+        for r, row in enumerate(table.data.grid):
+            text = _row_text(row)
             if text.strip():
-                out.append((page, "table", text))
+                out.append((page, "table", text, table.self_ref, r))
     out.sort(key=lambda x: x[0])  # stable: document order within a page
     return out
 
@@ -961,7 +1039,8 @@ def _snippet(text: str, start: int, end: int) -> str:
     return ("…" if a else "") + text[a:b] + ("…" if b < len(text) else "")
 
 
-def registry_identifiers(doc: DoclingDocument, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+def registry_identifiers(doc: DoclingDocument, meta: dict[str, Any] | None = None, *,
+                         with_refs: bool = False) -> dict[str, Any]:
     """Study identifiers found by pattern anywhere in the document, including headers/footers.
 
     A value counts as the study's own when it stands in a header/footer, on the first pages or right
@@ -970,6 +1049,8 @@ def registry_identifiers(doc: DoclingDocument, meta: dict[str, Any] | None = Non
     pages wins (ties: first seen), with its verbatim source text (page, layer, the item or table-row
     text around it) for provenance. sponsor_protocol_id is doc_metadata's protocol_id, else a labelled
     "Protocol Number: X".
+    With with_refs each source also names the item it was taken from: "ref" (a table row: the table's ref) and
+    "row" (its index in table.data.grid, else None); the rest of the result is the same.
     """
     sources = _identifier_sources(doc)
     out: dict[str, Any] = {"sponsor_protocol_id": None, **{k: None for k in IDENTIFIER_PATTERNS},
@@ -980,9 +1061,15 @@ def registry_identifiers(doc: DoclingDocument, meta: dict[str, Any] | None = Non
         return (layer == "furniture" or page <= IDENTIFIER_EARLY_PAGES
                 or bool(label and label.search(text[max(0, start - 40):start])))
 
+    def source(page: int, layer: str, text: str, a: int, b: int, ref: str, row: int | None) -> dict[str, Any]:
+        src = {"page": page if page < 10 ** 6 else None, "layer": layer, "text": _snippet(text, a, b)}
+        if with_refs:
+            src.update(ref=ref, row=row)
+        return src
+
     def pick(kind: str, finder) -> None:
         counts, first, where, seen = Counter(), [], {}, []
-        for page, layer, text in sources:
+        for page, layer, text, ref, row in sources:
             for m in finder(text):
                 value = m.group(1)
                 if value not in seen:
@@ -991,15 +1078,14 @@ def registry_identifiers(doc: DoclingDocument, meta: dict[str, Any] | None = Non
                     continue
                 if (page, value) not in where:
                     counts[value] += 1
-                    where[(page, value)] = (page, layer, text, m.start(1), m.end(1))
+                    where[(page, value)] = (page, layer, text, m.start(1), m.end(1), ref, row)
                 if value not in first:
                     first.append(value)
         best = _most_frequent(counts, first)
         if best is not None:
             out[kind] = best
-            page, layer, text, a, b = min((v for (p, val), v in where.items() if val == best), key=lambda v: v[0])
-            out["sources"][kind] = {"page": page if page < 10 ** 6 else None, "layer": layer,
-                                    "text": _snippet(text, a, b)}
+            out["sources"][kind] = source(*min((v for (p, val), v in where.items() if val == best),
+                                               key=lambda v: v[0]))
         if [v for v in seen if v != best]:
             out["others"][kind] = [v for v in seen if v != best]
 
@@ -1009,13 +1095,13 @@ def registry_identifiers(doc: DoclingDocument, meta: dict[str, Any] | None = Non
     if pid:
         # The id as doc_metadata found it; its source is the first text holding it, a labelled one first.
         rx = re.compile(rf"(?<![A-Za-z0-9])({re.escape(pid)})(?![A-Za-z0-9])")
-        hits = [(page, layer, text, m) for page, layer, text in sources for m in [rx.search(text)] if m]
+        hits = [(page, layer, text, ref, row, m) for page, layer, text, ref, row in sources
+                for m in [rx.search(text)] if m]
         hits.sort(key=lambda h: (not re.search(r"(?i)\bprotocol\b", h[2]), h[0]))
         out["sponsor_protocol_id"] = pid
         if hits:
-            page, layer, text, m = hits[0]
-            out["sources"]["sponsor_protocol_id"] = {"page": page if page < 10 ** 6 else None, "layer": layer,
-                                                     "text": _snippet(text, m.start(1), m.end(1))}
+            page, layer, text, ref, row, m = hits[0]
+            out["sources"]["sponsor_protocol_id"] = source(page, layer, text, m.start(1), m.end(1), ref, row)
     else:
         pick("sponsor_protocol_id", _SPONSOR_ID.finditer)
     if not out["others"]:

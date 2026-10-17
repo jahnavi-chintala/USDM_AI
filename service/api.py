@@ -8,7 +8,8 @@ Routes (OpenAPI at /docs and /openapi.json):
   GET  /health                                   200 when the service is healthy, else 503 (Docker healthcheck)
   GET  /version                                  pipeline version, fingerprint, packages, models
   POST /documents                                multipart upload: file, reprocess, password (form field only)
-  GET  /documents   GET|DELETE /documents/{doc_id}   POST /documents/{doc_id}/reprocess (force: query or JSON)
+  GET  /documents   GET|DELETE /documents/{doc_id}   POST /documents/{doc_id}/reprocess (force: query or JSON;
+                                                   password: JSON body only)
   GET  /documents/{doc_id}/jobs   GET /jobs   GET /jobs/{job_id}   POST /jobs/{job_id}/cancel
   GET  /documents/{doc_id}/files  GET /documents/{doc_id}/files/{name}   (short names such as chunks.jsonl)
   GET  /tools                                    protocol tool definitions (style=anthropic|openai)
@@ -436,19 +437,25 @@ def create_app(service: ProtocolService | None = None, *, manage_lifecycle: bool
               responses={200: {"description": "Not queued: the result is current (pass force) or a job is "
                                               "already queued / running"},
                          202: {"description": "A reprocess job was queued"}, **_errors(400, 404)})
-    def reprocess(doc_id: str, service: ServiceDep,
+    def reprocess(doc_id: str, request: Request, service: ServiceDep,
                   force: Annotated[bool | None, Query(description="Reprocess even when the result is "
                                                                   "current.")] = None,
                   options: Annotated[ReprocessOptions | None, Body(description="Alternative to the query "
-                                                                               "parameter.")] = None
+                                                                               "parameter, and the password of "
+                                                                               "an encrypted PDF.")] = None
                   ) -> JSONResponse:
         """Queues a job when the published result is stale (made by another pipeline version or fingerprint) or
-        force is set; force may come as a query parameter or as a JSON body {"force": true}."""
-        return _decision(service.reprocess(doc_id, force=bool(force) or bool(options and options.force)))
+        force is set; force may come as a query parameter or as a JSON body {"force": true}. The password of an
+        encrypted source PDF comes only in the JSON body {"password": "..."}, never in the URL."""
+        if "password" in request.query_params:
+            raise BadRequest("send the PDF password in the JSON body, never in the URL", code="password_in_query")
+        secret = options.password.get_secret_value() if options and options.password is not None else None
+        return _decision(service.reprocess(doc_id, force=bool(force) or bool(options and options.force),
+                                           password=secret or None))
 
     # ---------------------------------------------------------------- jobs
     @app.get("/documents/{doc_id}/jobs", tags=["jobs"], summary="Jobs of a document (newest first)",
-             responses=_errors(400))
+             responses=_errors(400, 404))
     def document_jobs(doc_id: str, service: ServiceDep, state: str | None = None,
                       limit: int = 100) -> JSONResponse:
         return _ok(service.list_jobs(doc_id=doc_id, state=state, limit=limit))
@@ -548,6 +555,9 @@ class ReprocessOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     force: StrictBool = Field(False, description="Reprocess even when the result is current.")
+    password: SecretStr | None = Field(None, description="Password of an encrypted source PDF: held in memory until "
+                                                         "its job starts, never stored or logged; dropped when no "
+                                                         "job is queued.")
 
 
 def upload(service: ServiceDep,
