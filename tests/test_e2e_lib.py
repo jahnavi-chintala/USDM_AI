@@ -178,6 +178,20 @@ def test_visit_and_identifier_quotes() -> None:
                                 {"label": "Day 1", "header_path": ["Day 1"]}, {"label": "", "header_path": []}]}]}
     quotes = lib.visit_quotes(soa)
     assert [(q.text, q.verbatim) for q in quotes] == [("Day 1", False), ("Period 1 Day 2", False)]
+    # with header cells: the cells as printed (and a unit's stub cell) are verbatim quotes, once per text, without a
+    # section; cells shorter than 2 letters or digits are counted, not quoted (quote_check refuses them)
+    soa = {"soas": [{"section_id": "S1.3", "visits": [
+        {"label": "Hour 0", "header_path": ["Day 1", "Hour 0"],
+         "header_cells": [{"text": "Day 1^a", "unit": None, "unit_from": None},
+                          {"text": "0", "unit": "Hour", "unit_from": {"text": "Hours", "column": 0}}]},
+        {"label": "Hour 12", "header_path": ["Day 1", "Hour 12"],
+         "header_cells": [{"text": "Day 1^a", "unit": None, "unit_from": None},
+                          {"text": "12", "unit": "Hour", "unit_from": {"text": "Hours", "column": 0}}]}]}]}
+    quotes = lib.visit_quotes(soa)
+    assert [(q.text, q.category, q.section_id, q.verbatim) for q in quotes] == [
+        ("Hour 0", "visit", None, False), ("Day 1^a", "visit_header", None, True), ("Hours", "visit_header", None, True),
+        ("Hour 12", "visit", None, False), ("12", "visit_header", None, True)]
+    assert lib.short_header_cells(soa) == 1 and lib.quotable("D1") and not lib.quotable("D") and not lib.quotable("-")
     info = {"identifiers": {"nct": {"value": "NCT00000001", "source": {"text": "NCT #: NCT00000001"}},
                             "sponsor_protocol_id": None}}
     assert [q.text for q in lib.identifier_quotes(info)] == ["NCT00000001", "NCT #: NCT00000001"]

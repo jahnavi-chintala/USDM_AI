@@ -12,13 +12,21 @@ Contract (one dict per SoA; merged multi-page tables are one table; tables linke
 (table_merge.continuation_chains) and adjacent SoA tables that continue each other are combined):
   {"table_id", "table_ids", "caption", "section_id", "pages",
    "visits": [{"id": "V1", "label", "header_path", "window", "timing", "column",
-               + "table_id", "epoch_hint", "footnote_markers"}],
+               + "table_id", "epoch_hint", "footnote_markers", "header_cells", "header_text", "label_composed"}],
    "activities": [{"id": "A1", "label", "section", "notes", "footnote_markers", "row", + "table_id"}],
    "cells": [{"activity", "visit", "mark", "text", "qualifier", "footnote_markers"}],
    "footnotes": {"a": str, ...}, "header_notes": [str], "section_rows": [{"table_id", "row"}], "warnings": [str]}
   label = the leaf header text; epoch_hint = the outermost group header spanning >= 2 columns; timing = the
   timing expressions of the header path ('Cycle 1, D8'; bare numbers take the stub's unit: 'W2 15' under
   'Week [W] Study day' -> 'W2 Day 15'), else a pure timing in the window row ('Day -28 to Day -1');
+  header_cells = the grid cells behind header_path, parallel to it (same length and order), for quoting the PDF: {"text"
+  as printed (whitespace-collapsed, footnote markers and a header note after a newline kept), "table_id", "row" and
+  "column" (the grid row and column where the cell starts), "unit" (the word added to a bare number: 'Hour', 'Days';
+  else null), "unit_from" ({"text", "column"} of the label-column cell that names the unit, in the cell's row or,
+  for a cell starting in a visit-window row, in its first row below that holds the header path; else null)},
+  taken from the table the visit is taken from; header_text = the leaf cell's text (null without a header path);
+  label_composed = a unit was added to the leaf part, so the label is not the cell's own text ('Hours' | '0' ->
+  'Hour 0': quote header_text and unit_from.text, not the label).
   column/row/table_id = where the visit/activity first appears. Only scheduled cells are listed (no blanks or
   dashes); a cell spanning several visits is listed for each; mark = an X-like glyph (also 'X----X' or an
   arrow drawn across visits), qualifier = the other text ('Cycle 1-3', 'if necessary' of 'X (if necessary)').
@@ -345,14 +353,22 @@ def _unit_of(stub: str) -> str | None:
     return base.capitalize()
 
 
-def _with_unit(part: str, unit: str | None) -> str:
-    """'-21' under a 'Days' stub -> 'Day -21'; '2-3' -> 'Days 2-3'; '4^g' under 'Visit number' -> 'Visit 4^g'."""
+def _unit_word(part: str, unit: str | None) -> str | None:
+    """The word _with_unit puts before a bare number ('Day'; 'Days' for a range), None when it adds nothing."""
     core = split_markers(part, frozenset(), mark_letters=False)[0]
     if unit and _BARE_TIME.match(core):
-        part = re.sub(r"(?<![\d.])\.(?=\d)", "0.", part)  # '-.3' -> '-0.3'
         plural = bool(re.search(r"\d\s*(?:to|through|-|–|—|→)\s*[-−–]?\d", core)) and unit != "Visit"
-        return f"{unit}{'s' if plural else ''} {part}"
-    return part
+        return f"{unit}{'s' if plural else ''}"
+    return None
+
+
+def _with_unit(part: str, unit: str | None) -> str:
+    """'-21' under a 'Days' stub -> 'Day -21'; '2-3' -> 'Days 2-3'; '4^g' under 'Visit number' -> 'Visit 4^g'."""
+    word = _unit_word(part, unit)
+    if word is None:
+        return part
+    part = re.sub(r"(?<![\d.])\.(?=\d)", "0.", part)  # '-.3' -> '-0.3'
+    return f"{word} {part}"
 
 
 # =========================================================================== one table -> part
@@ -363,7 +379,7 @@ class _Part:
     ref: str
     pages: list[int]
     ncols: int
-    visits: list[dict]            # col, parts (raw header path), window_raw
+    visits: list[dict]            # col, parts (raw header path), meta, hcells (one header cell per part), window_raw
     activities: list[dict]        # row, label_raw, section_raw, notes_raw, cells {col: raw}, blank
     header_rows: list[int]
     label_cols: list[int]
@@ -490,13 +506,30 @@ def _parse_table(t, doc) -> _Part | None:
         else:
             break
 
-    def stub_of(r: int) -> str:
-        parts = []
+    def stub_cells(r: int) -> list[tuple[int, str]]:
+        """(grid column, text) of the label-column cells that start in row r, a repeated text once."""
+        out: list[tuple[int, str]] = []
         for lc in label_cols:
             cell = grid[r][lc]
-            if cell.start_row_offset_idx == r and texts[r][lc] and texts[r][lc] not in parts:
-                parts.append(texts[r][lc])
-        return " ".join(parts)
+            if cell.start_row_offset_idx == r and texts[r][lc] and texts[r][lc] not in [x for _, x in out]:
+                out.append((cell.start_col_offset_idx, texts[r][lc]))
+        return out
+
+    def stub_of(r: int) -> str:
+        return " ".join(x for _, x in stub_cells(r))
+
+    def unit_from(r: int) -> dict | None:
+        """The stub cell of row r that holds the unit word _unit_of(stub_of(r)) takes (the last one named)."""
+        cells = stub_cells(r)
+        hits = list(_UNIT_WORD.finditer(" ".join(x for _, x in cells)))
+        if not hits:
+            return None
+        pos, start = hits[-1].start(1), 0
+        for col, x in cells:
+            if pos < start + len(x):
+                return {"text": x, "column": col}
+            start += len(x) + 1
+        return None
 
     # ---- the visit-window row(s) of the header block
     def is_window_row(r: int) -> bool:
@@ -519,10 +552,11 @@ def _parse_table(t, doc) -> _Part | None:
     # ---- header path per column (a cell's text after its first newline is a header note)
     col_parts: dict[int, list[str]] = {}
     col_meta: dict[int, list[tuple[bool, str]]] = {}   # per part: (a group header over >= 2 columns, row stub)
+    col_hcells: dict[int, list[dict]] = {}   # per part: the header cell it was built from (where, unit added)
     col_notes: dict[int, list[str]] = {}
     header_texts: list[str] = []
     for c in range(ncols):
-        parts, meta, notes, seen = [], [], [], set()
+        parts, meta, hcells, notes, seen = [], [], [], [], set()
         for r in path_rows:
             cell = grid[r][c]
             if id(cell) in seen:
@@ -544,13 +578,18 @@ def _parse_table(t, doc) -> _Part | None:
                 notes.append(" ".join(blocks[1:]))
             if not re.search(r"[A-Za-z0-9]", name):
                 continue
+            unit = None
             if c not in label_cols:
-                name = _with_unit(name, _unit_of(stub_of(r)))
+                stub_unit = _unit_of(stub_of(r))
+                unit, name = _unit_word(name, stub_unit), _with_unit(name, stub_unit)
             if parts and _norm(parts[-1]) == _norm(name):
                 continue
             parts.append(name)
             meta.append((cell.end_col_offset_idx - cell.start_col_offset_idx >= 2, stub_of(r)))
-        col_parts[c], col_meta[c], col_notes[c] = parts, meta, notes
+            hcells.append({"text": texts[r][c], "table_id": t.self_ref, "row": cell.start_row_offset_idx,
+                           "column": cell.start_col_offset_idx, "unit": unit,
+                           "unit_from": unit_from(r) if unit else None})
+        col_parts[c], col_meta[c], col_hcells[c], col_notes[c] = parts, meta, hcells, notes
 
     # ---- notes columns: a header keyword, or long text in the last column
     def long_text(c: int) -> bool:
@@ -607,7 +646,7 @@ def _parse_table(t, doc) -> _Part | None:
                 if v and cell.start_row_offset_idx == r and v.casefold() not in _EMPTY and v not in wins:
                     wins.append(v)
         header_texts.extend(wins)
-        visits.append({"col": c, "cols": cols, "parts": col_parts[c], "meta": col_meta[c],
+        visits.append({"col": c, "cols": cols, "parts": col_parts[c], "meta": col_meta[c], "hcells": col_hcells[c],
                        "window_raw": " ".join(wins) or None})
 
     # ---- body rows: repeated headers dropped, sections, activities
@@ -849,13 +888,14 @@ def _build(doc, parts: list[_Part], modes: list[str], index) -> dict:
     visits_out, unnamed = [], []
     for i, w in enumerate(vlist):
         v, p = w["v"], parts[w["part"]]
-        path, meta, markers = [], [], []
-        for x, mt in zip(v["parts"], v["meta"]):
+        path, meta, hcells, markers = [], [], [], []
+        for x, mt, hc in zip(v["parts"], v["meta"], v["hcells"]):
             clean, ms = split_markers(x, keys, mark_letters=False)
             markers += [m for m in ms if m not in markers]
             if clean and (not path or _norm(path[-1]) != _norm(clean)):
                 path.append(clean)
                 meta.append(mt)
+                hcells.append(hc)
         label = path[-1] if path else ""
         if not label:
             unnamed.append(f"{p.ref}#c{v['col']}")
@@ -878,7 +918,9 @@ def _build(doc, parts: list[_Part], modes: list[str], index) -> dict:
         epoch = next((x for x, (grp, _) in zip(path[:-1], meta[:-1]) if grp), None)
         visits_out.append({"id": f"V{i + 1}", "label": label, "header_path": path, "window": window or None,
                            "timing": timing, "column": v["col"], "table_id": p.ref, "epoch_hint": epoch,
-                           "footnote_markers": markers})
+                           "footnote_markers": markers, "header_cells": hcells,
+                           "header_text": hcells[-1]["text"] if hcells else None,
+                           "label_composed": bool(hcells and hcells[-1]["unit"])})
     if unnamed:
         warnings.append(f"unnamed visit columns: {len(unnamed)} ({', '.join(unnamed[:8])})")
     dups = [k for k, n in Counter(w["key"] for w in vlist if w["key"]).items() if n > 1]

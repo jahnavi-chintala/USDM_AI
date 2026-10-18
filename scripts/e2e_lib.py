@@ -341,17 +341,45 @@ def section_quotes(result: dict, category: str, *, min_words: int = 4, tables: b
 
 
 def visit_quotes(soa_result: dict) -> list[Quote]:
-    """Every SoA visit label get_soa reports (once per text). Never counted as verbatim: soa.py composes labels
-    and header paths from several header cells and the label column ("Hour 0" from "Time point (hours)" + "0")."""
-    out, seen = [], set()
+    """The SoA values an agent quotes: every visit label (once per text), never counted as verbatim because soa.py
+    composes labels from several header cells and the label column ("Hour 0" from "Hours" + "0"), and the header
+    cells the labels were built from (header_cells: each cell's text as printed and the stub cell a unit came
+    from), which are verbatim, once per text. They are quoted without a section: a continuation table can sit in
+    another section than the SoA. A cell with fewer than 2 letters or digits ("0", "D") is too short for
+    quote_check (which refuses it); its table, row and column locate it instead (see short_header_cells)."""
+    out, seen, seen_cells = [], set(), set()
     for s in soa_result.get("soas") or []:
         for v in s.get("visits") or []:
             label = (v.get("label") or "").strip()
-            if not label or label.casefold() in seen:
-                continue
-            seen.add(label.casefold())
-            out.append(Quote(label, "visit", None, verbatim=False))
+            if label and label.casefold() not in seen:
+                seen.add(label.casefold())
+                out.append(Quote(label, "visit", None, verbatim=False))
+            for text in header_cell_texts(v):
+                if quotable(text) and text.casefold() not in seen_cells:
+                    seen_cells.add(text.casefold())
+                    out.append(Quote(text, "visit_header", None))
     return out
+
+
+def header_cell_texts(visit: dict) -> list[str]:
+    """The texts of a visit's header cells and of the stub cells their units came from, stripped, non-empty."""
+    out = []
+    for cell in visit.get("header_cells") or []:
+        for text in (cell.get("text"), (cell.get("unit_from") or {}).get("text")):
+            if (text or "").strip():
+                out.append(text.strip())
+    return out
+
+
+def quotable(text: str) -> bool:
+    """Long enough for quote_check: at least 2 letters or digits."""
+    return len(re.findall(r"[^\W_]", text or "")) >= 2
+
+
+def short_header_cells(soa_result: dict) -> int:
+    """Distinct header-cell texts too short for quote_check (fewer than 2 letters or digits)."""
+    return len({t.casefold() for s in soa_result.get("soas") or [] for v in s.get("visits") or []
+                for t in header_cell_texts(v) if not quotable(t)})
 
 
 IDENTIFIER_KEYS = ("nct", "sponsor_protocol_id")

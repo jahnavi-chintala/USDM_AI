@@ -7,11 +7,14 @@ several styles, a continuation chain (a column missing on the next page), a hori
 on the next page), windows and stub units inside headers, detection through a "soa" section role, lookups.
 """
 
+import os
+import re
 import sys
 import traceback
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from docling_core.types.doc import (BoundingBox, CoordOrigin, DocItemLabel, DoclingDocument, ProvenanceItem, Size,
                                     TableCell, TableData)
@@ -226,6 +229,19 @@ def test_horizontal_split_combined_and_stub_units() -> None:
     p = cell(s, "ADAS-Cog", "Week -2")
     assert (p["mark"], p["qualifier"]) == (False, "P")
     assert cell(s, "ADAS-Cog", "ET")["footnote_markers"] == ["a"] and s["footnotes"]["a"] == "Performed if diabetic."
+    # header cells: the unit words come from the empty stub column ('VISIT' / 'WEEK'); a visit of the second
+    # table (more visits for the same activities) takes its cells, and table_id, from that table
+    wk4 = by_label(s["visits"], "Week 4")
+    assert wk4["header_cells"] == [
+        {"text": "5", "table_id": "#/tables/1", "row": 0, "column": 2, "unit": "Visit",
+         "unit_from": {"text": "VISIT", "column": 1}},
+        {"text": "4", "table_id": "#/tables/1", "row": 1, "column": 2, "unit": "Week",
+         "unit_from": {"text": "WEEK", "column": 1}}], wk4
+    wk03 = by_label(s["visits"], "Week -0.3")
+    assert wk03["header_cells"][1] == {"text": "-.3", "table_id": "#/tables/0", "row": 1, "column": 3, "unit": "Week",
+                                       "unit_from": {"text": "WEEK", "column": 1}}  # printed '-.3', label 'Week -0.3'
+    et = by_label(s["visits"], "ET")
+    assert (et["header_text"], et["label_composed"], et["header_cells"][0]["unit"]) == ("ET", False, None)
 
 
 def test_label_only_section_rows() -> None:
@@ -312,6 +328,247 @@ def test_role_soa_section_and_detection() -> None:
     soas = soa.extract_soa(d, idx)
     assert len(soas) == 1 and soas[0]["table_id"] == "#/tables/0", soas
     assert soas[0]["section_id"] == idx.section_of("#/tables/0") is not None
+
+
+# ------------------------------------------------------------------ header cells (quotable cells behind a label)
+
+HEADER_CELL_KEYS = {"text", "table_id", "row", "column", "unit", "unit_from"}
+
+
+def check_header_cells(s: dict) -> None:
+    """The invariants of every visit: header_cells parallel to header_path, header_text the leaf cell's text,
+    label_composed exactly when a unit was added to the leaf part."""
+    for v in s["visits"]:
+        hc = v["header_cells"]
+        assert len(hc) == len(v["header_path"]), v
+        for c in hc:
+            assert set(c) == HEADER_CELL_KEYS and isinstance(c["text"], str) and c["text"], c
+            assert isinstance(c["row"], int) and isinstance(c["column"], int) and c["table_id"] in s["table_ids"], c
+            assert (c["unit"] is None) == (c["unit_from"] is None), c
+            if c["unit_from"]:
+                assert set(c["unit_from"]) == {"text", "column"} and c["unit_from"]["text"], c
+        assert v["header_text"] == (hc[-1]["text"] if hc else None), v
+        assert v["label_composed"] is bool(hc and hc[-1]["unit"]), v
+
+
+def hours_doc() -> DoclingDocument:
+    """A header row whose stub is 'Hours' over bare numbers: the labels are composed ('Hour 0')."""
+    d = new_doc()
+    rows = [["Hours", "0", "1", "2", "4", "8"], ["ECG", "X", "X", "", "X", ""], ["PK sample", "X", "X", "X", "X", "X"],
+            ["Vital signs", "X", "", "X", "", "X"]]
+    add_table(d, grid_rows(rows, header=1), pv(1, 560, 300))
+    return d
+
+
+def test_header_cells_of_composed_labels() -> None:
+    [s] = soa.extract_soa(hours_doc())
+    assert [v["label"] for v in s["visits"]] == ["Hour 0", "Hour 1", "Hour 2", "Hour 4", "Hour 8"]
+    check_header_cells(s)
+    for k, (v, num) in enumerate(zip(s["visits"], ["0", "1", "2", "4", "8"])):
+        assert v["header_path"] == [v["label"]] and v["header_text"] == num and v["label_composed"] is True
+        assert v["header_cells"] == [{"text": num, "table_id": "#/tables/0", "row": 0, "column": k + 1, "unit": "Hour",
+                                      "unit_from": {"text": "Hours", "column": 0}}], v
+
+
+def days_doc() -> DoclingDocument:
+    """Two header rows: a group cell over three columns, a visit header with a footnote marker ('Day 1^a'), a range
+    and a header note after a newline, under a 'Days' stub."""
+    d = new_doc()
+    cells = [C("Epoch", 0, 0, h=True), C("Treatment (each cycle)", 0, 1, cs=3, h=True),
+             C("Follow-up", 0, 4, cs=3, h=True),
+             C("Days", 1, 0, h=True), C("Day 1^a", 1, 1, h=True), C("2-3", 1, 2, h=True), C("8", 1, 3, h=True),
+             C("30", 1, 4, h=True), C("60", 1, 5, h=True), C("90\nEnd of study", 1, 6, h=True),
+             C("ECG", 2, 0), C("X", 2, 1), C("X", 2, 3), C("X", 2, 4),
+             C("Labs", 3, 0), C("X", 3, 1), C("X", 3, 2), C("X", 3, 5), C("X", 3, 6),
+             C("Vitals", 4, 0), C("X", 4, 1), C("X", 4, 6)]
+    add_table(d, cells, pv(1, 560, 300), footnotes=["^a Pre-dose."])
+    return d
+
+
+def test_header_cells_of_groups_ranges_markers_and_notes() -> None:
+    [s] = soa.extract_soa(days_doc())
+    vs = s["visits"]
+    assert [v["label"] for v in vs] == ["Day 1", "Days 2-3", "Day 8", "Day 30", "Day 60", "Day 90"], vs
+    check_header_cells(s)
+    group = {"text": "Treatment (each cycle)", "table_id": "#/tables/0", "row": 0, "column": 1, "unit": None,
+             "unit_from": None}
+    d1 = by_label(vs, "Day 1")
+    assert d1["header_path"] == ["Treatment (each cycle)", "Day 1"] and d1["footnote_markers"] == ["a"]
+    assert d1["header_text"] == "Day 1^a" and d1["label_composed"] is False
+    assert d1["header_cells"] == [group, {"text": "Day 1^a", "table_id": "#/tables/0", "row": 1, "column": 1,
+                                          "unit": None, "unit_from": None}]
+    # a range takes the plural unit word; the group cell stays the one that starts at column 1 for every column under it
+    rng, d8 = by_label(vs, "Days 2-3"), by_label(vs, "Day 8")
+    assert rng["header_cells"][1] == {"text": "2-3", "table_id": "#/tables/0", "row": 1, "column": 2, "unit": "Days",
+                                      "unit_from": {"text": "Days", "column": 0}}
+    assert (rng["column"], d8["column"]) == (2, 3) and rng["label_composed"] and d8["label_composed"]
+    assert rng["header_cells"][0] == d8["header_cells"][0] == group
+    assert d8["header_cells"][1]["unit"] == "Day" and d8["header_cells"][1]["column"] == 3
+    # a header note after a newline stays in the cell's text, not in the label
+    d90 = by_label(vs, "Day 90")
+    assert d90["header_text"] == "90 End of study" and d90["header_cells"][0]["text"] == "Follow-up"
+    assert d90["header_cells"][1]["unit"] == "Day" and d90["label_composed"] is True
+    assert s["header_notes"] == ["End of study"]
+
+
+def test_header_cells_of_unnamed_and_plain_visits() -> None:
+    d = new_doc()
+    rows = [["Procedure", "Screening", "", "Day 8", "Day 15", "EOT"], ["Consent", "X", "X", "", "", ""],
+            ["Vital signs", "X", "X", "X", "X", "X"], ["ECG", "X", "", "X", "", "X"]]
+    add_table(d, grid_rows(rows, header=1), pv(1, 560, 100))
+    [s] = soa.extract_soa(d)
+    check_header_cells(s)
+    unnamed = s["visits"][1]
+    assert unnamed["label"] == "" and unnamed["header_path"] == [] and unnamed["header_cells"] == []
+    assert unnamed["header_text"] is None and unnamed["label_composed"] is False
+    scr = by_label(s["visits"], "Screening")
+    assert scr["header_cells"] == [{"text": "Screening", "table_id": "#/tables/0", "row": 0, "column": 1,
+                                    "unit": None, "unit_from": None}]
+    assert scr["header_text"] == "Screening" and scr["label_composed"] is False
+
+
+def test_header_cells_skip_repeated_parts() -> None:
+    """A leaf cell repeating the group cell above it adds no header_path part, so it adds no header cell either."""
+    d = new_doc()
+    cells = [C("Procedure", 0, 0, rs=2, h=True), C("Screening", 0, 1, cs=2, h=True), C("Day 1", 0, 3, h=True),
+             C("Day 8", 0, 4, h=True), C("EOT", 0, 5, h=True), C("Screening", 1, 1, h=True), C("Visit 2", 1, 2, h=True),
+             C("Consent", 2, 0), C("X", 2, 1), C("X", 2, 2), C("Vital signs", 3, 0), C("X", 3, 1), C("X", 3, 3),
+             C("X", 3, 4), C("ECG", 4, 0), C("X", 4, 2), C("X", 4, 5)]
+    add_table(d, cells, pv(1, 560, 100))
+    [s] = soa.extract_soa(d)
+    check_header_cells(s)
+    scr, v2 = by_label(s["visits"], "Screening"), by_label(s["visits"], "Visit 2")
+    group = {"text": "Screening", "table_id": "#/tables/0", "row": 0, "column": 1, "unit": None, "unit_from": None}
+    assert scr["header_path"] == ["Screening"] and scr["header_cells"] == [group]
+    assert v2["header_path"] == ["Screening", "Visit 2"] and v2["header_cells"] == [
+        group, {"text": "Visit 2", "table_id": "#/tables/0", "row": 1, "column": 2, "unit": None, "unit_from": None}]
+
+
+def test_header_cells_after_marker_cleaning() -> None:
+    """The output step drops header parts that cleaning makes equal to the one before ('Screening' over 'Screening a'
+    with 'a' a footnote key) or empty (a leaf '^a'); the header cell goes with it, so header_cells stays parallel."""
+    d = new_doc()
+    cells = [C("Procedure", 0, 0, rs=2, h=True), C("Screening", 0, 1, cs=2, h=True), C("Treatment", 0, 3, cs=2, h=True),
+             C("EOT", 0, 5, rs=2, h=True), C("Screening a", 1, 1, h=True), C("Visit 2", 1, 2, h=True),
+             C("^a", 1, 3, h=True), C("Day 8", 1, 4, h=True),
+             C("Consent", 2, 0), C("X", 2, 1), C("X", 2, 2), C("Vital signs", 3, 0), C("X", 3, 1), C("X", 3, 3),
+             C("X", 3, 4), C("ECG", 4, 0), C("X", 4, 2), C("X", 4, 5)]
+    add_table(d, cells, pv(1, 560, 100), footnotes=["a. Applies to all visits."])
+    [s] = soa.extract_soa(d)
+    check_header_cells(s)
+    vs = s["visits"]
+    assert [v["label"] for v in vs] == ["Screening", "Visit 2", "Treatment", "Day 8", "EOT"], vs
+    cell = {"table_id": "#/tables/0", "unit": None, "unit_from": None}
+    scr, treat = vs[0], vs[2]
+    # a dropped duplicate leaves the group cell as the leaf cell; the marker is still the visit's
+    assert scr["header_path"] == ["Screening"] and scr["footnote_markers"] == ["a"]
+    assert scr["header_cells"] == [{"text": "Screening", "row": 0, "column": 1, **cell}], scr
+    assert scr["header_text"] == "Screening"
+    # an empty part leaves the group cell too
+    assert treat["header_path"] == ["Treatment"] and treat["footnote_markers"] == ["a"]
+    assert treat["header_cells"] == [{"text": "Treatment", "row": 0, "column": 3, **cell}], treat
+    assert vs[1]["header_cells"] == [{"text": "Screening", "row": 0, "column": 1, **cell},
+                                     {"text": "Visit 2", "row": 1, "column": 2, **cell}]
+
+
+def test_header_cells_row_is_the_cells_start_row() -> None:
+    """A leaf cell that starts in the visit-window row and spans into the row below it: `row` is where the cell
+    starts (as `column` is), not the header-path row it was read from."""
+    d = new_doc()
+    cells = [C("Activity", 0, 0, h=True), C("Treatment", 0, 1, cs=2, h=True), C("Follow-up", 0, 3, cs=2, h=True),
+             C("EOT", 0, 5, h=True),
+             C("Visit Window", 1, 0), C("Day 1", 1, 1, rs=2, h=True), C("±3D", 1, 2, h=True),
+             C("Study day", 2, 0, h=True), C("Day 8", 2, 2, h=True), C("Day 15", 2, 3, h=True),
+             C("Day 22", 2, 4, h=True),
+             C("Consent", 3, 0), C("X", 3, 1), C("X", 3, 2), C("Vital signs", 4, 0), C("X", 4, 1), C("X", 4, 3),
+             C("X", 4, 4), C("ECG", 5, 0), C("X", 5, 2), C("X", 5, 5)]
+    add_table(d, cells, pv(1, 560, 100))
+    [s] = soa.extract_soa(d)
+    check_header_cells(s)
+    d1, d8 = by_label(s["visits"], "Day 1"), by_label(s["visits"], "Day 8")
+    assert d1["header_path"] == ["Treatment", "Day 1"], d1
+    assert d1["header_cells"][1] == {"text": "Day 1", "table_id": "#/tables/0", "row": 1, "column": 1, "unit": None,
+                                     "unit_from": None}, d1
+    assert d8["header_cells"][1]["row"] == 2 and d8["header_cells"][0]["row"] == 0, d8
+
+
+def test_header_cells_in_the_other_synthetic_soas() -> None:
+    """Windows, a spanning group, a repeated header row and a continuation chain: the invariants hold, plain headers
+    are not composed, and a visit on both pages of a chain keeps the cells of the first page's table."""
+    [main] = soa.extract_soa(main_soa_doc())
+    check_header_cells(main)
+    assert [v["label_composed"] for v in main["visits"]] == [False] * 5
+    assert by_label(main["visits"], "EOT")["header_cells"] == [
+        {"text": "EOT", "table_id": "#/tables/0", "row": 0, "column": 5, "unit": None, "unit_from": None}]
+    [chain] = soa.extract_soa(chain_doc())
+    check_header_cells(chain)
+    assert {v["header_cells"][-1]["table_id"] for v in chain["visits"]} == {"#/tables/0"}
+
+
+def table_row_text(row) -> str:
+    """A grid row as quote_check sees it: each cell once, the non-empty ones joined with ' | '."""
+    return " | ".join(x for x in {id(g): soa.collapse(g.text) for g in row}.values() if x)
+
+
+def test_header_cells_quotable_on_public_documents() -> None:
+    """On the six public protocols: header_cells parallel to header_path, every cell where it says it is (the grid
+    cell at table / row / column holds the text), and every cell text and unit stub text found by quote_check.
+    quote_check refuses a text of fewer than 2 letters or digits ('0', 'D'): such a cell is checked as its whole table
+    row, which quote_check finds as one table-row text ('Hours | 0 | 1 | 2')."""
+    os.environ["OPENROUTER_OFFLINE"] = "1"
+    names = ["LZZT_CDISC_Pilot", "Lilly_NCT03421379", "Alexion_NCT04573309", "Bayer_NCT04304508",
+             "PrECOG_NCT01797120", "Sanofi_NCT03637764"]
+    present = [n for n in names if (ROOT / "output_public" / n / "chunks" / "stats.json").is_file()]
+    if not present:
+        print("   (skipped: output_public/ absent)")
+        return
+    if len(present) < len(names):
+        print(f"   (output_public/{', '.join(sorted(set(names) - set(present)))} absent: not checked)")
+    from protocol_api import ProtocolDocument
+
+    for name in present:
+        pd = ProtocolDocument.open(ROOT / "output_public" / name)
+        tables = {t.self_ref: t for t in pd.doc.tables}
+        asked: dict[str, bool] = {}                     # quote -> found, once per distinct quote
+        counts = {"cell": [0, 0], "stub": [0, 0]}       # [found, checked]
+        as_row, missing = 0, []
+
+        def check(kind: str, text: str, row) -> None:
+            nonlocal as_row
+            short = len(re.findall(r"[A-Za-z0-9]", text)) < 2
+            quote = table_row_text(row) if short else text
+            as_row += short
+            if quote not in asked:
+                asked[quote] = pd.quote_check(quote)["found"]
+            counts[kind][0] += asked[quote]
+            counts[kind][1] += 1
+            if not asked[quote]:
+                missing.append(text)
+
+        res = pd.get_soa(with_markdown=False)
+        visits = [v for s in res["soas"] for v in s["visits"]]
+        for s in res["soas"]:
+            check_header_cells(s)
+            for v in s["visits"]:
+                for c in v["header_cells"]:
+                    grid = tables[c["table_id"]].data.grid
+                    row = grid[c["row"]]
+                    cell = row[c["column"]]
+                    assert (cell.start_row_offset_idx, cell.start_col_offset_idx) == (c["row"], c["column"]), (name, c)
+                    assert soa.collapse(cell.text) == c["text"], (name, c)
+                    check("cell", c["text"], row)
+                    if c["unit_from"]:
+                        # the stub cell is in a row the header cell spans (its own row unless it starts above)
+                        stub_rows = [grid[r] for r in range(cell.start_row_offset_idx, cell.end_row_offset_idx)
+                                     if soa.collapse(grid[r][c["unit_from"]["column"]].text) == c["unit_from"]["text"]]
+                        assert stub_rows, (name, c)
+                        check("stub", c["unit_from"]["text"], stub_rows[0])
+                if v["header_cells"] and v["header_cells"][-1]["unit"]:
+                    assert v["label"].startswith(v["header_cells"][-1]["unit"] + " "), (name, v["label"])
+        print(f"   {name}: {len(visits)} visits, {sum(v['label_composed'] for v in visits)} composed labels, "
+              f"header cells found {counts['cell'][0]}/{counts['cell'][1]}, unit stubs found "
+              f"{counts['stub'][0]}/{counts['stub'][1]} ({as_row} too short, checked as their table row)")
+        assert not missing, (name, missing[:5])
 
 
 # ------------------------------------------------------------------ primitives

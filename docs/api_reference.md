@@ -2196,6 +2196,17 @@ cells that are scheduled, footnotes, and a Markdown view. Optional `visit` and `
 | `soas[].visits[].table_id` | string | Table the visit first appears in. |
 | `soas[].visits[].epoch_hint` | string \| null | The outermost group header spanning the column (`Period 1`, `Screening`): a hint for the study epoch. |
 | `soas[].visits[].footnote_markers` | string[] | Footnote markers on the visit header, keys of `footnotes`. |
+| `soas[].visits[].label_composed` | boolean | `true` when `label` is not the column's own header text: a bare number in the header took the unit of its row's stub (`Days -42 to -9` from the cell `-42 to -9` under a `Days` stub). Quote `header_text` / `header_cells` then, not `label`. |
+| `soas[].visits[].header_text` | string \| null | The column's own header cell as printed (markers and header notes kept: `UNS ^d`): the text to quote_check for this visit. Null for a column without a header. Same as `header_cells[-1].text`. |
+| `soas[].visits[].header_cells` | object[] | The header cells `header_path` was built from: one entry per `header_path` entry, same order. |
+| `soas[].visits[].header_cells[].text` | string | The cell's text as printed, whitespace-normalised, footnote markers and header notes kept. |
+| `soas[].visits[].header_cells[].table_id` | string | Table of the cell (for a visit continued from another page, the table it was taken from). |
+| `soas[].visits[].header_cells[].row` | integer | Grid row where the cell starts (0-based), as in `get_table`'s `grid`. |
+| `soas[].visits[].header_cells[].column` | integer | Grid column where the cell starts (0-based); a group header spanning several columns gives its first column. |
+| `soas[].visits[].header_cells[].unit` | string \| null | The unit `get_soa` put before a bare number of this cell (`Day`, `Days`, `Hour`, `Visit`); null when the cell text was used as it is. |
+| `soas[].visits[].header_cells[].unit_from` | object \| null | Where that unit came from: the label-column cell of the header row the unit was read from (a row the cell covers; normally `row`). Null when `unit` is null. |
+| `soas[].visits[].header_cells[].unit_from.text` | string | That stub cell's text as printed (`Days`, `Time point (hours)`). |
+| `soas[].visits[].header_cells[].unit_from.column` | integer | Its grid column. |
 | `soas[].activities` | object[] | The activity rows, top to bottom. Section rows are not activities. |
 | `soas[].activities[].id` | string | `A1`, `A2`, ... in row order; valid within this SoA only. |
 | `soas[].activities[].label` | string | The row label, markers removed. |
@@ -2259,10 +2270,16 @@ Lilly_NCT03421379, `{"activity": "Informed Consent"}` (trimmed):
       "pages": [12, 13, 14, 15, 16, 17, 18, 19],
       "visits": [
         {"id": "V1", "label": "Days -28 to -2", "header_path": ["Screening", "Days -28 to -2"], "window": null,
-         "timing": "Days -28 to -2", "column": 1, "table_id": "#/tables/3", "epoch_hint": null, "footnote_markers": []},
+         "timing": "Days -28 to -2", "column": 1, "table_id": "#/tables/3", "epoch_hint": null, "footnote_markers": [],
+         "label_composed": false, "header_text": "Days -28 to -2",
+         "header_cells": [{"text": "Screening", "table_id": "#/tables/3", "row": 0, "column": 1, "unit": null,
+                           "unit_from": null},
+                          {"text": "Days -28 to -2", "table_id": "#/tables/3", "row": 1, "column": 1, "unit": null,
+                           "unit_from": null}]},
         {"id": "V2", "label": "Day -1", "header_path": ["Period 1", "Day -1"], "window": null,
          "timing": "Period 1, Day -1", "column": 2, "table_id": "#/tables/3", "epoch_hint": "Period 1",
-         "footnote_markers": []}
+         "footnote_markers": [], "label_composed": false, "header_text": "Day -1",
+         "header_cells": [/* "Period 1" (row 0), "Day -1" (row 1), column 2 */]}
         /* 6 more */
       ],
       "activities": [
@@ -2298,6 +2315,11 @@ Lilly_NCT03421379, `{"activity": "Informed Consent"}` (trimmed):
 
 - The structure is inferred by `soa.py` from the table grid: check visit names, windows and timings against
   `read_section("soa")` or `get_table(table_id, format="rows")` before you rely on them.
+- To verify a visit, quote its `header_text` (and, for a composed label, `header_cells[].unit_from.text`) with
+  `quote_check`, not `label`: labels are cleaned and some are composed. A header cell with fewer than 2 letters or
+  digits (`0`, `D`) is too short for `quote_check`; its `table_id`, `row` and `column` locate it in
+  `get_table(table_id)`'s `grid`. Quote header cells without `section_id`: a continued table can lie in another
+  section than the SoA.
 - The filters do not shrink `soas`: every call returns the whole SoA. Pass `with_markdown: false` to save space.
 - To render a grid: columns from `visits`, rows from `activities` (grouped by `section`), and each cell from
   `cells` by `(activity, visit)`; footnote markers resolve through `footnotes`.
@@ -3277,8 +3299,8 @@ description and Mermaid diagram, labelled as such: show the same label in your U
   ([Pages and boxes](#pages-and-boxes)). Boxes are per item, not per word, and table-cell boxes have no page number.
 - **A complete answer from `search`.** It is a ranked, budgeted selection. Use `read_section` for anything that must
   be complete (every criterion, every objective).
-- **Verbatim SoA visit labels.** `get_soa` cleans labels and composes `timing`; some labels are not word for word in
-  the PDF.
+- **Verbatim SoA visit labels.** `get_soa` cleans labels and composes some (`label_composed`); the header cells they
+  were built from are given as printed (`header_text`, `header_cells`), with where they are.
 - **Confidence scores for extracted values.** The service gives evidence (source lines, match tiers, `role_score`),
   not probabilities. Heuristic values say so (`sponsor.method`).
 - **Push notifications.** There are no webhooks or streams: poll the job.

@@ -36,7 +36,9 @@ Steps (PASS / FAIL / SKIP table at the end; exit 1 on any FAIL, 2 when refused):
                   quote_check (100% required), SoA below the floors (encounter recall < 0.8, activity recall < 0.2,
                   cell F1 < 0.7: far below the host baseline of the same pipeline, 1.0 / 0.28-1.0 / 0.81-0.89, so
                   they catch a missing or broken SoA, not the known extraction limits). SoA visit labels are composed
-                  by soa.py (e.g. "Hour 0" from a "Time point (hours)" header): their quote_check rate is reported only.
+                  by soa.py (e.g. "Hour 0" from a "Hours" stub and a "0" header): their quote_check rate is reported
+                  only; the header cells they were built from (get_soa header_cells, and the stub a unit came from)
+                  are verbatim and count in the 100% check.
   4 concurrency   while the last protocol converts: agent 1 (1st document, MCP HTTP), agent 2 (2nd document, MCP
                   stdio) and a REST client repeating the same tool calls, plus /health polled every 0.5 s. MCP
                   structuredContent must equal the REST JSON for identical calls; no error. FAIL: /health max >= 2 s
@@ -789,8 +791,10 @@ def score_workflow(ctx: Ctx, d: Doc, wf: dict, step: str = "3", keyed: bool = Tr
             f"{found_v}/{len(verb)} ({', '.join(f'{k} {v}' for k, v in scores['quote_check']['per_category'].items())})")
     for q in missing[:5]:
         ctx.pub(f"      not found ({q['category']}, elsewhere {q['elsewhere']}): {q['text'][:100]!r}")
+    scores["quote_check"]["header_cells_too_short"] = lib.short_header_cells(wf.get("soa") or {})
     ctx.say(f"    {d.label}: quote_check of SoA visit labels (composed by soa.py, reported only): "
-            f"{scores['quote_check']['visit_labels_found']}/{len(derived)}")
+            f"{scores['quote_check']['visit_labels_found']}/{len(derived)}; header cells too short to quote "
+            f"(located by table, row and column): {scores['quote_check']['header_cells_too_short']}")
     if ctx.numbers_only or not keyed:
         return scores
     # identity

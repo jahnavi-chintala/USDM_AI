@@ -36,7 +36,7 @@ Every field of every tool result, with examples, is described in [api_reference.
 | `find_sections(role, query)` | Ranked sections by ICH M11 role and/or fuzzy title. Section numbers work too ("6.2"). | Finding a section whose role tagging is uncertain. |
 | `read_section(section)` | Complete Markdown of a section and its subsections, with per-block provenance. `section` can be an id (`S6.1`), a number (`6.1`) or a role (`inclusion`). | **Every enumeration.** This is complete; `search` is not. |
 | `get_table(table)` | One whole table, chosen by id (`#/tables/5`) or by caption/heading words. Markdown, grid, merged cells, footnotes; page-split chains joined. `format="rows"` gives one line per row. | Intervention tables, objective/endpoint tables, lab panels, wide SoA tables. |
-| `get_soa(visit, activity)` | The structured Schedule of Activities from `soa.py`: visits (label, header path, window, timing), activities, activity × visit cells (mark, qualifier, footnote markers), footnote texts, Markdown. Optional filter by visit and/or activity. | Encounters, Activities, ScheduledActivityInstances, Timings. |
+| `get_soa(visit, activity)` | The structured Schedule of Activities from `soa.py`: visits (label, header path, window, timing, and the header cells as printed with their table row / column), activities, activity × visit cells (mark, qualifier, footnote markers), footnote texts, Markdown. Optional filter by visit and/or activity. | Encounters, Activities, ScheduledActivityInstances, Timings. |
 | `search(query)` | The production retrieval context: the identity block plus ranked blocks (whole sections or parents, tables, passages). Each block has kind, text, section, pages and refs; glossary definitions are included. | Facts scattered through the body, such as a washout period or a dose rule in an appendix. |
 | `abbreviation(term)` | Glossary lookup in both directions ("AE" → "adverse event", or the reverse), with where the term is defined. | Expanding abbreviations in extracted text. |
 | `quote_check(quote, section_id)` | Whether the text occurs in the document, the match type, and every location. | **Verifying every extracted value** (see below). |
@@ -211,3 +211,6 @@ The main protocol (`output/`) is confidential: run the CLI on it locally only, a
   - Check it with `quote_check`.
 - **The SoA structure comes from `soa.py`**, so its visit names, windows and timings are what that module infers.
   - Check them against `read_section("soa")` and the table.
+  - A visit `label` can be composed (`label_composed`: `Hour 0` from a `Hours` stub and a `0` cell). Quote
+    `header_text` / `header_cells[].text` (and `unit_from.text`) instead, without a `section_id`; a cell shorter than
+    2 letters or digits is located by its `table_id`, `row` and `column` in `get_table`.

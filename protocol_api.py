@@ -1753,8 +1753,12 @@ TOOLS: list[dict] = [
     {"name": "get_soa", "method": "get_soa",
      "description": "The structured Schedule of Activities: visits (label, window, timing), activities, the "
                     "activity x visit cells with marks and footnote markers, footnote texts, with provenance and a "
-                    "Markdown rendering. Optional visit/activity filter. If 'available' is false, read the SoA with "
-                    "read_section('soa') and get_table(...).",
+                    "Markdown rendering. A visit's 'label' may be composed ('Hour 0' from the stub 'Hours' and the "
+                    "cell '0'): quote_check its header_text (header_cells holds the header cells as printed) and, "
+                    "for a composed label, the unit_from text, without section_id, not the label; a header cell "
+                    "of fewer than 2 letters or digits cannot be checked alone: its table_id, row and column "
+                    "locate it in get_table's grid. Optional visit/activity filter. If 'available' is false, read "
+                    "the SoA with read_section('soa') and get_table(...).",
      "input_schema": {"type": "object", "properties": {
          "visit": {"type": "string"}, "activity": {"type": "string"},
          "with_markdown": {"type": "boolean", "default": True}},
