@@ -528,6 +528,8 @@ mark, .hl { background: var(--mark-bg); color: var(--mark-text); border-radius: 
 .block-card > header { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 8px 10px; background: var(--surface-2); border-bottom: 1px solid var(--border); font-size: 0.86rem; }
 .block-card > .block-body { padding: 10px 12px; max-height: 420px; overflow: auto; }
 .id-source { font-family: var(--serif); color: var(--muted); font-size: 0.9rem; }
+.source-tag { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 3px; }
+.stack-sm > .source-tag, .row > .source-tag { margin-top: 0; }
 
 /* SoA grid */
 .soa-wrap { overflow: auto; max-height: 70vh; border: 1px solid var(--border); border-radius: var(--radius-sm); }
@@ -539,6 +541,8 @@ mark, .hl { background: var(--mark-bg); color: var(--mark-text); border-radius: 
 .soa thead th.corner { z-index: 3; background: var(--surface-2); }
 .soa td.on { background: color-mix(in srgb, var(--ok) 13%, var(--surface)); font-weight: 700; color: var(--ok); }
 .soa td .qual { display: block; font-size: 0.7rem; color: var(--muted); font-weight: 500; }
+.composed-mark { color: var(--accent-strong); font-weight: 700; }
+.soa .composed-mark { margin-left: 3px; cursor: help; }
 .soa tbody tr:hover th.act { background: var(--surface-2); }
 sup.fn { font-size: 0.68em; color: var(--violet); font-weight: 700; margin-left: 1px; }
 .footnotes { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; font-size: 0.86rem; }

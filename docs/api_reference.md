@@ -738,8 +738,9 @@ Notes:
 
 - The job's caches (chunk embeddings, query embeddings, reranks) are copied from the old result, so a reprocess
   sends only what changed to OpenRouter.
-- This route takes no password. A reprocess of an encrypted PDF therefore fails when the job opens the PDF. For a
-  stale result, upload the PDF again with `reprocess=true` and its `password` instead.
+- An encrypted source PDF needs its `password` in the JSON body, as `{"force": true, "password": "…"}`; without it
+  the job fails when it opens the PDF. The password is held in memory only: if the service restarts before the job
+  starts, the job fails and the reprocess must be requested again.
 
 #### Duplicate and version rules
 

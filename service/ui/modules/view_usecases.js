@@ -275,9 +275,10 @@ const USE_CASES = [
   {
     id: "soa",
     title: "Build SoA encounters and activities",
-    summary: "Read the structured Schedule of Activities, cross-check a row against the table as printed, and map visits, "
-      + "activities and marks to USDM Encounter, Activity and ScheduledActivityInstance.",
-    flow: ["get_soa", "get_table", "USDM mapping"],
+    summary: "Read the structured Schedule of Activities, cross-check a row against the table as printed, verify the visit "
+      + "headers with quote_check, and map visits, activities and marks to USDM Encounter, Activity and "
+      + "ScheduledActivityInstance.",
+    flow: ["get_soa", "get_table", "quote_check", "USDM mapping"],
     steps: [
       {
         title: "Read the structured Schedule of Activities",
@@ -324,7 +325,82 @@ const USE_CASES = [
             h("details", null, h("summary", { class: "small" }, `All ${lines.length} row lines of ${s.table_id}`),
               h("ol", { class: "list-plain stack-sm" }, lines.map((l) => h("li", { class: "small" }, h("code", { class: "break" }, l))))),
             takeaway("The row line uses the printed column headers (visit numbers here), get_soa the inferred visit labels; "
-              + "when they disagree, trust the printed table and quote_check the label."),
+              + "when they disagree, trust the printed table and quote_check the visit's header_text (labels can be composed)."),
+          ];
+        },
+      },
+      {
+        title: "Verify the visit headers with quote_check",
+        explain: "A visit label is cleaned and can be composed (a bare number under a 'Days' stub becomes 'Days -42 to -9'), "
+          + "so quote the header cell as printed (header_text), not the label. Up to 6 visits are checked, without section_id "
+          + "(a continued table can lie in another section): up to 3 composed ones, then visits whose header cell can be quoted.",
+        run: async (ctx, tool) => {
+          const s = ((ctx.soa || {}).soas || [])[0];
+          if (!s) return [alertBox("info", "Skipped", "No SoA to check.")];
+          const all = s.visits || [];
+          if (!all.length) return [alertBox("info", "No visits", "This Schedule of Activities has no visits to check.")];
+          if (!all.some((v) => "header_text" in v)) {
+            return [alertBox("info", "Skipped", "get_soa of this service returns no header_text (an older version): quote_check the visit label instead.")];
+          }
+          const quotable = (v) => ((v.header_text || "").match(/[\p{L}\p{N}]/gu) || []).length >= 2;
+          const picked = new Set(all.filter((v) => v.label_composed).slice(0, 3));
+          for (const group of [all.filter(quotable), all]) {
+            for (const v of group) if (picked.size < 6) picked.add(v);
+          }
+          // a short number occurs all over a protocol: only a listed location inside the cell's own table says more
+          const inItsTable = (qc, cell) => Boolean(cell && cell.table_id)
+            && (qc.locations || []).some((l) => ((l.provenance || {}).refs || []).includes(cell.table_id));
+          const rows = [];
+          let missed = 0;
+          let failed = 0;
+          for (const v of all.filter((x) => picked.has(x))) { // column order
+            const cells = Array.isArray(v.header_cells) ? v.header_cells : [];
+            const last = cells[cells.length - 1];
+            const text = v.header_text;
+            let result;
+            if (!text) {
+              result = h("span", { class: "faint" }, "no header cell");
+            } else if (!quotable(v)) {
+              result = h("span", { class: "small muted", title: last && last.table_id ? `table ${last.table_id}` : null },
+                `too short to quote, located at ${last ? `row ${last.row}, column ${last.column}` : `column ${v.column}`}`);
+            } else {
+              let qc;
+              try {
+                qc = await tool("quote_check", { quote: text });
+              } catch (err) {
+                qc = { found: false, error: err };
+              }
+              const listed = (qc.locations || []).length;
+              const places = `${qc.count ?? listed} place${(qc.count ?? listed) === 1 ? "" : "s"}`;
+              if (qc.error) {
+                failed += 1;
+                result = badge(qc.error.type || "error", "danger");
+              } else if (!qc.found) {
+                missed += 1;
+                result = badge("not found", "danger");
+              } else if (inItsTable(qc, last)) {
+                result = badge("found · in its table", "ok", { title: `a listed location is in ${last.table_id}` });
+              } else {
+                result = badge(last && last.table_id ? `found · ${places}, its table not among the ${listed} listed` : `found · ${places}`, "info");
+              }
+            }
+            const units = cells.filter((c) => c && c.unit).map((c) => h("div", { class: "small" },
+              `unit "${c.unit}"${c.unit_from ? ` from the row's "${c.unit_from.text}" cell (column ${c.unit_from.column})` : ""}`));
+            rows.push([v.label || h("span", { class: "faint" }, "–"), v.label_composed ? badge("yes", "info") : "no",
+              text ? h("code", { class: "break" }, text) : h("span", { class: "faint" }, "–"),
+              units.length ? units : h("span", { class: "faint" }, "–"), result]);
+          }
+          return [
+            h("div", { class: "row" }, badge(`${rows.length} of ${all.length} visits`, "outline"),
+              badge(`${all.filter((v) => v.label_composed).length} composed labels`, "info")),
+            miniTable(["Visit label", "Composed", "Header cell as printed", "Unit from", "quote_check"], rows),
+            takeaway((missed ? `${missed} header cell(s) were not found: compare them with get_table(format='rows'). ` : "")
+              + (failed ? `${failed} quote_check call(s) failed (error badge): run the step again. ` : "")
+              + "A composed label was built by get_soa from the printed cell and the unit of its row: keep the header cell as the "
+              + "evidence for the visit. A short number occurs all over a protocol, so a match only proves that the text exists "
+              + "('in its table': a listed location lies in the cell's own table); the cell's table_id, row and column point at "
+              + "the cell itself in get_table's grid. A cell with fewer than 2 letters or digits cannot be quoted, only located "
+              + "that way."),
           ];
         },
       },

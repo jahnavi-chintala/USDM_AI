@@ -8,6 +8,7 @@ No pytest, offline, fast, no browser and no document data: a temporary DATA_DIR 
     an identifier, never fetched, and is the only exception)
   - no inline <script> / <style>, style="" attributes or inline event handlers in the markup; no innerHTML-style
     sinks, eval, new Function or string timers in the scripts (all of it would break under the CSP or open XSS)
+  - the reprocess dialog's password goes in the JSON body only: not in a query object or the URL, not logged or stored
   - every API path the scripts use is a path of the app's OpenAPI schema, or /mcp
   - every named import resolves to an export of the imported module
   - `node --input-type=module --check` on every .js file when node is on PATH (skipped with a note otherwise;
@@ -287,6 +288,125 @@ def test_named_imports_resolve():
             if (p.parent / spec).resolve() not in exported:
                 problems.append(f"{rel(p)}: missing module {spec}")
     assert not problems, f"unresolved imports: {problems}"
+
+
+def _js_call(code: str, start: int) -> str:
+    """The text of the call whose '(' is at `start`, up to its matching ')' (string literals skipped)."""
+    depth, quote, i = 0, None, start
+    while i < len(code):
+        c = code[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'`":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return code[start:i + 1]
+        i += 1
+    raise AssertionError("unbalanced call in the script")
+
+
+REPROCESS_FLOW_SAMPLE = """export async function reprocessFlow(doc) {
+  const pw = h("input", { type: "password", autocomplete: "off" });
+  const conf = await confirmOpenRouter("reprocess", { extra: pw });
+  const typed = pw.value;
+  pw.value = "";
+  const payload = { force: Boolean(conf.checks.force) };
+  if (typed) payload.password = typed;
+  const res = await post(PATHS.reprocess, { params: { doc_id: doc.doc_id }, json: payload });
+  toast("queued", "ok");
+  return res.data;
+}
+
+function unrelated() { console.log("not part of reprocessFlow"); }
+"""
+
+
+def _reprocess_flow_problems(code: str) -> list[str]:
+    """Why reprocessFlow in `code` (script text without comments) could leak the PDF password; [] when it cannot.
+    Independent of the variable names: it follows the password input, the value read from it and the JSON body."""
+    start = code.find("export async function reprocessFlow")
+    if start < 0:
+        return ["reprocessFlow is missing"]
+    end = re.compile(r"^(?:export\s|function\s|async\s+function\s)", re.M).search(code, start + 1)
+    flow = code[start:end.start() if end else len(code)]  # up to the next top-level declaration
+    problems = []
+    fields = re.finditer(r"""(?:const|let)\s+(\w+)\s*=\s*h\(\s*"input"\s*,\s*(\{[^}]*\})""", flow)
+    field = next((m for m in fields if re.search(r'\btype\s*:\s*"password"', m.group(2))), None)
+    secrets = {"password"}
+    if field is None:
+        problems.append("the dialog has no input with type: \"password\"")
+    else:
+        if not re.search(r'\bautocomplete\s*:\s*"off"', field.group(2)):
+            problems.append("the password input lacks autocomplete: \"off\"")
+        name = re.escape(field.group(1))
+        secrets |= {field.group(1)} | {m.group(1) for m in re.finditer(
+            r"(?:const|let|var)\s+(\w+)\s*=\s*" + name + r"\.value\b", flow)}
+        if not re.search(r"\b" + name + r"""\.value\s*=\s*(?:""|'')""", flow):  # this field's own value, not any other
+            problems.append(f"nothing clears the password field ({field.group(1)}.value = \"\")")
+    call = re.search(r"post\(\s*PATHS\.reprocess\b", flow)
+    if not call:
+        return problems + ["reprocessFlow does not post to PATHS.reprocess"]
+    args = _js_call(flow, call.start() + len("post"))
+    if re.search(r"\bquery\s*:", args):
+        problems.append("the reprocess call has a query object (anything there ends up in the URL)")
+    body = re.search(r"\bjson\s*:\s*(\{|[\w$.]+)", args)
+    if not body:
+        problems.append("the reprocess call has no JSON body")
+    elif body.group(1) == "{":
+        if not re.search(r"\bpassword\b", args[body.end():]):
+            problems.append("the JSON body has no password key")
+    else:
+        secrets.add(body.group(1))
+        var = re.escape(body.group(1))
+        key = (r"(?<!delete )\b" + var + r"""\s*(?:\.\s*password\b|\[\s*['"]password['"]\s*\])\s*=(?!=)"""
+               r"|\b" + var + r"\s*=\s*\{[^}]*\bpassword\b")
+        if not re.search(key, flow):
+            problems.append("the JSON body never gets a password key")
+    alt = "|".join(re.escape(n) for n in sorted(secrets))
+    if re.search(r"\btoast\([^;]*\b(?:" + alt + r")\b", flow, re.S):
+        problems.append("a toast shows the password or the body")
+    if re.search(r"\bconsole\s*\.", flow):
+        problems.append("reprocessFlow logs to the console")
+    if re.search(r"\.request\b", flow):  # an ApiError keeps its request, and with it the JSON body
+        problems.append("reprocessFlow reads the request object of an error (it holds the body)")
+    for sink in (r"storageSet|localStorage|sessionStorage", r"encodeURIComponent|location\.|URLSearchParams"):
+        if re.search(sink, flow):
+            problems.append(f"reprocessFlow touches {sink}")
+    return problems
+
+
+def test_reprocess_password_only_in_json_body():
+    """The reprocess dialog's password goes in the JSON body: never in a query object or the URL, not logged, not
+    stored, not shown in a toast, and the field is cleared. The check is itself tried on unsafe variants."""
+    code = strip_js_comments((UI / "modules" / "view_documents.js").read_text(encoding="utf-8"))
+    problems = _reprocess_flow_problems(code)
+    assert not problems, f"reprocessFlow: {problems}"
+    assert not _reprocess_flow_problems(REPROCESS_FLOW_SAMPLE), "the sample of a safe flow was rejected"
+    unsafe = {
+        "force in the query (the old form)": ("json: payload", 'query: payload.force ? { force: "true" } : null'),
+        "password in the query": ("json: payload", "json: payload, query: { password: typed }"),
+        "password never put in the body": ("if (typed) payload.password = typed;", "delete payload.password;"),
+        "field not cleared": ('pw.value = "";', ""),
+        "another field cleared instead": ('pw.value = "";', 'conf.value = "";'),
+        "visible field": ('type: "password"', 'type: "text"'),
+        "autocomplete left on": ('autocomplete: "off"', 'autocomplete: "on"'),
+        "password in a toast": ('toast("queued", "ok");', "toast(`failed for ${typed}`, \"error\");"),
+        "password logged": ('toast("queued", "ok");', "console.log(typed);"),
+        "request object of an error shown": ('toast("queued", "ok");', 'toast(JSON.stringify(err.request), "error");'),
+    }
+    for name, (old, new) in unsafe.items():
+        variant = REPROCESS_FLOW_SAMPLE.replace(old, new)
+        assert variant != REPROCESS_FLOW_SAMPLE and _reprocess_flow_problems(variant), f"not caught: {name}"
+    for p in ui_files({".js"}):  # and no script puts a password into a query object
+        text = strip_js_comments(p.read_text(encoding="utf-8"))
+        assert not re.search(r"\bquery\s*:\s*\{[^}]*password", text), f"{rel(p)}: password in a query object"
 
 
 def test_node_syntax_check():

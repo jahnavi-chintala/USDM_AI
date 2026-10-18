@@ -15,10 +15,16 @@ const shownJobs = new Set(); // job ids shown in the "Jobs" card during this pag
 
 export async function reprocessFlow(doc) {
   const { title } = docLabel(doc);
+  const password = h("input", { type: "password", class: "input", id: "reprocess-password", autocomplete: "off" });
   const conf = await confirmOpenRouter("reprocess", {
     title: `Reprocess ${title}?`,
     action: "The service converts the stored source PDF again with the current pipeline. The current result stays "
       + "served until the new one is published.",
+    extra: h("div", { class: "field" },
+      h("label", { class: "field-label", for: "reprocess-password" }, "Password (only for an encrypted PDF)"),
+      password,
+      h("div", { class: "field-help" }, "Sent in the request body, held in the service's memory until the job starts; "
+        + "never stored or logged, and dropped when nothing is queued.")),
     skipWhenOffline: false,
     confirmLabel: "Reprocess",
     checkboxes: [{
@@ -29,9 +35,13 @@ export async function reprocessFlow(doc) {
         : "This result was made by the current pipeline; without force nothing is queued.",
     }],
   });
+  const secret = password.value;
+  password.value = ""; // read once, also when the dialog was cancelled: the field never keeps it
   if (!conf.ok) return null;
+  const body = { force: Boolean(conf.checks.force) };
+  if (secret) body.password = secret; // the JSON body only: the service refuses a password in the URL
   try {
-    const res = await post(PATHS.reprocess, { params: { doc_id: doc.doc_id }, query: conf.checks.force ? { force: "true" } : null });
+    const res = await post(PATHS.reprocess, { params: { doc_id: doc.doc_id }, json: body });
     const d = res.data || {};
     if (d.queued && d.job_id) {
       shownJobs.add(d.job_id);
@@ -49,6 +59,8 @@ export async function reprocessFlow(doc) {
   } catch (err) {
     toast(`${err.type}: ${err.message}`, "error", 7000);
     return null;
+  } finally {
+    delete body.password; // an ApiError keeps its request, and with it this body
   }
 }
 

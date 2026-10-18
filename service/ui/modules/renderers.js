@@ -85,23 +85,48 @@ function section(title, ...children) {
   return h("section", { class: "stack-sm" }, h("h4", { class: "section-title" }, title), ...body);
 }
 
-function scalar(v) {
+function scalar(v, ctx) {
   if (v === null || v === undefined || v === "") return h("span", { class: "faint" }, "–");
   if (typeof v === "boolean") return badge(String(v), v ? "ok" : "outline");
   if (typeof v === "object") {
-    if ("value" in v) return valueWithSource(v);
+    if ("value" in v) return valueWithSource(v, ctx);
     return genericView(v, 2);
   }
   return String(v);
 }
 
-function valueWithSource(entry) {
-  if (!entry || typeof entry !== "object") return scalar(entry);
+function valueWithSource(entry, ctx) {
+  if (!entry || typeof entry !== "object") return scalar(entry, ctx);
   const src = entry.source || {};
   return h("div", { class: "stack-sm" },
     h("div", null, h("strong", null, String(entry.value ?? "–")), entry.method ? h("span", { class: "small muted" }, ` (${entry.method})`) : null),
     src.text ? h("div", { class: "id-source" }, "“", highlightQuote(src.text, String(entry.value ?? "")), "”",
-      h("span", { class: "small faint" }, [src.page ? ` · p. ${src.page}` : "", src.layer && src.layer !== "body" ? ` · ${src.layer}` : ""].join(""))) : null);
+      h("span", { class: "small faint" }, [src.page ? ` · p. ${src.page}` : "", src.layer && src.layer !== "body" ? ` · ${src.layer}` : ""].join(""))) : null,
+    sourceTag(entry, ctx));
+}
+
+/** The item ref of a sourced value's line (tiny, monospace) and, when the tool explorer is there (ctx.onTool), a
+ * "Verify" button that runs quote_check on that line's text, also without a ref (an older service) as long as the
+ * line has 2 letters or digits. The " / " that joins the lines of a multi-ref source is not in the document: it
+ * becomes an elision. Null when there is neither a ref nor a button. */
+function sourceTag(entry, ctx) {
+  const src = entry && typeof entry === "object" ? entry.source : null;
+  if (!src || typeof src !== "object") return null;
+  const refs = Array.isArray(src.refs) ? src.refs : [];
+  const ref = src.ref || refs[0];
+  let quote = String(src.text || "").replace(/^\s*…\s*/, "").replace(/\s*…\s*$/, "");
+  if (refs.length > 1) quote = quote.split(" / ").join(" … ");
+  const canVerify = Boolean(ctx && ctx.onTool) && (quote.match(/[\p{L}\p{N}]/gu) || []).length >= 2;
+  if (!ref && !canVerify) return null;
+  let verify = null;
+  if (canVerify) {
+    verify = toolButton("quote_check", { quote }, ctx, "Verify");
+    verify.setAttribute("aria-label", `Verify "${truncate(String(entry.value ?? quote), 60)}" with quote_check`);
+  }
+  return h("span", { class: "source-tag" },
+    ref ? h("span", { class: "tiny faint mono break", title: refs.length > 1 ? `Item refs of the source line: ${refs.join(", ")}` : "Item ref of the source line" },
+      typeof src.row === "number" ? `${ref} row ${src.row}` : ref) : null,
+    verify);
 }
 
 function tile(label, value, cls) {
@@ -251,12 +276,19 @@ function compactValue(v) {
 
 function documentInfo(d, ctx) {
   const titles = d.titles || {};
-  const titleVal = (titles.official_title || {}).value || (titles.detected_title || {}).value;
+  const titleEntry = [titles.official_title, titles.detected_title].find((t) => t && t.value);
+  const titleVal = titleEntry && titleEntry.value;
+  const titleSrc = sourceTag(titleEntry, ctx);
+  const withMethod = (t) => `${t.value ?? t}${t.method ? ` (${t.method})` : ""}`; // the style of valueWithSource
   const head = h("div", { class: "stack-sm" },
     h("h3", { class: "break" }, titleVal || "No title detected"),
+    titleEntry && (titleEntry.method || titleSrc) ? h("div", { class: "row tiny muted" },
+      titleEntry.method ? `(${titleEntry.method})` : null, titleSrc) : null,
     h("div", { class: "row small muted" },
-      titles.brief_title ? h("span", null, `Brief title: ${titles.brief_title.value ?? titles.brief_title}`) : null,
-      titles.acronym ? h("span", null, `Acronym: ${titles.acronym.value ?? titles.acronym}`) : null,
+      titles.brief_title ? h("span", null, `Brief title: ${withMethod(titles.brief_title)}`) : null,
+      sourceTag(titles.brief_title, ctx),
+      titles.acronym ? h("span", null, `Acronym: ${withMethod(titles.acronym)}`) : null,
+      sourceTag(titles.acronym, ctx),
       !titles.official_title && titles.detected_title ? badge("detected title (no official title label)", "warn") : null));
 
   const ids = d.identifiers || {};
@@ -268,14 +300,16 @@ function documentInfo(d, ctx) {
       const src = v.source || {};
       return h("tr", null,
         h("td", { "data-label": "Identifier" }, v.label || key, h("div", { class: "tiny faint mono" }, key)),
-        h("td", { "data-label": "Value" }, h("strong", { class: "mono" }, String(v.value ?? "–"))),
-        h("td", { "data-label": "Verbatim line" }, src.text ? h("span", { class: "id-source" }, highlightQuote(src.text, String(v.value ?? ""))) : h("span", { class: "faint" }, "–")),
+        h("td", { "data-label": "Value" }, h("strong", { class: "mono" }, String(v.value ?? "–")),
+          v.method ? h("div", { class: "tiny muted" }, v.method) : null),
+        h("td", { "data-label": "Verbatim line" }, src.text ? h("span", { class: "id-source" }, highlightQuote(src.text, String(v.value ?? ""))) : h("span", { class: "faint" }, "–"),
+          sourceTag(v, ctx)),
         h("td", { "data-label": "Where", class: "nowrap" }, src.page ? h("span", { class: "chip chip-page" }, `p. ${src.page}`) : null, " ",
           src.section_id ? sectionChip(src.section_id, ctx) : null, src.layer && src.layer !== "body" ? badge(src.layer, "outline") : null));
     })))) : h("div", { class: "muted small" }, "No registry or sponsor identifier found.");
 
   const version = d.version || {};
-  const versionRows = Object.entries(version).map(([k, v]) => [k.replace(/_/g, " "), scalar(v)]);
+  const versionRows = Object.entries(version).map(([k, v]) => [k.replace(/_/g, " "), scalar(v, ctx)]);
   const sponsor = d.sponsor || null;
   const cover = d.cover_page && typeof d.cover_page === "object" ? Object.entries(d.cover_page) : [];
   const roles = d.roles_found || {};
@@ -291,10 +325,10 @@ function documentInfo(d, ctx) {
     other ? section("Other identifiers cited", genericView(other, 1)) : null,
     h("div", { class: "grid-2" },
       section("Version (StudyVersion)", h("dl", { class: "kv kv-compact" }, versionRows.flatMap(([k, v]) => [h("dt", null, k), h("dd", null, v)]))),
-      sponsor ? section("Sponsor (Organization)", valueWithSource({ ...sponsor, value: sponsor.name || sponsor.value }),
+      sponsor ? section("Sponsor (Organization)", valueWithSource({ ...sponsor, value: sponsor.name || sponsor.value }, ctx),
         provLine(sponsor.provenance, ctx)) : null),
     cover.length ? section("Cover page label / value pairs", h("dl", { class: "kv kv-compact" },
-      cover.flatMap(([k, v]) => [h("dt", null, k), h("dd", null, scalar(v))]))) : null,
+      cover.flatMap(([k, v]) => [h("dt", null, k), h("dd", null, scalar(v, ctx))]))) : null,
     soaTables.length ? section("Schedule of Activities tables", h("div", { class: "table-wrap" }, h("table", { class: "table" },
       h("thead", null, h("tr", null, h("th", null, "Table"), h("th", null, "Section"), h("th", null, "Pages"), h("th", { class: "num" }, "Size"), h("th", null, ""))),
       h("tbody", null, soaTables.map((t) => h("tr", null,
@@ -320,18 +354,20 @@ function toolButton(tool, args, ctx, label) {
 
 function outline(d, ctx) {
   const sections = Array.isArray(d.sections) ? d.sections : [];
-  const byId = new Map(sections.map((s) => [s.id, s]));
-  const roots = sections.filter((s) => !s.parent || !byId.has(s.parent));
+  const idOf = (s) => s.section_id ?? s.id; // id / parent are the deprecated names of section_id / parent_id
+  const parentOf = (s) => s.parent_id ?? s.parent;
+  const byId = new Map(sections.map((s) => [idOf(s), s]));
+  const roots = sections.filter((s) => !parentOf(s) || !byId.has(parentOf(s)));
   const node = (s) => {
     const kids = (s.children || []).map((c) => byId.get(c)).filter(Boolean);
     const row = h("span", { class: "tree-row" },
       s.number ? h("span", { class: "tree-num" }, s.number) : null,
       h("span", { class: "tree-title" }, s.number && (s.title || "").startsWith(s.number)
-        ? s.title.slice(s.number.length).replace(/^\.?\s*/, "") : (s.title || s.id)),
+        ? s.title.slice(s.number.length).replace(/^\.?\s*/, "") : (s.title || idOf(s))),
       roleChip(s.role, s.role_score),
       h("span", { class: "tree-meta" }, [fmtPageRange(s.pages), `${fmtNumber(s.tokens)} tok`,
         s.tables ? `${s.tables} table${s.tables === 1 ? "" : "s"}` : null, s.figures ? `${s.figures} fig.` : null].filter(Boolean).join(" · ")),
-      ctx.onSection ? sectionChip(s.id, ctx) : null);
+      ctx.onSection ? sectionChip(idOf(s), ctx) : null);
     if (!kids.length) return h("li", { class: "tree-node leaf" }, row);
     const det = h("details", { open: (s.level ?? 1) <= 1 }, h("summary", null, row),
       h("ul", null, kids.map(node)));
@@ -424,16 +460,45 @@ function fnMarks(markers) {
   return h("sup", { class: "fn", title: `footnote ${markers.join(", ")}` }, markers.join(","));
 }
 
+/** The header cells of a visit as printed, top to bottom: get_soa's header_cells, else just header_text. */
+function printedCells(v) {
+  const cells = (Array.isArray(v.header_cells) ? v.header_cells : []).filter((c) => c && typeof c === "object");
+  return v.header_text ? (cells.length ? cells : [{ text: v.header_text }]) : [];
+}
+
+/** A visit header's tooltip: header path, window, epoch, and with get_soa's header_cells the cells as printed (a
+ * unit get_soa put before a bare number says where it came from). */
+function visitTitle(v) {
+  const lines = [Array.isArray(v.header_path) ? v.header_path.join(" > ") : "", v.window ? `window ${v.window}` : "",
+    v.epoch_hint ? `epoch ${v.epoch_hint}` : "", v.label_composed ? "label composed by get_soa" : ""];
+  const printed = printedCells(v);
+  if (printed.length) {
+    lines.push("header cells as printed, top to bottom:", ...printed.map((c) => `  "${c.text ?? ""}"${c.unit_from
+      ? ` (unit "${c.unit ?? ""}" from the row's "${c.unit_from.text ?? ""}" cell)` : ""}`));
+  }
+  return lines.filter(Boolean).join("\n") || v.label;
+}
+
+/** The same cells for screen readers (the tooltip is not read): visually hidden text, last in the header and set off
+ * by a separator so that a reader does not run it into the label or a footnote marker. */
+function printedForReaders(v) {
+  const printed = printedCells(v);
+  return printed.length ? h("span", { class: "visually-hidden" },
+    `; ${printed.length > 1 ? "header cells" : "header cell"} as printed: ${printed.map((c) => c.text ?? "").join(", ")}`) : null;
+}
+
 export function soaGrid(soa) {
   const visits = soa.visits || [];
   const acts = soa.activities || [];
   const cells = new Map((soa.cells || []).map((c) => [`${c.activity}|${c.visit}`, c]));
   const thead = h("thead", null, h("tr", null, h("th", { class: "corner", scope: "col" }, "Activity \\ Visit"),
-    visits.map((v) => h("th", { scope: "col", title: [Array.isArray(v.header_path) ? v.header_path.join(" > ") : "", v.window ? `window ${v.window}` : "",
-      v.epoch_hint ? `epoch ${v.epoch_hint}` : ""].filter(Boolean).join("\n") || v.label },
-    v.label, fnMarks(v.footnote_markers),
+    visits.map((v) => h("th", { scope: "col", title: visitTitle(v) },
+    v.label,
+    v.label_composed ? h("span", { class: "composed-mark", role: "img", "aria-label": "label composed by get_soa" }, "≈") : null,
+    fnMarks(v.footnote_markers),
     v.timing && v.timing !== v.label ? h("span", { class: "visit-sub" }, v.timing) : null,
-    v.window ? h("span", { class: "visit-sub" }, v.window) : null))));
+    v.window ? h("span", { class: "visit-sub" }, v.window) : null,
+    printedForReaders(v)))));
   const tbody = h("tbody", null, acts.map((a) => h("tr", null,
     h("th", { class: "act", scope: "row", title: a.notes || "" }, a.label, fnMarks(a.footnote_markers),
       a.section ? h("span", { class: "visit-sub" }, a.section) : null),
@@ -444,8 +509,11 @@ export function soaGrid(soa) {
       return h("td", { class: c.mark ? "on" : null, title: [c.text, c.qualifier].filter(Boolean).join(" · ") },
         text, fnMarks(c.footnote_markers), c.qualifier ? h("span", { class: "qual" }, c.qualifier) : null);
     }))));
-  return h("div", { class: "soa-wrap", tabindex: "0", role: "region", "aria-label": "Schedule of Activities grid" },
+  const grid = h("div", { class: "soa-wrap", tabindex: "0", role: "region", "aria-label": "Schedule of Activities grid" },
     h("table", { class: "soa" }, thead, tbody));
+  if (!visits.some((v) => v.label_composed)) return grid;
+  return h("div", { class: "stack-sm" }, grid, h("div", { class: "tiny muted" },
+    h("span", { class: "composed-mark", "aria-hidden": "true" }, "≈"), " label composed by get_soa: hover the column header for the header cells as printed"));
 }
 
 function footnoteList(notes) {
@@ -541,15 +609,22 @@ function locationView(loc, quote, ctx, cls) {
     Array.isArray(prov.refs) && prov.refs.length ? h("div", { class: "tiny faint mono break" }, prov.refs.join(", ")) : null);
 }
 
+/** " · 9 in page text · 3 in headers/footers" from count_by_layer ({body, furniture}); a zero part is left out. */
+function layerSplit(byLayer) {
+  if (!byLayer || typeof byLayer !== "object") return "";
+  return [byLayer.body > 0 ? `${byLayer.body} in page text` : null, byLayer.furniture > 0 ? `${byLayer.furniture} in headers/footers` : null]
+    .filter(Boolean).map((part) => ` · ${part}`).join("");
+}
+
 export function quoteCheck(d, ctx) {
   const quote = d.quote || "";
   const locs = d.locations || [];
   const verdict = h("div", { class: ["verdict", d.found ? "ok" : "bad"] }, icon(d.found ? "check" : "x"),
     d.found ? "Found" : "Not found",
     d.match ? badge(`match: ${d.match}`, "info") : null,
-    d.found ? h("span", { class: "small" }, `${d.count ?? locs.length} location${(d.count ?? locs.length) === 1 ? "" : "s"}`) : null,
+    d.found ? h("span", { class: "small" }, `${d.count ?? locs.length} location${(d.count ?? locs.length) === 1 ? "" : "s"}${layerSplit(d.count_by_layer)}`) : null,
     d.section_id ? h("span", { class: "small" }, "within ", sectionChip(d.section_id, ctx)) : null);
-  const parts = Array.isArray(d.parts) ? section("Elided quote: every part must occur", h("ol", { class: "list-plain stack-sm" },
+  const parts = Array.isArray(d.parts) ? section("Elided quote: the parts must occur in order, each within 2,000 characters of the previous one", h("ol", { class: "list-plain stack-sm" },
     d.parts.map((p) => h("li", { class: "location" }, h("div", { class: "row" }, badge(p.found ? "found" : "not found", p.found ? "ok" : "danger"),
       p.match ? badge(p.match, "info") : null, h("span", { class: "small break" }, `“${p.part}”`)),
     (p.locations || []).slice(0, 1).map((l) => h("div", { class: "context" }, highlightQuote(l.text || "", p.part))))))) : null;
