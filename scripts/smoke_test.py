@@ -52,6 +52,10 @@ type + our file:line; never document text.
 
 Real run against the container (PowerShell, from the project root):
     .venv\\Scripts\\python.exe scripts\\smoke_test.py --allow-openrouter
+Against the hosted service behind its proxy (docs/hosting_gcp.md): set PROTOCOL_SERVICE_API_KEY and every REST and
+MCP HTTP request carries "Authorization: Bearer <key>" (the key is never printed); --stdio-cmd= (empty) skips stdio:
+    $env:PROTOCOL_SERVICE_API_KEY = Read-Host 'API key'
+    .venv\\Scripts\\python.exe scripts\\smoke_test.py --base-url https://<host> --stdio-cmd= --allow-openrouter
 Offline run against a local service (python -m service.api with OPENROUTER_OFFLINE=1, PORT=8790; the stdio child
 inherits this environment, so set DATA_DIR to the service's):
     .venv\\Scripts\\python.exe scripts\\smoke_test.py --base-url http://127.0.0.1:8790 \\
@@ -193,9 +197,16 @@ class PathScanner:
                 return
 
 
+def auth_headers() -> dict[str, str]:
+    """The proxy's API key header when PROTOCOL_SERVICE_API_KEY is set (a hosted service), else none."""
+    key = os.environ.get("PROTOCOL_SERVICE_API_KEY", "").strip()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 class Rest:
     def __init__(self, base: str, scanner: PathScanner) -> None:
-        self.http = httpx.Client(base_url=base, timeout=httpx.Timeout(TOOL_TIMEOUT, connect=15.0), trust_env=False)
+        self.http = httpx.Client(base_url=base, timeout=httpx.Timeout(TOOL_TIMEOUT, connect=15.0), trust_env=False,
+                                 headers=auth_headers())
         self.scanner = scanner
 
     def close(self) -> None:
@@ -824,12 +835,24 @@ async def doc_parity(run: Run, client, d: Doc, calls: list[tuple[str, str, dict]
     return len(calls), differ
 
 
+def mcp_target(url: str):
+    """What mcp.Client connects to: the URL, or with PROTOCOL_SERVICE_API_KEY set, a Streamable HTTP transport whose
+    HTTP client sends the key (that client lives until the script ends)."""
+    if not auth_headers():
+        return url
+    import httpx2
+    from mcp.client.streamable_http import streamable_http_client
+
+    http = httpx2.AsyncClient(headers=auth_headers(), timeout=httpx2.Timeout(30.0, read=TOOL_TIMEOUT))
+    return streamable_http_client(url, http_client=http)
+
+
 async def mcp_http(run: Run) -> None:
     from mcp import Client
 
     r = run.report
     url = f"{run.base}/mcp"
-    async with Client(url, mode="legacy", read_timeout_seconds=TOOL_TIMEOUT) as client:
+    async with Client(mcp_target(url), mode="legacy", read_timeout_seconds=TOOL_TIMEOUT) as client:
         r.check("6", "initialize (handshake) at /mcp", client.server_info.name == "protocol-service",
                 f"protocol {client.protocol_version}, server {client.server_info.name} {client.server_info.version}")
         names = [t.name for t in (await client.list_tools()).tools]

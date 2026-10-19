@@ -1,0 +1,25 @@
+# Caddy in front of the protocol service on a Google Cloud VM (docs/hosting_gcp.md).
+#
+# HTTPS for PROXY_SITE with a certificate from Let's Encrypt (ZeroSSL if that fails), renewed automatically; plain HTTP
+# is redirected to HTTPS. Every request must carry "Authorization: Bearer <PROXY_API_KEY>", except /health (for uptime
+# checks); anything else gets 401. The service itself has no authentication. Both values come from the environment
+# (compose passes them from .env and refuses to start without them).
+{$PROXY_SITE} {
+	# The service refuses PDFs above MAX_UPLOAD_MB (100 MB); stop larger bodies here.
+	request_body {
+		max_size 110MB
+	}
+
+	handle /health {
+		reverse_proxy protocol-service:8000
+	}
+
+	@authorized header Authorization "Bearer {$PROXY_API_KEY}"
+	handle @authorized {
+		reverse_proxy protocol-service:8000
+	}
+
+	handle {
+		respond "unauthorized: send the header Authorization: Bearer <API key>" 401
+	}
+}

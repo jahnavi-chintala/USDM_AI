@@ -8,7 +8,7 @@ One container holds the whole service:
 
 Documents, results, the job queue and the caches live in one named Docker volume.
 
-Today the service runs locally only. Before it is hosted anywhere it needs authentication, TLS and a decision on storage; see [the checklist](#10-before-hosting-checklist).
+Today the service runs locally only. Before it is hosted anywhere it needs authentication, TLS and a decision on storage; see [the checklist](#10-before-hosting-checklist). A worked setup for one Google Cloud VM (HTTPS and an API key in front, a data disk, faster conversion) is in [docs/hosting_gcp.md](docs/hosting_gcp.md).
 
 Commands are for PowerShell on Windows, run from the repository root; the Docker commands are the same on Linux and macOS.
 

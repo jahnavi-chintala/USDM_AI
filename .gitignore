@@ -21,6 +21,14 @@
 !/docker/*.py
 !/docker/*.sh
 
+# hosting configuration (docs/hosting_gcp.md); the secrets stay in .env on the host
+!/deploy/
+/deploy/*
+!/deploy/gcp/
+/deploy/gcp/*
+!/deploy/gcp/Caddyfile
+!/deploy/gcp/docker-compose.gcp.yml
+
 !/scripts/
 /scripts/*
 !/scripts/*.py

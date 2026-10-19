@@ -11,6 +11,7 @@ gold sets and reports stay local and are never committed (see `.gitignore`).
 **As a service:** one Docker container with a REST API, an MCP server (HTTP at `/mcp` and stdio), a demo UI
 at `/ui/` and a background worker: upload a PDF, poll the job, call the tools.
 - Build, run, configuration, backups, MCP setup, data handling and the pre-hosting checklist: [DEPLOY.md](DEPLOY.md).
+- Hosting on one Google Cloud VM behind HTTPS and an API key: [docs/hosting_gcp.md](docs/hosting_gcp.md).
 - What every REST route, MCP tool, protocol tool and published file returns, field by field: [docs/api_reference.md](docs/api_reference.md).
 - The code is in `service/` (the UI in `service/ui/`).
 - `scripts/e2e_test.py` tests a running container end to end with public protocols.
