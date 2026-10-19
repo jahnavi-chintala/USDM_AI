@@ -11,13 +11,21 @@ Stages (contracts.STAGES), all writing into `workdir` in the final documents/<do
                config.vlm_cache_dir; then the cached results are attached. A figure that fails is a warning.
   save         protocol.json / .md / .html, images/, tables/
   chunk        chunks/ (chunks, parents, sections, tables, glossary, stats)
+  identity     chunks/identity.json: the identity record (titles, acronym, sponsor, ids, version, each with its source
+               item) built by the rules. With config.identity_model (IDENTITY_MODEL) set, one OpenRouter request per
+               document (zero-data-retention routing) sends the numbered text lines of pages 1-3 (body text, table
+               rows, running headers/footers) and the rule values as candidates; the model chooses, code verifies
+               each value in the lines it cites and keeps the rule value otherwise. The answer is cached under
+               config.identity_cache_dir (a cache hit sends nothing). The whole rules record is written when the
+               model step is off, offline without a cached answer, or fails.
   embed        chunks/embeddings.npy (config.embed_model; cached per chunk content hash)
   quality      quality.json: word coverage, table QA, figure counts, stage results, warnings
 
-OPENROUTER_OFFLINE: the figures and embed stages never call out; what they would have needed is reported as
-"skipped_offline" with a warning, and the document still finishes ("done_with_warnings"). A fatal error (the
-conversion itself, chunking) raises; the caller records the exception type and our file:line only, and the
-stages so far from the exception's `pipeline_stages` (completed ones, then the failing one with status "failed").
+OPENROUTER_OFFLINE: the figures, identity and embed stages never call out; what they would have needed is reported
+as "skipped_offline" with a warning, and the document still finishes ("done_with_warnings"). A failed identity or
+embed stage ("failed") is a warning too. A fatal error (the conversion itself, chunking) raises; the caller
+records the exception type and our file:line only, and the stages so far from the exception's `pipeline_stages`
+(completed ones, then the failing one with status "failed").
 Logs: workdir/logs/pipeline.log (this thread's records) and workdir/logs/convert.log (batch subprocesses).
 """
 
@@ -119,6 +127,7 @@ def process_document(pdf_path: Path, workdir: Path, config: ServiceConfig, *, se
     from chunk_protocol import chunk_document
     from convert_protocol import convert_document, file_sha256
     from embed_chunks import embed_document
+    from identity_llm import run_identity
     from pipeline_version import PIPELINE_VERSION, pipeline_fingerprint
     from protocol_settings import ProtocolSettings
     from retrieve import OfflineRefused
@@ -203,6 +212,25 @@ def process_document(pdf_path: Path, workdir: Path, config: ServiceConfig, *, se
         stats = chunk_document(workdir / f"{STEM}.json", chunks_dir, quiet_text=True)
         finish("chunk", chunks=stats["chunks"], parents=stats.get("parents", {}).get("parents", 0))
 
+        report("identity")
+        try:
+            ident = run_identity(workdir, model=config.identity_model, cache_dir=config.identity_cache_dir)
+        except Exception as exc:  # noqa: BLE001 - document_info falls back to the rules without the record
+            from service.worker import describe_exception
+
+            log.warning("identity stage failed: %s at %s", *describe_exception(exc))
+            finish("identity", "failed", error=type(exc).__name__)
+            warnings.append(f"identity record not written ({type(exc).__name__}): document_info uses the rules")
+        else:
+            id_status = ident.get("status", "done")
+            finish("identity", id_status, **{k: v for k, v in ident.items() if k != "status" and v is not None})
+            if id_status == "skipped_offline":
+                warnings.append("identity: the model step was skipped (OPENROUTER_OFFLINE is set); the rule values "
+                                "are kept")
+            elif id_status == "partial":
+                why = ident.get("reason") or ident.get("error") or "unknown"  # the fixed label first
+                warnings.append(f"identity: the model step failed ({why}); the rule values are kept")
+
         report("embed")
         try:
             emb = embed_document(chunks_dir / "chunks.jsonl", config.embed_model, progress=report)
@@ -217,11 +245,13 @@ def process_document(pdf_path: Path, workdir: Path, config: ServiceConfig, *, se
 
         report("quality")
         doc = DoclingDocument.load_from_json(workdir / f"{STEM}.json")
-        pdf = pdfium.PdfDocument(str(pdf_path), password=password)
         dec_path = workdir / f"{STEM}.decisions.json"
         decisions = json.loads(dec_path.read_text(encoding="utf-8")) if dec_path.exists() else None
-        quality = quality_report(doc, pdf, decisions)
-        pdf.close()
+        pdf = pdfium.PdfDocument(str(pdf_path), password=password)
+        try:
+            quality = quality_report(doc, pdf, decisions)
+        finally:
+            pdf.close()  # also when the report fails: an open handle locks source.pdf on Windows
         cov = quality["coverage"]
         if cov["coverage"] is not None and cov["coverage"] < 0.97:
             warnings.append(f"word coverage {cov['coverage']:.1%} is below 97%")

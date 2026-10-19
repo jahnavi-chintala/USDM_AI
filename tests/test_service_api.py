@@ -164,6 +164,9 @@ def test_health_version_openapi() -> None:
         v = client.get("/version").json()
         assert v["pipeline_version"] == "1.0.0" and v["fingerprint"] == "fp-test" and v["offline"] is True
         assert {"packages", "models", "config", "fingerprint_inputs"} <= set(v) and "fastapi" in v["packages"]
+        identity = service.config.identity_model
+        assert v["models"]["identity"] == identity and v["config"]["identity_model"] == identity, v["models"]
+        assert v["fingerprint_inputs"]["models"]["identity"] == identity
         spec = client.get("/openapi.json").json()
         from pipeline_version import PIPELINE_VERSION
 
@@ -487,6 +490,20 @@ def test_files() -> None:
         assert client.get(f"/documents/{doc}/files").json()["aliases"]["quality"] == "quality.json"
         assert client.get(f"/documents/{doc}/files/quality").json() == {"coverage": {}}
         (folder / "quality.json").unlink()
+        # chunks/identity.json (the identity stage's record): listed, aliased and served when the result has it; a
+        # result made before the stage (this one) lists and answers as before
+        assert "chunks/identity.json" not in listing["files"] and "identity.json" not in listing["aliases"]
+        error_of(client.get(f"/documents/{doc}/files/identity.json"), 404, "file_not_found")
+        (folder / "chunks" / "identity.json").write_text('{"titles": {}}', encoding="utf-8")
+        with_record = client.get(f"/documents/{doc}/files").json()
+        assert with_record["files"] == sorted([*listing["files"], "chunks/identity.json"]), with_record["files"]
+        assert with_record["aliases"] == {**listing["aliases"], "identity.json": "chunks/identity.json"}
+        for name in ("identity.json", "chunks/identity.json"):
+            r = client.get(f"/documents/{doc}/files/{name}")
+            assert r.status_code == 200 and r.headers["content-type"] == "application/json", name
+            assert r.headers["x-content-type-options"] == "nosniff" and r.json() == {"titles": {}}, name
+        (folder / "chunks" / "identity.json").unlink()
+        assert client.get(f"/documents/{doc}/files").json() == listing
         error_of(client.get(f"/documents/{doc}/files/nothing.txt"), 404, "file_not_found")
         secrets_on_disk = [service.config.registry_path.read_bytes()[:16], (folder / "source.pdf").read_bytes()[:8]]
         assert secrets_on_disk[0].startswith(b"SQLite format 3")
@@ -931,8 +948,9 @@ TOOL_CALLS = {
 
 
 def test_delete_purges_caches() -> None:
-    """DELETE ?purge_caches=true also removes the PDF's conversion batches and its figure descriptions from the
-    shared caches; other documents' entries stay; without the flag the caches are left alone."""
+    """DELETE ?purge_caches=true also removes the PDF's conversion batches, its figure descriptions and its
+    identity-model answers from the shared caches; other documents' entries stay; without the flag the caches are
+    left alone."""
     if not tokenizer_cached():
         print(f"   (skipped: tokenizer {TOKENIZER} not in the local Hugging Face cache)")
         return
@@ -950,9 +968,14 @@ def test_delete_purges_caches() -> None:
                             storage=service.storage)["doc_id"]
         key = document_key(DoclingDocument.load_from_json(folder / "protocol.json"))
         vlm, batches = service.config.vlm_cache_dir, service.config.batch_cache_dir
+        identity = service.config.identity_cache_dir
         for name, doc_key in (("mine", key), ("other", "0123456789abcdef")):
             (vlm / f"{name}.json").write_text(json.dumps({"doc_key": doc_key, "description": "made up"}),
                                               encoding="utf-8")
+        for name, doc_key in (("mine", key), ("other", "0123456789abcdef")):  # one entry per document and model
+            (identity / f"{name}.json").write_text(json.dumps({"doc_key": doc_key, "answer": "made up"}),
+                                                   encoding="utf-8")
+        (identity / "broken.json").write_text("{not json", encoding="utf-8")
         for owner in (doc[:16], "f" * 16):
             run = batches / owner / "layout-cfg"
             run.mkdir(parents=True)
@@ -962,8 +985,10 @@ def test_delete_purges_caches() -> None:
         with client_for(service) as client:
             r = client.delete(f"/documents/{doc}", params={"purge_caches": "true"})
             assert r.status_code == 200 and r.json() == {"doc_id": doc, "deleted": True,
-                                                         "purged": {"batches": 2, "figures": 1}}, r.text
+                                                         "purged": {"batches": 2, "figures": 1, "identity": 1}}, r.text
             assert not (vlm / "mine.json").exists() and (vlm / "other.json").exists() and (vlm / "broken.json").exists()
+            assert not (identity / "mine.json").exists() and (identity / "other.json").exists()
+            assert (identity / "broken.json").exists()
             assert not (batches / doc[:16]).exists() and (batches / ("f" * 16)).is_dir()
             error_of(client.get(f"/documents/{doc}"), 404, "document_not_found")
             # a document without a Docling JSON (fake pipeline): its batches go, no figure key, nothing else
@@ -972,8 +997,8 @@ def test_delete_purges_caches() -> None:
             (batches / other["doc_id"][:16]).mkdir()
             (batches / other["doc_id"][:16] / "0001-0015.json").write_text("{}", encoding="utf-8")
             r = client.delete(f"/documents/{other['doc_id']}?purge_caches=true")
-            assert r.json()["purged"] == {"batches": 1, "figures": 0}, r.text
-            assert (vlm / "other.json").exists()
+            assert r.json()["purged"] == {"batches": 1, "figures": 0, "identity": 0}, r.text
+            assert (vlm / "other.json").exists() and (identity / "other.json").exists()
             # without the flag: nothing purged, no "purged" key
             third = upload(client, make_pdf("Kept caches study")).json()
             wait_job(client, third["job_id"])

@@ -65,7 +65,8 @@ import api_inventory_common as common  # noqa: E402
 PUBLIC = ("LZZT_CDISC_Pilot", "Lilly_NCT03421379")   # run through the pipeline (conversion copied)
 PUBLIC_ALL = ("Alexion_NCT04573309", "Bayer_NCT04304508", "Lilly_NCT03421379", "LZZT_CDISC_Pilot",
               "PrECOG_NCT01797120", "Sanofi_NCT03637764")
-CHUNK_FILES = ("chunks.jsonl", "parents.jsonl", "tables.jsonl", "sections.json", "glossary.json", "stats.json")
+CHUNK_FILES = ("chunks.jsonl", "parents.jsonl", "tables.jsonl", "sections.json", "glossary.json", "stats.json",
+               "identity.json")
 LOCAL = "http://127.0.0.1"
 FINAL = ("done", "done_with_warnings", "failed", "cancelled")
 PASSWORD = "made-up-inventory-password"
@@ -94,6 +95,7 @@ DYNAMIC: dict[str, tuple[str, ...]] = {
                                "document.identifiers.others"),
     "file:chunks/sections.json": ("ref_section", "ref_map"),
     "file:chunks/glossary.json": ("entries",),
+    "file:chunks/identity.json": ("cover_page", "others", "llm.usage", "llm.usage.*"),
 }
 
 Sink = Callable[..., None]   # sink(surface, body, note="")
@@ -527,7 +529,8 @@ def _read_files(s: Scenario, doc_id: str) -> None:
     for name, alias in (("chunks/chunks.jsonl", "chunks.jsonl"), ("chunks/parents.jsonl", "parents.jsonl"),
                         ("chunks/tables.jsonl", "tables.jsonl"), ("chunks/sections.json", "sections.json"),
                         ("chunks/glossary.json", "glossary.json"), ("chunks/stats.json", "stats.json"),
-                        ("quality.json", "quality"), ("protocol.decisions.json", "decisions")):
+                        ("chunks/identity.json", "identity.json"), ("quality.json", "quality"),
+                        ("protocol.decisions.json", "decisions")):
         if name not in names:
             continue
         r = s.client.get(f"/documents/{doc_id}/files/{alias}")

@@ -80,8 +80,9 @@ export async function deleteFlow(doc) {
       name: "purge",
       label: "Also purge caches",
       checked: false,
-      help: "Also removes this PDF's cached Docling conversion batches and its figure descriptions (cache/batches, "
-        + "cache/vlm). Without it they stay, as a speed-up for a later upload of the same PDF.",
+      help: "Also removes this PDF's cached Docling conversion batches, its figure descriptions and its identity-model "
+        + "answers (cache/batches, cache/vlm, cache/identity). Without it they stay, as a speed-up for a later upload "
+        + "of the same PDF.",
     }],
   });
   if (!conf.ok) return false;

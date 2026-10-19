@@ -5,7 +5,8 @@ implements it on a local (or mounted) filesystem under config.data_dir:
 
   documents/<doc_id>/        the published result of a document (doc_id = SHA-256 of the PDF bytes)
   work/<job_id>/             scratch space of one job: source.pdf, then every output in the final layout
-  cache/vlm/, cache/batches/ caches shared across documents (owned by the pipeline)
+  cache/vlm/, cache/batches/, cache/identity/
+                             caches shared across documents (owned by the pipeline)
   inbox/                     PDFs placed for ingestion by path
 
 A cloud adapter (S3/GCS/Azure) implements the same methods: work/ stays a local scratch directory on the
@@ -56,7 +57,7 @@ ERROR_LOG = ("logs", "error.log")
 SAFE_FILES = frozenset({
     "protocol.md", "protocol.json", "protocol.html", "protocol.decisions.json", "quality.json",
     "chunks/chunks.jsonl", "chunks/parents.jsonl", "chunks/sections.json", "chunks/tables.jsonl",
-    "chunks/glossary.json", "chunks/stats.json",
+    "chunks/glossary.json", "chunks/stats.json", "chunks/identity.json",
 })
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 _IMAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,250}")
@@ -238,8 +239,9 @@ class Storage(abc.ABC):
     @abc.abstractmethod
     def purge_caches(self, doc_id: str, figure_doc_key: str | None = None) -> dict[str, int]:
         """Remove what the shared caches hold for one PDF: its conversion batches and, given the figure cache's
-        document key (figure_vlm.document_key), the figure descriptions made for it. {"batches", "figures"}:
-        the numbers of batch files and figure entries removed."""
+        document key (figure_vlm.document_key, the key the identity cache uses too), the figure descriptions and
+        the identity-model answers made for it. {"batches", "figures", "identity"}: the numbers of batch files,
+        figure entries and identity entries removed."""
 
     # ---- inbox
     @abc.abstractmethod
@@ -268,7 +270,7 @@ class LocalStorage(Storage):
         self.work = config.work_dir
         self.inbox = config.inbox_dir
         for d in (self.documents, self.work, config.cache_dir, config.vlm_cache_dir, config.batch_cache_dir,
-                  self.inbox):
+                  config.identity_cache_dir, self.inbox):
             d.mkdir(parents=True, exist_ok=True)
         # Windows: antivirus / indexer / a reader holding a file open make directory renames fail for a moment.
         self._rename_attempts = rename_attempts or (6 if os.name == "nt" else 1)
@@ -524,17 +526,37 @@ class LocalStorage(Storage):
         if batches.is_dir():
             n_batches = sum(1 for p in batches.rglob("*.json") if p.is_file() and p.name != "manifest.json")
             shutil.rmtree(batches, ignore_errors=True)
-        n_figures = 0
+        # figure descriptions and identity answers: cache/<vlm|identity>/*.json, each entry holding the "doc_key"
+        n_figures = n_identity = 0
         if figure_doc_key:
-            for entry in self.config.vlm_cache_dir.glob("*.json"):
-                try:
-                    key = json.loads(entry.read_text(encoding="utf-8")).get("doc_key")
-                except (OSError, ValueError, AttributeError):
+            n_figures = self._purge_keyed(self.config.vlm_cache_dir, figure_doc_key)
+            n_identity = self._purge_keyed(self.config.identity_cache_dir, figure_doc_key)
+        return {"batches": n_batches, "figures": n_figures, "identity": n_identity}
+
+    @staticmethod
+    def _purge_keyed(cache: Path, doc_key: str) -> int:
+        """Delete the entries of a cache folder whose "doc_key" is `doc_key`; the number deleted. An entry that cannot
+        be read, or deleted (a locked file on Windows), is left alone and the others are still purged. Temporary
+        files of the key left by a killed process ("<doc_key>.<random>.tmp") are deleted too, not counted."""
+        removed = 0
+        for entry in cache.glob("*.json"):
+            try:
+                key = json.loads(entry.read_text(encoding="utf-8")).get("doc_key")
+                if key != doc_key:
                     continue
-                if key == figure_doc_key:
-                    entry.unlink(missing_ok=True)
-                    n_figures += 1
-        return {"batches": n_batches, "figures": n_figures}
+                entry.unlink(missing_ok=True)
+            except (OSError, ValueError, AttributeError):
+                continue
+            removed += 1
+        # an entry being written when the process was killed: "<doc_key>.<random>.tmp" (identity_llm names its
+        # temporary files so); removed too, not counted (it is no complete entry)
+        if re.fullmatch(r"[0-9a-f]{16}", doc_key or ""):
+            for leftover in cache.glob(f"{doc_key}.*.tmp"):
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError:
+                    continue
+        return removed
 
     # ---- inbox
     def list_inbox(self) -> list[str]:

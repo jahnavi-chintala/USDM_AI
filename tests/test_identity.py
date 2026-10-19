@@ -11,6 +11,8 @@ on the next line (two refs), "property of Eli Lilly and Company", a history tabl
 produce (method "stored", located in the first item holding the value).
 """
 
+import copy
+import hashlib
 import json
 import sys
 import tempfile
@@ -291,6 +293,41 @@ def test_cover_label_value_on_next_line() -> None:
         check_source(doc, src, lambda ref: "S1", key)
 
 
+def test_cover_label_followed_by_a_label() -> None:
+    """A label with no value on its own line takes the next line only when that line is not a label itself (a cover
+    label, or a short line ending with a colon): "Approval Date:" then "Sponsor Signatory:" gives no approval date."""
+    long_value = "A Phase 3, Randomized, Double-Blind Study of Drug X Versus Placebo in Adults With Condition Y:"
+    doc, refs = make_doc([
+        ("t", "Approval Date:", 1),
+        ("t", "Sponsor Signatory:", 1),                         # a label of its own: not the approval date
+        ("t", "Sponsor Name:", 1),
+        ("t", "Legal Registered Address:", 1),                  # a cover label: not the sponsor
+        ("t", "Regulatory Agency Identifier Number(s):", 1),    # not the address
+        ("t", "Protocol Number:", 1),
+        ("t", "ZX-4417", 1),                                    # a value on the next line still works
+        ("t", "Short Title:", 1),
+        ("t", "Drug X in Condition Y: the DRUGX-3 study", 1),   # a colon inside a value
+        ("t", "Official Title:", 1),
+        ("t", long_value, 1),                                   # over 60 characters before its colon: a value
+    ])
+    cover = build_identity(doc, section_of=lambda ref: None)["cover_page"]
+    assert set(cover) == {"sponsor_protocol_number", "brief_title", "official_title"}, sorted(cover)
+    assert cover["sponsor_protocol_number"] == {"value": "ZX-4417", "page": 1, "text": "Protocol Number: / ZX-4417",
+                                                "refs": [refs[5], refs[6]]}, cover["sponsor_protocol_number"]
+    assert cover["brief_title"]["value"] == "Drug X in Condition Y: the DRUGX-3 study"
+    assert cover["official_title"]["value"] == long_value and cover["official_title"]["refs"] == [refs[9], refs[10]]
+    # the public protocols: no cover-page value is a label ("Approval Date:" / "Sponsor Signatory:" on Alexion)
+    for name in PUBLIC:
+        if (got := load(name)) is None:
+            continue
+        doc, stored, _ = got
+        cover = build_identity(doc, stored, section_of=section_fn(doc))["cover_page"]
+        assert not [k for k, c in cover.items() if c["value"].rstrip().endswith((":", "\uff1a"))], (name, sorted(cover))
+        if name == "Alexion_NCT04573309":
+            assert "approval_date" not in cover and cover["sponsor"]["value"] == "Alexion Pharmaceuticals, Inc."
+            assert cover["official_title"]["value"].endswith("Treated with ALXN1840"), cover["official_title"]
+
+
 def test_property_of_company_line() -> None:
     doc, refs = make_doc([("h", "CLINICAL STUDY PROTOCOL", 1),
                           ("t", "This is the property of Eli Lilly and Company and may not be reproduced.", 1)])
@@ -535,6 +572,86 @@ def test_others_listed() -> None:
     ident = build_identity(doc, section_of=lambda r: None)
     assert ident["others"] == {"nct": ["NCT07654321", "NCT07654322"]}, ident["others"]
     assert field(ident, "nct")["value"] == "NCT01234567"
+
+
+def test_stored_record_round_trip() -> None:
+    """write_record / load_record: deterministic bytes, LF line ends, no temporary file left; the meta stamp right
+    after source_sha256; a record of another Docling JSON, of other stats.json values (or without a stamp: "stale",
+    checked last), another schema or shape, a broken file or a missing one is refused with its reason."""
+    from identity import (FIELDS as RECORD_FIELDS, MODEL_METHOD, RECORD_FILE, SCHEMA, load_record, meta_stamp,
+                          write_record)
+    from pipeline_version import PIPELINE_VERSION
+
+    doc, _ = make_doc([("t", "Official Title: A Phase 3 Study of Drug X in Adults With Condition Y", 1),
+                       ("t", "Protocol Number: ZX-4417", 1)], pages=1)
+    rec = build_identity(doc, section_of=lambda r: None)
+    meta = {"doc_name": "syn", "version_label": "Amendment 4", "identifiers": {"nct": None, "sources": {}},
+            "title": "A Phase 3 Study of Drug X \u2013 adults"}
+    stamp = hashlib.sha256(json.dumps(meta, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    assert meta_stamp(meta) == stamp and meta_stamp(dict(reversed(list(meta.items())))) == stamp
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        assert load_record(d, "abc") == (None, "missing")
+        assert load_record(d, "abc", meta) == (None, "missing")
+        path = write_record(d, rec, source_sha256="abc", meta=meta)
+        first = path.read_bytes()
+        assert path.name == RECORD_FILE and b"\r" not in first and [p.name for p in d.iterdir()] == [RECORD_FILE]
+        write_record(d, rec, source_sha256="abc", meta=copy.deepcopy(meta))
+        assert path.read_bytes() == first
+        data, why = load_record(d, "abc")
+        assert why is None and data["schema"] == SCHEMA and data["pipeline_version"] == PIPELINE_VERSION
+        assert list(data)[:3] == ["schema", "source_sha256", "meta_sha256"] and data["meta_sha256"] == stamp
+        assert data["model"] is None and data["prompt_version"] is None and data["llm"] is None
+        assert {k: data[k] for k in ("fields", "cover_page", "others")} == json.loads(json.dumps(
+            {k: rec[k] for k in ("fields", "cover_page", "others")}))
+        assert list(data["fields"]) == list(RECORD_FIELDS)
+        assert load_record(d, "other") == (None, "other_document")
+        assert load_record(d, None) == (None, "other_document")
+        # the stats.json values: the same ones load, other ones (or a record without the stamp) are stale
+        assert load_record(d, "abc", copy.deepcopy(meta)) == (data, None)
+        assert load_record(d, "abc", {**meta, "version_label": "Amendment 5"}) == (None, "stale")
+        assert load_record(d, "abc", {}) == (None, "stale")
+        assert load_record(d, "other", {**meta, "version_label": "x"}) == (None, "other_document")  # checked first
+        unstamped = {k: v for k, v in data.items() if k != "meta_sha256"}
+        path.write_text(json.dumps(unstamped), encoding="utf-8")
+        assert load_record(d, "abc", meta) == (None, "stale") and load_record(d, "abc")[1] is None
+        path.write_text(json.dumps({**unstamped, "schema": SCHEMA + 1}), encoding="utf-8")
+        assert load_record(d, "abc", meta) == (None, "schema")  # the shape before the stamp
+        # with a model: prompt_version and llm are kept, a model field carries its method
+        chosen = json.loads(json.dumps(rec))
+        chosen["fields"]["acronym"] = {"value": "ZX", "method": MODEL_METHOD, "source": None,
+                                       "rules": {"value": None, "method": None}}
+        write_record(d, chosen, source_sha256="abc", meta=meta, model="openrouter:x/y", prompt_version="1",
+                     llm={"accepted": ["acronym"]})
+        data, _ = load_record(d, "abc", meta)
+        assert data["model"] == "openrouter:x/y" and data["prompt_version"] == "1"
+        assert data["llm"] == {"accepted": ["acronym"]} and data["fields"]["acronym"]["method"] == MODEL_METHOD
+        def with_field(key, value):
+            return json.dumps({**data, "fields": {**data["fields"], key: value}})
+
+        good_source = data["fields"]["official_title"]["source"]
+        assert good_source is not None
+        for broken, why in (("{not json", "unreadable"), (json.dumps([1]), "schema"),
+                            (json.dumps({**data, "schema": SCHEMA + 1}), "schema"),
+                            (json.dumps({**data, "fields": {"acronym": None}}), "schema"),
+                            (json.dumps({**data, "others": []}), "schema"),
+                            (json.dumps({**data, "others": {"nct": "NCT01234567"}}), "schema"),
+                            (json.dumps({**data, "cover_page": {"phase": "3"}}), "schema"),
+                            (with_field("acronym", "ZX"), "schema"),
+                            (with_field("acronym", {"value": "", "method": "m", "source": None}), "schema"),
+                            (with_field("acronym", {"value": "ZX", "method": "m", "source": {"page": 1}}), "schema"),
+                            (with_field("acronym", {"value": "ZX", "method": "m", "source": None, "rules": "x"}),
+                             "schema"),
+                            (with_field("sponsor", {"value": "Acme", "method": "m", "source": good_source}), "schema"),
+                            (with_field("sponsor", {"value": "Acme", "method": "m", "source": None,
+                                                    "verbatim": "Acme"}), "schema")):
+            path.write_text(broken, encoding="utf-8")
+            assert load_record(d, "abc") == (None, why), broken[:80]
+        # a well-formed model sponsor is accepted
+        path.write_text(with_field("sponsor", {"value": "Acme", "method": MODEL_METHOD, "source": good_source,
+                                               "verbatim": "Acme", "rules": {"value": None, "method": None}}),
+                        encoding="utf-8")
+        assert load_record(d, "abc")[1] is None
 
 
 if __name__ == "__main__":

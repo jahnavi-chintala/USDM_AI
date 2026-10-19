@@ -6,9 +6,11 @@ embeddings, no network). Checks: partition invariants (non-overlap, every chunk 
 size bounds except table parents, windows carry their heading) with the fallback index and, when
 importable, structure.py's index; greedy fill within the budget; degradation order (parent, +-1
 neighbours, chunk alone, dropped; table whole / rows +-1); near-duplicate suppression (synopsis vs
-body); the identity block; section-level small-to-big; the identifier patterns.
+body); the identity block, with the fields a model chose in the stored identity record (chunks/identity.json) laid over
+the stats values; section-level small-to-big; the identifier patterns.
 """
 
+import copy
 import json
 import sys
 import tempfile
@@ -19,12 +21,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from docling_core.types.doc import (BoundingBox, ContentLayer, CoordOrigin, DocItemLabel, DoclingDocument, ListItem,
                                     ProvenanceItem, Size, TableCell, TableData, TableItem)
 
+import identity
 import parents
+import retrieve
 from chunk_protocol import (IDENTIFIER_PATTERNS, ProtocolSerializerProvider, ProtocolTableSerializer,
                             registry_identifiers)
 from retrieve import Block, ContextBuilder, Hit, Result, identity_block
 
 MIN, MAX = 20, 60  # partition limits in words (the test tokenizer counts words)
+SHA = "feedface00112233"  # the made-up Docling JSON's source_sha256 in stats.json and a stored identity record
 WORDS = lambda s: len(s.split())  # noqa: E731
 
 BODY_DESIGN = ("The Zorvex trial is a randomized open label study of zorvexumab in adults with quuxoma "
@@ -327,6 +332,209 @@ def test_identity_block() -> None:
         assert build(b, "q", hits_for(b.retriever.chunks, [lambda c: "intro0" in c["text"]])).blocks[0].kind != "document"
     blk = identity_block({}, {"nct": None, "sources": {}})
     assert "ClinicalTrials.gov (NCT) number: none found" in blk.text
+
+
+STORED_META = {"title": "A made-up study of zorvexumab", "acronym": "ZVX", "protocol_id": "ZX-4417",
+               "version_label": "Amendment 1", "version_date": "1 January 2026"}
+STORED_IDS = {"sponsor_protocol_id": "ZX-4417", "nct": None, "eudract": "2019-003431-33", "eu_ct": None, "ind": None,
+              "who_utn": None, "others": {"nct": ["NCT07654321"]},
+              "sources": {"sponsor_protocol_id": {"page": 1, "layer": "body", "text": "Zorvex Study Protocol ZX-4417"},
+                          "eudract": {"page": 1, "layer": "table", "text": "EudraCT number: 2019-003431-33"}}}
+
+
+def stored_field(value, method, source=None, **extra) -> dict:
+    return {"value": value, "method": method, "source": source, **extra}
+
+
+def model_field(value, source, rules=None, **extra) -> dict:
+    """A field as the identity stage stores one a model chose (MODEL_METHOD, a source, "rules" = the rule field it
+    replaced); the source is given as {"page", "layer", "text"} and carries the keys of a stored source besides."""
+    src = {**source, "ref": "#/texts/1", "refs": ["#/texts/1"], "row": None, "section_id": "S1"} if source else None
+    return {"value": value, "method": identity.MODEL_METHOD, "source": src,
+            "rules": rules or {"value": None, "method": None}, **extra}
+
+
+def test_identity_overlay() -> None:
+    meta, ids = copy.deepcopy(STORED_META), copy.deepcopy(STORED_IDS)
+    text = identity_block(meta, ids).text
+    # no record, an empty record and a record of rules only (their values differ from the stats on purpose): equal
+    # copies, not the arguments
+    header = {"page": 5, "layer": "furniture", "text": "x"}
+    rules_only = {"fields": {
+        "official_title": stored_field("Another title", "cover-page label"), "acronym": stored_field("ANO", "stored"),
+        "sponsor_protocol_id": stored_field("ZX-0000", "labelled pattern", header),
+        "nct": stored_field("NCT00000009", "registry pattern", {"page": 2, "layer": "body", "text": "y"}),
+        "version_label": stored_field("Amendment 9", "history table"),
+        "version_date": stored_field("9 Sep 2029", "stored"),
+        "sponsor": stored_field("Someone", "copyright line", None, verbatim="Someone")}}
+    for record in (None, {}, {"fields": {}}, {"fields": None}, rules_only):
+        got_meta, got_ids = retrieve.identity_overlay(meta, ids, record)
+        assert (got_meta, got_ids) == (meta, ids) and got_meta is not meta and got_ids is not ids
+        assert got_ids["sources"] is not ids["sources"] and got_ids["others"] is not ids["others"]
+        assert identity_block(got_meta, got_ids).text == text
+    got_meta, got_ids = retrieve.identity_overlay({}, {"nct": None, "sources": {}}, rules_only)  # empty stats
+    assert (got_meta, got_ids) == ({}, {"nct": None, "sources": {}})
+    assert retrieve.identity_overlay({}, {}, None) == ({}, {})  # no "sources" key stays absent
+    # the fields a model chose replace the stats values; nothing else does
+    body = lambda t: {"page": 1, "layer": "body", "text": t}  # noqa: E731
+    record = {"fields": {
+        **rules_only["fields"],
+        "official_title": model_field("The title a model chose", body("Title line"),
+                                      {"value": "A made-up study of zorvexumab", "method": "title page"}),
+        "acronym": model_field("ZVX-2", body("Acronym line")),
+        "version_label": model_field("Amendment 2", body("Version line")),
+        "version_date": model_field("2 February 2026", body("Date line")),
+        "sponsor_protocol_id": model_field("ZX-4418", {"page": 3, "layer": "furniture", "text": "ZX-4418 header"},
+                                           {"value": "ZX-4417", "method": "labelled pattern"}),
+        "nct": model_field("NCT01234567", {"page": 2, "layer": "table", "text": "NCT01234567 row"}),
+        "eudract": model_field("2020-000001-11", None, {"value": "2019-003431-33", "method": "registry pattern"}),
+        "who_utn": model_field("U1111-1234-5678", body("UTN line")),
+        "ind": model_field("", body("empty values are not a choice")),
+        "eu_ct": {**model_field("2022-500123-12-00", body("EU CT line")), "method": "registry pattern"},  # a rule's
+    }}
+    got_meta, got_ids = retrieve.identity_overlay(meta, ids, record)
+    assert (meta, ids) == (STORED_META, STORED_IDS)  # the arguments are untouched
+    assert got_meta == {**STORED_META, "title": "The title a model chose", "acronym": "ZVX-2",
+                        "version_label": "Amendment 2", "version_date": "2 February 2026"}
+    replaced = ("sources", "sponsor_protocol_id", "nct", "eudract", "who_utn")
+    assert {k: v for k, v in got_ids.items() if k not in replaced} == {
+        k: v for k, v in STORED_IDS.items() if k not in replaced}
+    assert (got_ids["sponsor_protocol_id"], got_ids["nct"], got_ids["eudract"], got_ids["who_utn"]) == (
+        "ZX-4418", "NCT01234567", "2020-000001-11", "U1111-1234-5678")
+    assert got_ids["sources"] == {  # {"page", "layer", "text"} only; the source of a replaced value goes with it
+        "sponsor_protocol_id": {"page": 3, "layer": "furniture", "text": "ZX-4418 header"},
+        "nct": {"page": 2, "layer": "table", "text": "NCT01234567 row"},
+        "who_utn": body("UTN line")}
+    assert got_ids["ind"] is None and got_ids["eu_ct"] is None  # an empty model value and a rule's value: no change
+    lines = identity_block(got_meta, got_ids).text.splitlines()
+    none_found = "none found in the document text (body, tables, headers/footers)"
+    assert lines == [
+        "Title: The title a model chose", "Acronym: ZVX-2",
+        'Sponsor protocol number: ZX-4418 (source p. 3, header/footer: "ZX-4418 header")',
+        'ClinicalTrials.gov (NCT) number: NCT01234567 (source p. 2, table: "NCT01234567 row")',
+        "EudraCT number: 2020-000001-11", f"EU CT number: {none_found}", f"IND number: {none_found}",
+        'WHO Universal Trial Number: U1111-1234-5678 (source p. 1: "UTN line")',
+        "Version: Amendment 2, 2 February 2026"], lines
+    assert identity_block(got_meta, got_ids).pages == [1, 2, 3]
+    # without a "sources" key in the stats' identifiers, the model's sources create it
+    got_meta, got_ids = retrieve.identity_overlay({}, {"nct": None}, {"fields": {"nct": record["fields"]["nct"]}})
+    assert got_ids == {"nct": "NCT01234567",
+                       "sources": {"nct": {"page": 2, "layer": "table", "text": "NCT01234567 row"}}}
+
+
+def builder_with_sha(doc, chunks, tmp) -> ContextBuilder:
+    """A fresh builder over a stats.json with a source_sha256: a stored identity record belongs to a Docling JSON."""
+    b = make_builder(doc, chunks, tmp, 2000)
+    stats = Path(tmp) / "stats.json"
+    data = json.loads(stats.read_text(encoding="utf-8"))
+    data["document"]["source_sha256"] = SHA
+    stats.write_text(json.dumps(data), encoding="utf-8")
+    return b
+
+
+def test_identity_block_reads_the_stored_record() -> None:
+    """The Document block of a context takes the fields a model chose from chunks/identity.json (the stats values
+    otherwise); no file, a file of rules only, one of another Docling JSON, one built from other stats.json values
+    (stale), a broken one and one of another schema give the block of today, token count included; the context is the
+    block first, then the passages."""
+    doc = make_doc()
+    hit = lambda b: hits_for(b.retriever.chunks, [lambda c: "intro0" in c["text"]])  # noqa: E731
+    with tempfile.TemporaryDirectory() as tmp:
+        chunks = make_chunks(doc)
+        b = builder_with_sha(doc, chunks, tmp)
+        today = b._identity_block()
+        assert not (Path(tmp) / identity.RECORD_FILE).exists()
+        meta = json.loads((Path(tmp) / "stats.json").read_text(encoding="utf-8"))["document"]
+        assert today.text == identity_block(meta, meta["identifiers"]).text
+        plain = build(b, "What is the NCT number?", hit(b)).render()
+        rules = {k: stored_field(**v) for k, v in {  # the rules' record of this made-up document
+            "official_title": {"value": meta["title"], "method": "title page"},
+            "nct": {"value": "NCT01234567", "method": "registry pattern",
+                    "source": {"page": 1, "layer": "furniture", "text": "ZX-4417 Zorvex NCT01234567"}},
+            # a rule's value is never laid over the stats: this one differs on purpose, the block stays
+            "acronym": {"value": "ANO", "method": "stored"},
+            "version_label": {"value": "Amendment 9", "method": "history table"},
+        }.items()}
+        for what, write in (
+                ("rules only", lambda: identity.write_record(tmp, {"fields": rules}, source_sha256=SHA, meta=meta)),
+                ("another document", lambda: identity.write_record(
+                    tmp, {"fields": {"acronym": model_field("OTHER", None)}}, source_sha256="0123456789abcdef",
+                    meta=meta, model="a/model", prompt_version="x", llm={})),
+                ("other stats values (stale)", lambda: identity.write_record(
+                    tmp, {"fields": {"acronym": model_field("STALE", None)}}, source_sha256=SHA,
+                    meta={**meta, "version_label": "Amendment 99"}, model="a/model", prompt_version="x", llm={})),
+                ("not JSON", lambda: (Path(tmp) / identity.RECORD_FILE).write_text("{not json", encoding="utf-8")),
+                ("another schema", lambda: (Path(tmp) / identity.RECORD_FILE).write_text(
+                    json.dumps({"schema": 99, "fields": {}}), encoding="utf-8"))):
+            write()
+            b = builder_with_sha(doc, chunks, tmp)
+            got = b._identity_block()
+            assert got.text == today.text and got.tokens == today.tokens and got.pages == today.pages, what
+            assert build(b, "What is the NCT number?", hit(b)).render() == plain, what
+        # a model's fields
+        cited = "Results of an earlier trial (NCT07654321) informed the dose."
+        fields = {
+            "official_title": model_field("The title a model chose", {"page": 1, "layer": "body", "text": "Zorvex"}),
+            "acronym": model_field("ZVX-2", {"page": 1, "layer": "body", "text": "Zorvex Study Protocol ZX-4417"}),
+            "nct": model_field("NCT07654321", {"page": 9, "layer": "body", "text": cited},
+                               {"value": "NCT01234567", "method": "registry pattern"}),
+        }
+        identity.write_record(tmp, {"fields": fields}, source_sha256=SHA, meta=meta, model="a/model",
+                              prompt_version="x", llm={})
+        b = builder_with_sha(doc, chunks, tmp)
+        got = b._identity_block()
+        lines = got.text.splitlines()
+        assert lines[:2] == ["Title: The title a model chose", "Acronym: ZVX-2"]
+        assert f'ClinicalTrials.gov (NCT) number: NCT07654321 (source p. 9: "{cited}")' in lines
+        assert "NCT01234567" not in got.text
+        gone = [x for x in today.text.splitlines() if x not in lines]  # the rules' title and NCT lines are replaced
+        assert len(gone) == 2 and gone[0] == "Title: A made-up study of zorvexumab"
+        assert gone[1].startswith("ClinicalTrials.gov (NCT) number: NCT01234567 (source ")
+        assert "Sponsor protocol number: ZX-4417" in got.text and "Version: Amendment 1, 1 January 2026" in got.text
+        assert 9 in got.pages and got.tokens == b.count(got.render(0)) != today.tokens
+        ctx = build(b, "What is the NCT number?", hit(b))
+        assert ctx.blocks[0].kind == "document" and ctx.blocks[0].text == got.text
+        assert ctx.render().startswith(f"[1] Document identity (title page, headers/footers) | Document identity | "
+                                       f"pp. {min(got.pages)}-9\n")
+        # the builder keeps its own block: a later call returns a copy of it
+        got.text = "changed"
+        assert b._identity_block().text == "\n".join(lines)
+
+
+def test_identity_record_given_to_the_builder() -> None:
+    """ContextBuilder(identity_record=...) (production_builder passes it on) replaces the builder's own read of
+    chunks/identity.json: a record is used and the file is not read, None means "no usable record" (the stats values),
+    not given means the builder loads the file itself; a mode clone keeps the record."""
+    doc = make_doc()
+    with tempfile.TemporaryDirectory() as tmp:
+        chunks = make_chunks(doc)
+        builder_with_sha(doc, chunks, tmp)  # stats.json with a source_sha256
+        (Path(tmp) / "doc.json").write_text("{}", encoding="utf-8")  # any file: no retriever sha to check it against
+        retriever = FakeRetriever(chunks, tmp)
+        retriever.source_sha256 = None
+        ser = ProtocolSerializerProvider().get_serializer(doc)
+        src = {"page": 1, "layer": "body", "text": "Zorvex Study Protocol ZX-4417"}
+        on_disk = {"fields": {"acronym": model_field("FILE-ACR", src)}}
+        given = {"fields": {"acronym": model_field("GIVEN-ACR", src)}}
+        meta = json.loads((Path(tmp) / "stats.json").read_text(encoding="utf-8"))["document"]
+        identity.write_record(tmp, on_disk, source_sha256=SHA, meta=meta, model="a/model", prompt_version="x",
+                              llm={})
+
+        shared = dict(doc=doc, serializer=ser, tok=FakeTok(), tables={})
+
+        def block(**kw) -> str:
+            return ContextBuilder(retriever, Path(tmp) / "doc.json", **shared, **kw)._identity_block().text
+
+        today = identity_block(meta, meta["identifiers"]).text.splitlines()
+        assert block().splitlines() == today[:1] + ["Acronym: FILE-ACR"] + today[1:]  # not given: loads the file
+        assert block(identity_record=None).splitlines() == today  # given, none usable: the file is not read
+        assert "Acronym: GIVEN-ACR" in block(identity_record=given) and "FILE-ACR" not in block(identity_record=given)
+        b = retrieve.production_builder(retriever, Path(tmp) / "doc.json", identity_record=given, **shared)
+        clone = b.with_mode("chunks")  # made before the block is first built
+        assert b.mode == "parents" and "Acronym: GIVEN-ACR" in b._identity_block().text
+        assert "Acronym: GIVEN-ACR" in clone._identity_block().text
+        loads = retrieve.production_builder(retriever, Path(tmp) / "doc.json", **shared)
+        assert "Acronym: FILE-ACR" in loads._identity_block().text
 
 
 def test_greedy_fill_within_budget() -> None:

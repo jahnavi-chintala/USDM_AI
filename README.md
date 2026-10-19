@@ -34,6 +34,9 @@ at `/ui/` and a background worker: upload a PDF, poll the job, call the tools.
 .venv\Scripts\python validate_output.py
 # 3. Chunks, parent units, sections, tables, glossary
 .venv\Scripts\python chunk_protocol.py [output_dir\protocol.json --out output_dir\chunks]
+# 3b. The identity record chunks/identity.json (rules only; --model openrouter:... adds the model check, which
+#     sends the first three pages' lines to OpenRouter once; run it again after re-chunking)
+.venv\Scripts\python identity_llm.py --chunks output_dir\chunks --model ""
 # 4. Embeddings (sends chunk text to OpenRouter; only changed chunks are re-embedded)
 .venv\Scripts\python embed_chunks.py --chunks output_dir\chunks\chunks.jsonl embed
 # 5. Agent toolset over one converted protocol
@@ -53,6 +56,7 @@ Set `OPENROUTER_OFFLINE=1` to forbid any API call: cache misses then raise inste
 | Structure | `structure.py` | heading levels from outline / numbering / TOC, section tree with stable ids and ICH M11 roles, reading-order repair |
 | Figures | `figure_vlm.py` | AI figure descriptions and Mermaid, cached per image; the service describes uncached figures at ingest, the command-line conversion only attaches cached ones |
 | Chunking | `chunk_protocol.py`, `parents.py`, `glossary.py` | 512-token chunks with section ids and roles, structural parent units, self-describing table rows, abbreviation glossary |
+| Identity | `identity.py`, `identity_llm.py` | titles, sponsor, registry ids and version, each with the line it was read from (`chunks/identity.json`); optionally a model picks values from the title pages and only those found in the cited lines are kept |
 | Retrieval | `retrieve.py`, `embed_chunks.py` | BM25 + dense (qwen3-embedding-8b) + qwen3-reranker-8b; parent-aware context builder (`production_builder`) |
 | Schedule of Activities | `soa.py` | visits with windows, activities, marks with qualifiers and footnotes |
 | Agent toolset | `protocol_api.py` | `document_info`, `outline`, `find_sections`, `read_section`, `get_table`, `get_soa`, `search`, `abbreviation`, `quote_check`; see `docs/protocol_api.md` |
@@ -73,7 +77,8 @@ No pytest needed: `.venv\Scripts\python tests\test_<name>.py` for each file in `
   reports) are local only.
 - Content leaves the machine only through OpenRouter, always with `{"data_collection": "deny",
   "zdr": true, "allow_fallbacks": false}`, and never under `OPENROUTER_OFFLINE=1`.
-  - On the command line these are explicit commands: figure descriptions, embeddings, answers, judging.
-  - The service does it automatically: figure descriptions and chunk embeddings at ingest, the query and
-    reranking at search. See [DEPLOY.md](DEPLOY.md#6-data-handling).
+  - On the command line these are explicit commands: figure descriptions, the identity check (`identity_llm.py
+    --model ...`), embeddings, answers, judging.
+  - The service does it automatically: figure descriptions, the identity check (`IDENTITY_MODEL`; on by default) and
+    chunk embeddings at ingest, the query and reranking at search. See [DEPLOY.md](DEPLOY.md#6-data-handling).
 - `test_protocols.py` reports private protocols as P1, P2, ... with aggregate numbers only.

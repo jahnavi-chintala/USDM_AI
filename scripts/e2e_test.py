@@ -918,6 +918,9 @@ def notice(ctx: Ctx, private: bool = False) -> str:
     lines = [f"The service at {ctx.target.base} reports offline=false. This run makes it send to OpenRouter "
              "(zero-data-retention routing, no fallbacks):",
              f"  - every figure image not yet in its figure cache -> {config.get('figure_model') or '(figures off)'}",
+             *([f"  - the first three pages' text and the running headers/footers of every document not yet in its "
+                f"identity cache (one request each) -> {config['identity_model']}"]
+               if config.get("identity_model") else []),
              f"  - the text of every chunk not yet in its embedding cache, in batches of 32 -> "
              f"{config.get('embed_model')}",
              f"  - the search queries {list(SEARCH_QUERIES)} per document -> {config.get('embed_model')} (query) and "
@@ -1038,6 +1041,19 @@ def check_stages(ctx: Ctx, d: Doc, job: dict, step: str) -> None:
             fig.get("status") == "skipped"
         ctx.report.check(step, f"{d.label}: online: figures and embed stages done", ok_fig and emb.get("status") ==
                          "done", f"figures {fig.get('status')}, embed {emb.get('status')}, {job.get('state')}")
+    # the identity stage (pipeline 2.1.0): it ran after chunk and its record is listed and served
+    ident = stages.get("identity") or {}
+    names = [s.get("name") for s in job.get("stages") or []]
+    in_order = "identity" in names and names.index("identity") == names.index("chunk") + 1
+    listing = _json(ctx.http.get(f"/documents/{d.doc_id}/files")) or {}
+    served = ctx.http.get(f"/documents/{d.doc_id}/files/identity.json")
+    record = _json(served) or {}
+    ctx.report.check(step, f"{d.label}: identity stage after chunk; chunks/identity.json listed and served",
+                     in_order and ident.get("status") in ("done", "skipped_offline", "partial")
+                     and "chunks/identity.json" in (listing.get("files") or []) and served.status_code == 200
+                     and record.get("schema") == 1 and isinstance(record.get("fields"), dict),
+                     f"identity {ident.get('status')} ({detail_counts(ident) or 'no counts'}), served "
+                     f"HTTP {served.status_code}, model {record.get('model')}")
 
 
 # ============================================================================ step 3: agent workflow per document
@@ -1374,11 +1390,13 @@ def check_reprocess(ctx: Ctx, d: Doc, job_id: str, old_result: str | None) -> No
               f"offline: figures {(stages.get('figures') or {}).get('status')}, embed "
               f"{(stages.get('embed') or {}).get('status')}")
         return
-    r.check("6", f"{d.label}: the reprocess sent nothing new (figures described_now 0, embed embedded 0)",
+    idd = (stages.get("identity") or {}).get("detail") or {}
+    r.check("6", f"{d.label}: the reprocess sent nothing new (figures described_now 0, embed embedded 0, identity "
+                 "no cache miss)",
             not fd.get("described_now") and not fd.get("failed") and (stages.get("embed") or {}).get("status") ==
-            "done" and ed.get("embedded") == 0,
+            "done" and ed.get("embedded") == 0 and idd.get("cache") != "miss",
             f"described_now {fd.get('described_now', 0)}, already_cached {fd.get('already_cached', 0)}, embedded "
-            f"{ed.get('embedded')}, cached {ed.get('cached')}")
+            f"{ed.get('embedded')}, cached {ed.get('cached')}, identity cache {idd.get('cache')}")
 
 
 # ============================================================================ step 7: failure cases
@@ -1621,8 +1639,9 @@ def step_purge(ctx: Ctx, enc: Doc | None) -> None:
               f"HTTP {resp.status_code}, deleted {body.get('deleted')}: service lacks purge_caches")
         return
     r.check("8", "DELETE ?purge_caches=true -> deleted with purged counts",
-            resp.status_code == 200 and body.get("deleted") is True,
-            f"purged batches {purged.get('batches')}, figures {purged.get('figures')}")
+            resp.status_code == 200 and body.get("deleted") is True and isinstance(purged.get("identity"), int),
+            f"purged batches {purged.get('batches')}, figures {purged.get('figures')}, identity "
+            f"{purged.get('identity')}")
     after = batch_listing(ctx)
     if before is None or after is None:
         r.add("8", "cache listing (docker exec)", FAIL, "docker exec failed")

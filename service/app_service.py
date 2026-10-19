@@ -373,8 +373,9 @@ class ProtocolService:
 
     def delete_document(self, doc_id: str, *, purge_caches: bool = False) -> dict:
         """Delete the record, the jobs and the stored files. Conflict while a job of the document is running.
-        purge_caches: also remove what the shared caches hold for this PDF (its conversion batches and its figure
-        descriptions), so no trace of it is left under DATA_DIR; a later upload converts and describes afresh."""
+        purge_caches: also remove what the shared caches hold for this PDF (its conversion batches, its figure
+        descriptions and its identity-model answers), so no trace of it is left under DATA_DIR; a later upload
+        converts, describes and identifies afresh. Returns "purged": {"batches", "figures", "identity"} (counts)."""
         self._check_doc_id(doc_id)
         self._evict(doc_id)
         figure_key = self._figure_cache_key(doc_id) if purge_caches else None
@@ -395,8 +396,9 @@ class ProtocolService:
         return out
 
     def _figure_cache_key(self, doc_id: str) -> str | None:
-        """The figure cache's key for the document (figure_vlm.document_key of its stored Docling JSON), or None
-        without a readable stored result (then only its conversion batches are purged)."""
+        """The figure cache's key for the document (figure_vlm.document_key of its stored Docling JSON; the identity
+        cache's entries carry the same key), or None without a readable stored result (then only its conversion
+        batches are purged)."""
         folder = self.storage.document_dir(doc_id)
         path = folder / "protocol.json" if folder else None
         if path is None or not path.is_file():

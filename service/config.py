@@ -1,9 +1,12 @@
 """Service configuration from environment variables (documented defaults; nothing hard-coded elsewhere).
 
   DATA_DIR             root of all service data (default: ./data next to the code; /data in the container)
-  OPENROUTER_API_KEY   key for figure descriptions, embeddings and reranking (never logged)
+  OPENROUTER_API_KEY   key for figure descriptions, the identity check, embeddings and reranking (never logged)
   OPENROUTER_OFFLINE   "1": never call OpenRouter; a stage that needs it is skipped with a warning
   FIGURE_MODEL         figure descriptions (default openrouter:anthropic/claude-opus-5.5; "" turns them off)
+  IDENTITY_MODEL       document identity (titles, sponsor, ids, version): "openrouter:<model id>" selects values from
+                       the first three pages' lines, kept only when found in the cited lines; one zero-data-retention
+                       request per document (default openrouter:anthropic/claude-opus-5.5; "" = rules only)
   EMBED_MODEL          chunk and query embeddings (default qwen/qwen3-embedding-8b)
   RERANK_MODEL         search reranker (default qwen/qwen3-reranker-8b)
   WORKER_CONCURRENCY   documents processed at the same time (default 1)
@@ -27,6 +30,7 @@ Layout under DATA_DIR (the storage layer owns it):
   work/<job_id>/             scratch space of a running job, moved into documents/ atomically on success
   cache/vlm/                 figure-description cache, shared across documents (image + model + prompt version)
   cache/batches/             Docling conversion batch cache (per PDF hash and converter configuration)
+  cache/identity/            identity-model answers, shared across documents (one entry per document and model)
   inbox/                     PDFs placed for ingestion by path (MCP ingest_document)
 """
 
@@ -40,9 +44,10 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "::1")
 
-# The same defaults as pipeline_version.DEFAULT_FIGURE_MODEL, embed_chunks.MODEL and retrieve.RERANK_MODEL
-# (tests/test_service_pipeline.py checks they agree).
+# The same defaults as pipeline_version.DEFAULT_FIGURE_MODEL / DEFAULT_IDENTITY_MODEL, embed_chunks.MODEL and
+# retrieve.RERANK_MODEL (tests/test_service_pipeline.py checks they agree).
 DEFAULT_FIGURE_MODEL = "openrouter:anthropic/claude-opus-5.5"
+DEFAULT_IDENTITY_MODEL = "openrouter:anthropic/claude-opus-5.5"  # "" turns the model check off (rules only)
 DEFAULT_EMBED_MODEL = "qwen/qwen3-embedding-8b"
 DEFAULT_RERANK_MODEL = "qwen/qwen3-reranker-8b"
 
@@ -75,6 +80,7 @@ class ServiceConfig:
     data_dir: Path
     offline: bool = False
     figure_model: str = DEFAULT_FIGURE_MODEL
+    identity_model: str = DEFAULT_IDENTITY_MODEL
     embed_model: str = DEFAULT_EMBED_MODEL
     rerank_model: str = DEFAULT_RERANK_MODEL
     worker_concurrency: int = 1
@@ -86,10 +92,12 @@ class ServiceConfig:
     @classmethod
     def from_env(cls) -> "ServiceConfig":
         figure = os.environ.get("FIGURE_MODEL")
+        identity = os.environ.get("IDENTITY_MODEL")
         return cls(
             data_dir=Path(os.environ.get("DATA_DIR") or ROOT / "data").resolve(),
             offline=_flag("OPENROUTER_OFFLINE"),
             figure_model=DEFAULT_FIGURE_MODEL if figure is None else figure.strip(),
+            identity_model=DEFAULT_IDENTITY_MODEL if identity is None else identity.strip(),
             embed_model=os.environ.get("EMBED_MODEL") or DEFAULT_EMBED_MODEL,
             rerank_model=os.environ.get("RERANK_MODEL") or DEFAULT_RERANK_MODEL,
             worker_concurrency=max(1, _int("WORKER_CONCURRENCY", 1)),
@@ -142,17 +150,23 @@ class ServiceConfig:
         return self.cache_dir / "batches"
 
     @property
+    def identity_cache_dir(self) -> Path:
+        return self.cache_dir / "identity"
+
+    @property
     def inbox_dir(self) -> Path:
         return self.data_dir / "inbox"
 
     def models(self) -> dict:
         """Model ids as pipeline_version.fingerprint_inputs() names them."""
-        return {"figure": self.figure_model, "embedding": self.embed_model, "reranker": self.rerank_model}
+        return {"figure": self.figure_model, "identity": self.identity_model, "embedding": self.embed_model,
+                "reranker": self.rerank_model}
 
     def public(self) -> dict:
         """Safe to show (/version, logs): no key, no paths beyond the data root."""
         return {"data_dir": str(self.data_dir), "offline": self.offline, "figure_model": self.figure_model,
-                "embed_model": self.embed_model, "rerank_model": self.rerank_model,
+                "identity_model": self.identity_model, "embed_model": self.embed_model,
+                "rerank_model": self.rerank_model,
                 "worker_concurrency": self.worker_concurrency, "figure_concurrency": self.figure_concurrency,
                 "max_upload_mb": self.max_upload_mb, "allowed_hosts": list(self.allowed_hosts),
                 "api_key_set": bool(os.environ.get("OPENROUTER_API_KEY"))}

@@ -16,15 +16,22 @@ import os
 from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version
 
-PIPELINE_VERSION = "2.0.0"  # 1.1.0: Phase 1 fixes (hyphen-split items, booktabs rows, quoted headings, ...)
+PIPELINE_VERSION = "2.1.0"  # 1.1.0: Phase 1 fixes (hyphen-split items, booktabs rows, quoted headings, ...)
 #                             1.1.1: chunk figure image_path relative to the document folder (was absolute)
 #                             1.1.2: protocol.json / .md / .html with LF and "/" image URIs on every platform
 #                                    (Windows results now hash, and so get chunk ids, like the Linux container's)
 #                             2.0.0: chunk ids of documents without protocol id + amendment derive from the
 #                                    source PDF (protocol.json records it as origin), not from the JSON
 #                                    (identifiers change: "doc-<pdf hash>-0000")
+#                             2.1.0: chunks/identity.json (the identity record, optionally model-checked:
+#                                    IDENTITY_MODEL); the embedding prefix never holds the file name ("Protocol
+#                                    <id> ..." without an acronym, was "<file stem> protocol <id> ..."), so
+#                                    some chunk boundaries move; cover-page labels no longer take a label line
+#                                    as their value
 
 DEFAULT_FIGURE_MODEL = "openrouter:anthropic/claude-opus-5.5"  # convert_protocol.py --figure-model default
+DEFAULT_IDENTITY_MODEL = "openrouter:anthropic/claude-opus-5.5"  # identity_llm.py (78/78 vs the rules' 68/78 on
+#                                                                   the hand-checked public gold; "" = rules only)
 _PACKAGES = ("docling", "docling-core", "docling-parse", "docling-ibm-models")
 
 
@@ -32,6 +39,12 @@ def figure_model() -> str:
     """The figure-description model in effect: FIGURE_MODEL ("" turns descriptions off) or the default."""
     value = os.environ.get("FIGURE_MODEL")
     return DEFAULT_FIGURE_MODEL if value is None else value.strip()
+
+
+def identity_model() -> str:
+    """The identity model in effect: IDENTITY_MODEL ("" turns the model step off) or the default."""
+    value = os.environ.get("IDENTITY_MODEL")
+    return DEFAULT_IDENTITY_MODEL if value is None else value.strip()
 
 
 def _version(package: str) -> str | None:
@@ -47,7 +60,8 @@ def model_ids() -> dict[str, str]:
     from protocol_api import TOKENIZER
     from retrieve import RERANK_MODEL
 
-    return {"figure": figure_model(), "embedding": EMBED_MODEL, "reranker": RERANK_MODEL, "tokenizer": TOKENIZER}
+    return {"figure": figure_model(), "identity": identity_model(), "embedding": EMBED_MODEL,
+            "reranker": RERANK_MODEL, "tokenizer": TOKENIZER}
 
 
 def fingerprint_inputs(settings=None, models: dict | None = None) -> dict:

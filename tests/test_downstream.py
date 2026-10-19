@@ -101,10 +101,13 @@ def test_metadata_running_header_prefix_unchanged() -> None:
 
 def test_metadata_fallbacks() -> None:
     meta = metadata(document("bare", [], [("h", "CLINICAL STUDY PROTOCOL"), TITLE]))
-    assert meta["acronym"] is None and doc_prefix(meta) == "bare protocol"
+    assert meta["acronym"] is None and doc_prefix(meta) == "Protocol"  # never the file name
     assert chunk_id_base(meta).startswith("doc-")
     meta = metadata(document("ex", [], [TITLE]), {"protocol_id": "ABC-001", "amendment": "3"})
-    assert doc_prefix(meta) == "ex protocol ABC-001 (Amendment 3)" and chunk_id_base(meta) == "ABC-001-A3"
+    assert doc_prefix(meta) == "Protocol ABC-001 (Amendment 3)" and chunk_id_base(meta) == "ABC-001-A3"
+    # the same document under another name (the service names every result protocol.json) gets the same prefix
+    meta = metadata(document("protocol", [], [TITLE]), {"protocol_id": "ABC-001", "amendment": "3"})
+    assert doc_prefix(meta) == "Protocol ABC-001 (Amendment 3)"
     assert looks_like_acronym("NOVA-3") and looks_like_acronym("CheckMate 227")
     assert not looks_like_acronym("CONFIDENTIAL") and not looks_like_acronym("Clinical Study Protocol")
 

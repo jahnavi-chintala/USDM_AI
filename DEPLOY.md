@@ -101,9 +101,10 @@ Settings come from environment variables. In compose they come from `.env` (docu
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENROUTER_API_KEY` | (empty) | Key for figure descriptions, embeddings and reranking. Only ever sent to `https://openrouter.ai` as the Authorization header; never logged. |
+| `OPENROUTER_API_KEY` | (empty) | Key for figure descriptions, the identity check, embeddings and reranking. Only ever sent to `https://openrouter.ai` as the Authorization header; never logged. |
 | `OPENROUTER_OFFLINE` | unset | `1` / `true` / `yes` / `on`: never call OpenRouter (see [offline mode](#offline-mode)). |
 | `FIGURE_MODEL` | `openrouter:anthropic/claude-opus-5.5` | Vision model for figure descriptions; an empty value turns them off. |
+| `IDENTITY_MODEL` | `openrouter:anthropic/claude-opus-5.5` | Identity check: a model picks titles, sponsor, ids and version from the first three pages and the running headers/footers, and the service keeps only values it finds in the lines the model cited (`chunks/identity.json`). An empty value turns the check off (the rules only). |
 | `EMBED_MODEL` | `qwen/qwen3-embedding-8b` | Chunk and query embeddings. |
 | `RERANK_MODEL` | `qwen/qwen3-reranker-8b` | Search reranker. |
 | `WORKER_CONCURRENCY` | `1` | Documents converted at the same time. Each needs about 5 GB at peak: raise `mem_limit` with it. |
@@ -277,6 +278,7 @@ claude mcp add --transport http protocol-service http://127.0.0.1:8000/mcp
 | When | What is sent | Model |
 |---|---|---|
 | Ingest, figures stage | each figure image (PNG crop) not yet in the figure cache, with the description prompt | `FIGURE_MODEL` |
+| Ingest, identity stage (unless `IDENTITY_MODEL` is empty) | one request per document not yet in the identity cache: the text of the first three pages and the distinct running headers/footers as numbered lines, and the rule values | `IDENTITY_MODEL` |
 | Ingest, embed stage | each chunk's text (with its section heading and document prefix) not yet in the embedding cache, in batches of 32 | `EMBED_MODEL` |
 | `search` tool | the query text (query embedding) | `EMBED_MODEL` |
 | `search` tool | the query plus the candidate chunk texts (rerank) | `RERANK_MODEL` |
@@ -285,12 +287,12 @@ claude mcp add --transport http protocol-service http://127.0.0.1:8000/mcp
 
 **Never sent:** the PDF itself, whole documents, file names or anything else.
 
-**Caches:** figure descriptions are keyed by image, model and prompt; embeddings by chunk content; query embeddings and reranks by query and candidate set. A reprocess or a repeated search sends nothing new: the smoke test checks that a forced reprocess sends zero requests.
+**Caches:** figure descriptions are keyed by image, model and prompt; identity answers by model, prompt version and the lines sent; embeddings by chunk content; query embeddings and reranks by query and candidate set. A reprocess or a repeated search sends nothing new: the smoke test checks that a forced reprocess sends zero requests.
 
 ### Offline mode
 
 With `OPENROUTER_OFFLINE=1` nothing is sent at all:
-- figure descriptions and embeddings are skipped, and the document finishes as `done_with_warnings`;
+- figure descriptions, embeddings and the identity check are skipped, and the document finishes as `done_with_warnings`; an identity answer already in the cache is still used, otherwise the rule values are kept;
 - `search` answers `409 search_unavailable` (no embeddings) or `503 offline` (query not cached);
 - every other tool works.
 
@@ -301,13 +303,13 @@ To add the missing parts later, reprocess the document online.
 - The models are inside the image and loaded with `HF_HUB_OFFLINE=1`.
 - Hugging Face telemetry and FastAPI's OpenTelemetry auto-configuration are off. The MCP SDK's telemetry hook has no exporter.
 - The build verifies the models with the network disabled.
-- `tests/test_service_zdr.py` checks that the runtime code holds exactly the three OpenRouter call sites above, each with the ZDR block, and that nothing is sent when offline.
+- `tests/test_service_zdr.py` checks that the runtime code holds exactly the four OpenRouter call sites above (figures, identity, embeddings, rerank), each with the ZDR block, and that nothing is sent when offline.
 
 ### Logs, passwords and deletion
 
 - **Logs and error responses** carry ids, counts and exception types with our own file:line, never document text.
 - **PDF passwords** are held in memory until their job starts: never stored, logged or echoed.
-- **Deleting a document** (`DELETE /documents/{doc_id}`) removes its record, jobs and folder. The shared caches keep its conversion batches (`cache/batches/<pdf hash>`) and figure descriptions (`cache/vlm`), so a re-upload is fast and sends nothing. To remove every trace, delete with `?purge_caches=true`: that also removes its batches and its figure descriptions, leaving other documents' entries in place. The answer reports what was removed (`"purged": {"batches": n, "figures": n}`).
+- **Deleting a document** (`DELETE /documents/{doc_id}`) removes its record, jobs and folder. The shared caches keep its conversion batches (`cache/batches/<pdf hash>`), figure descriptions (`cache/vlm`) and identity answers (`cache/identity`), so a re-upload is fast and sends nothing. To remove every trace, delete with `?purge_caches=true`: that also removes its batches, figure descriptions and identity answers, leaving other documents' entries in place. The answer reports what was removed (`"purged": {"batches": n, "figures": n, "identity": n}`).
 
 ## 7. Duplicate and version rules
 
@@ -322,7 +324,7 @@ To add the missing parts later, reprocess the document online.
 
 `POST /documents/{id}/reprocess?force=true` reprocesses even a current result.
 
-The fingerprint covers the pipeline version, the settings, the Docling versions, the converter configuration and the model ids, so changing `FIGURE_MODEL`, `EMBED_MODEL` or `RERANK_MODEL` makes existing results stale. Check the running values with `GET /version`.
+The fingerprint covers the pipeline version, the settings, the Docling versions, the converter configuration and the model ids, so changing `FIGURE_MODEL`, `IDENTITY_MODEL`, `EMBED_MODEL` or `RERANK_MODEL` makes existing results stale. Check the running values with `GET /version`.
 
 ## 8. Limits
 

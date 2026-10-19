@@ -1,20 +1,27 @@
 """Self-test for protocol_api.py: `python tests/test_protocol_api.py` (no pytest).
 
 Public protocols only: output_public/LZZT_CDISC_Pilot and output_public/Lilly_NCT03421379 (their USDM keys are in
-public_protocols/); the identity checks run on all six public outputs. Offline: OPENROUTER_OFFLINE=1 is forced, so search() runs on an eval question whose query
-embedding and rerank are cached (reports/eval/public/<name>.json), an uncached question must raise OfflineCacheMiss,
-and a fake client (embed_fn / rerank_fn) covers the uncached path without any network call.
+public_protocols/); the identity checks run on all six public outputs. Offline: OPENROUTER_OFFLINE=1 is forced, so
+search() runs on an eval question whose query embedding and rerank are cached (reports/eval/public/<name>.json), an
+uncached question must raise OfflineCacheMiss, and a fake client (embed_fn / rerank_fn) covers the uncached path
+without any network call.
 
 Checks: the source-sha guard; every tool and its provenance; the sponsor's "property of" line and source; document_info
 and search's identity block read the identity record (identity.py), not a search: every identifier source and every
 identity-block ref is the item holding the quoted line, Lilly's running header is its protocol id source, document_info
-values equal the stored ones, the record is built once and each call returns its own copy; outline ids; read_section of the inclusion / exclusion roles holds every criterion of the USDM key (usdm_gold's reader);
-continuation cursors lose nothing and keep with_blocks; find_sections hints; table chains are joined; get_soa with and
-without soa.py; quote_check positive / normalised / table / cross-item / furniture / negative / section-scoped /
-elided (in order, within 2,000 characters; with 3+ parts a later occurrence in the window completes a chain) / figure
-OCR text pages / uncapped count by layer / document text before AI-generated text at any tier / header-footer slots;
-the reading-order repair (Lilly p. 26); tool schemas are valid JSON Schema; call_tool never raises and types its own
-errors; the CLI.
+values equal the stored ones, the record is built once and each call returns its own copy; the stored record
+chunks/identity.json (rules only: nothing changes; fields a model chose: value, method, source and "rules" in
+document_info, the version label / amendment with method and source, the identity block and its refs in search, one
+load per document shared with the search builder; another document / other stats.json values or no stamp of them
+(stale: the reviewer's probe, a version label changed after the record was written) / not JSON / another schema: the
+rules of the current stats.json plus a warning with the reason, from the first tool call on, and an identity block
+consistent with document_info); outline ids; read_section of the inclusion / exclusion roles
+holds every criterion of the USDM key (usdm_gold's reader); continuation cursors lose nothing and keep with_blocks;
+find_sections hints; table chains are joined; get_soa with and without soa.py; quote_check positive / normalised /
+table / cross-item / furniture / negative / section-scoped / elided (in order, within 2,000 characters; with 3+ parts a
+later occurrence in the window completes a chain) / figure OCR text pages / uncapped count by layer / document text
+before AI-generated text at any tier / header-footer slots; the reading-order repair (Lilly p. 26); tool schemas are
+valid JSON Schema; call_tool never raises and types its own errors; the CLI.
 """
 
 import copy
@@ -138,17 +145,21 @@ def keep_order(query: str, chunks: list, model: str) -> list[tuple[int, float]]:
     return [(i, 1.0 / (i + 1)) for i in range(len(chunks))]
 
 
+def fake_open(path: Path) -> api.ProtocolDocument:
+    """A protocol folder opened with stand-in embedding / rerank functions: search runs without any network."""
+    dim = np.load(path / "chunks" / "embeddings.npy", mmap_mode="r").shape[1]
+
+    def embed_fn(text):
+        seed = int(hashlib.sha256(text.encode()).hexdigest()[:8], 16)
+        return np.random.default_rng(seed).standard_normal(dim).astype(np.float32)
+
+    return api.ProtocolDocument.open(path, embed_fn=embed_fn, rerank_fn=keep_order)
+
+
 def fake_doc(name: str) -> api.ProtocolDocument:
     """A public protocol opened with stand-in embedding / rerank functions: search runs without any network."""
     if name not in _FAKE_DOCS:
-        path = ROOT / "output_public" / name
-        dim = np.load(path / "chunks" / "embeddings.npy", mmap_mode="r").shape[1]
-
-        def embed_fn(text):
-            seed = int(hashlib.sha256(text.encode()).hexdigest()[:8], 16)
-            return np.random.default_rng(seed).standard_normal(dim).astype(np.float32)
-
-        _FAKE_DOCS[name] = api.ProtocolDocument.open(path, embed_fn=embed_fn, rerank_fn=keep_order)
+        _FAKE_DOCS[name] = fake_open(ROOT / "output_public" / name)
     return _FAKE_DOCS[name]
 
 
@@ -193,6 +204,41 @@ def identity_lines(text: str) -> list[tuple[str, int | None, str, str]]:
             out.append((line.split(":", 1)[0], int(m.group(1)) if m.group(1) else None,
                         {"header/footer": "furniture", "table": "table"}.get(m.group(2), "body"), m.group(3)))
     return out
+
+
+IDENTITY_QUESTION = "What is the planned number of participants?"
+
+
+def identity_folder(name: str, tmp: str) -> Path:
+    """output_public/<name> copied into tmp (the Docling JSON, protocol.decisions.json and chunks/ without the caches
+    and the images): a folder to put a chunks/identity.json into; the public output itself is never written."""
+    src, out = ROOT / "output_public" / name, Path(tmp) / name
+    stats = json.loads((src / "chunks" / "stats.json").read_text(encoding="utf-8"))
+    out.mkdir()
+    for fname in (stats["document"]["source_json"], "protocol.decisions.json"):
+        if (src / fname).is_file():
+            shutil.copy(src / fname, out / fname)
+    shutil.copytree(src / "chunks", out / "chunks", ignore=shutil.ignore_patterns("*cache*", "answer_*", "judge_*"))
+    (out / "chunks" / "identity.json").unlink(missing_ok=True)  # the copy starts without a stored identity
+    return out
+
+
+def model_field(d: api.ProtocolDocument, value: str, ref: str, replaced: dict | None, **extra) -> dict:
+    """A field as the identity stage stores one a model chose: MODEL_METHOD, the source copied from the real item `ref`
+    of d (its page and text), and "rules" = the value and method of the rule field it replaced (None: none)."""
+    import identity
+
+    item = d._resolve(ref)
+    src = {"page": api._pages_of(item)[0], "layer": "body", "text": " ".join(item.text.split()), "ref": ref,
+           "refs": [ref], "row": None, "section_id": d._section_of(ref)}
+    rules = {"value": (replaced or {}).get("value"), "method": (replaced or {}).get("method")}
+    return {"value": value, "method": identity.MODEL_METHOD, "source": src, "rules": rules, **extra}
+
+
+def source_line(label: str, value: str, field: dict) -> str:
+    """The identity block's line of an identifier whose source is a body item."""
+    src = field["source"]
+    return f'{label}: {value} (source p. {src["page"]}: "{src["text"]}")'
 
 
 def coverage(text: str, markdown_tokens: set) -> float:
@@ -363,7 +409,9 @@ def test_lilly_running_header_is_the_protocol_id_source():
 @case
 def test_document_info_values_equal_the_stored_values():
     """Titles, identifiers, version, sponsor and cover page are the values of the stored stats.json and the cover
-    page on the six public protocols (the source items changed, the values did not)."""
+    page on the six public protocols (the source items changed, the values did not): the rules' record (the
+    documents opened as if they had no chunks/identity.json). With the stored record (the identity model's, on by
+    default) every value is the rules' one except those with MODEL_METHOD, whose "rules" names the rules' value."""
     docs = public_docs()
     if not docs:
         return
@@ -371,9 +419,25 @@ def test_document_info_values_equal_the_stored_values():
 
     methods = {"cover-page label", "title page", "running header", "labelled pattern", "header/footer frequency",
                "history table", "registry pattern"}  # a rule's method; never "stored" on the public outputs
+    real_load = api.load_record
+    api.load_record = lambda chunks_dir, sha, meta=None: (None, "missing")
+    try:
+        rules_docs = {name: fake_open(path) for name, path in docs.items()}
+    finally:
+        api.load_record = real_load
     for name in docs:
-        d = fake_doc(name)
+        stored_info = fake_doc(name).document_info()
+        d = rules_docs[name]
         info, stored = d.document_info(), d.meta
+        for group, keys in (("titles", ("official_title", "brief_title", "acronym", "detected_title")),
+                            ("identifiers", [k for k, _ in IDENTITY_FIELDS]),
+                            ("version", ("date", "label_detail", "amendment_detail"))):
+            for key in keys:
+                got, rule_v = stored_info[group][key], info[group][key]
+                if got and got["method"] == api.MODEL_METHOD:
+                    assert got["rules"]["value"] == (rule_v or {}).get("value"), (name, key)
+                else:
+                    assert got == rule_v, (name, key)
         ids, cover = stored["identifiers"], info["cover_page"]
         t = info["titles"]
         assert (t["detected_title"] or {}).get("value") == stored["title"], name
@@ -395,7 +459,10 @@ def test_document_info_values_equal_the_stored_values():
                                 ("cover_approval_date", "approval_date")):
             assert (ver[key] or {}).get("value") == (cover[field_name]["value"] if field_name in cover else None), \
                 (name, key)
-        for v in [*t.values(), ver["date"]]:  # every sourced title / date: value, method, source
+        # the plain label / amendment have a sourced twin: the same value with the rule's method and source
+        assert (ver["label_detail"] or {}).get("value") == ver["label"], name
+        assert (ver["amendment_detail"] or {}).get("value") == ver["amendment"], name
+        for v in [*t.values(), ver["date"], ver["label_detail"], ver["amendment_detail"]]:  # value, method, source
             if v:
                 assert set(v) == {"value", "method", "source"} and v["method"] in methods, (name, v)
                 assert v["source"] is None or set(v["source"]) == SOURCE_KEYS, (name, v)
@@ -420,9 +487,15 @@ def test_document_info_values_equal_the_stored_values():
 @case
 def test_document_info_computed_once_and_copied():
     """The identity record is built once per open document (also for search); document_info is built once and
-    each call returns its own copy with the warnings of that moment."""
+    each call returns its own copy with the warnings of that moment. (A result without chunks/identity.json, as
+    made before pipeline 2.1.0: the stored record, when there is one, is used as it is.)"""
     matrix = np.load(LZZT / "chunks" / "embeddings.npy")
-    d = api.ProtocolDocument.open(LZZT, embed_fn=lambda text: matrix[7], rerank_fn=keep_order)
+    real_load = api.load_record
+    api.load_record = lambda chunks_dir, sha, meta=None: (None, "missing")
+    try:
+        d = api.ProtocolDocument.open(LZZT, embed_fn=lambda text: matrix[7], rerank_fn=keep_order)
+    finally:
+        api.load_record = real_load
     real, builds, opening_warnings = api.build_identity, [], list(d.warnings)
 
     def counting(*args, **kwargs):
@@ -470,6 +543,391 @@ def test_document_info_computed_once_and_copied():
 
     list_ids(d.document_info())
     assert len(seen) == len(set(seen))
+
+
+# =========================================================================== the stored identity record
+
+@case
+def test_identity_json_of_the_rules_changes_nothing():
+    """A chunks/identity.json holding the rules' record (what the identity stage writes without a model) gives the same
+    document_info (warnings included) and the same search result (identity block, refs, rendered context) as no file,
+    and builds nothing: the record is read from the file."""
+    if not public(LZZT, LILLY):
+        return
+    import identity
+
+    for name in ("LZZT_CDISC_Pilot", "Lilly_NCT03421379"):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = identity_folder(name, tmp)
+            plain = fake_open(folder)
+            info, found = plain.document_info(), plain.search(IDENTITY_QUESTION, k=2, rendered=True)
+            assert not (folder / "chunks" / identity.RECORD_FILE).exists()
+            record = plain.rules_identity_record()
+            path = identity.write_record(folder / "chunks", record, source_sha256=plain.source_sha256, meta=plain.meta)
+            real, builds = api.build_identity, []
+
+            def counting(*args, **kwargs):
+                builds.append(1)
+                return real(*args, **kwargs)
+
+            api.build_identity = counting
+            try:
+                stored = fake_open(folder)
+                assert stored.document_info() == info, name
+                assert stored.search(IDENTITY_QUESTION, k=2, rendered=True) == found, name
+            finally:
+                api.build_identity = real
+            assert builds == [], name
+            assert stored._identity_record()["fields"] == json.loads(path.read_text(encoding="utf-8"))["fields"], name
+            assert not any("rules" in v for v in [*info["titles"].values(), *info["identifiers"].values(),
+                                                  info["version"]["date"], info["sponsor"]] if v), name
+
+
+@case
+def test_identity_json_model_fields_show_in_document_info_and_the_identity_block():
+    """A field a model chose in chunks/identity.json (MODEL_METHOD, a source copied from a real item, "rules" = the rule
+    field it replaced) shows in document_info (value, method, source, rules; a field the rules found keeps no "rules"
+    key), in the identity block of document_info and of search (text and refs, one ref per "(source ...)" line) and in
+    the rendered production context; the other values and lines stay."""
+    if not public(LZZT):
+        return
+    import identity
+    from retrieve import IDENTITY_FIELDS
+
+    labels = dict(IDENTITY_FIELDS)
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = identity_folder("LZZT_CDISC_Pilot", tmp)
+        plain = fake_open(folder)
+        base, record = plain.document_info(), plain.rules_identity_record()
+        rules = copy.deepcopy(record["fields"])  # the rules' fields, before the model's replace them
+        assert rules["acronym"] is None and rules["nct"] is None and rules["version_date"] is None
+        assert rules["sponsor_protocol_id"] and rules["official_title"] and rules["sponsor"]
+        chosen = {
+            "official_title": model_field(plain, "A made-up title the model chose", "#/texts/3",
+                                          rules["official_title"]),
+            "acronym": model_field(plain, "XTP-1", "#/texts/1", rules["acronym"]),
+            "sponsor_protocol_id": model_field(plain, "ZZT-9", "#/texts/3", rules["sponsor_protocol_id"]),
+            "nct": model_field(plain, "NCT00000001", "#/texts/1", rules["nct"]),
+            "version_label": model_field(plain, "Amendment 7", "#/texts/0", rules["version_label"]),
+            "amendment": model_field(plain, "7", "#/texts/0", rules["amendment"]),
+            "version_date": model_field(plain, "01-Jan-2020", "#/texts/0", rules["version_date"]),
+            "sponsor": model_field(plain, "Lilly", "#/texts/0", rules["sponsor"], verbatim="Lilly (made up)"),
+        }
+        record["fields"].update(chosen)
+        identity.write_record(folder / "chunks", record, source_sha256=plain.source_sha256, meta=plain.meta,
+                              model="a/model", prompt_version="x", llm={})
+        d = fake_open(folder)
+        info = d.document_info()
+        json.dumps(info)
+        assert info["warnings"] == base["warnings"]
+        for key in ("official_title", "acronym"):
+            want = {"value": chosen[key]["value"], "method": identity.MODEL_METHOD, "source": chosen[key]["source"],
+                    "rules": chosen[key]["rules"]}
+            assert info["titles"][key] == want, key
+        assert info["titles"]["acronym"]["rules"] == {"value": None, "method": None}
+        assert info["titles"]["official_title"]["rules"] == {"value": base["titles"]["official_title"]["value"],
+                                                             "method": base["titles"]["official_title"]["method"]}
+        for key in ("brief_title", "detected_title"):
+            assert info["titles"][key] == base["titles"][key], key  # a field the model did not choose
+        for key in ("sponsor_protocol_id", "nct"):
+            want = {"value": chosen[key]["value"], "method": identity.MODEL_METHOD, "source": chosen[key]["source"],
+                    "rules": chosen[key]["rules"], "label": labels[key]}
+            assert info["identifiers"][key] == want, key
+        assert info["identifiers"]["nct"]["rules"] == {"value": None, "method": None}
+        assert info["identifiers"]["sponsor_protocol_id"]["rules"] == {"value": "H2Q-MC-LZZT",
+                                                                       "method": rules["sponsor_protocol_id"]["method"]}
+        for key in ("eudract", "eu_ct", "ind", "who_utn"):
+            assert info["identifiers"][key] == base["identifiers"][key], key
+        ver = info["version"]
+        assert base["version"]["label_detail"] is None and base["version"]["amendment_detail"] is None
+        assert ver["label"] == "Amendment 7" and ver["amendment"] == "7"
+        for key, detail in (("version_label", "label_detail"), ("amendment", "amendment_detail"),
+                            ("version_date", "date")):  # the version fields, each with method, source and rules
+            assert ver[detail] == {"value": chosen[key]["value"], "method": identity.MODEL_METHOD,
+                                   "source": chosen[key]["source"], "rules": {"value": None, "method": None}}, detail
+        sp = info["sponsor"]
+        assert (sp["name"], sp["value"], sp["method"]) == ("Lilly", "Lilly (made up)", identity.MODEL_METHOD)
+        assert sp["source"] == chosen["sponsor"]["source"] and sp["rules"] == chosen["sponsor"]["rules"]
+        assert sp["rules"] == {"value": "Eli Lilly and Company", "method": "copyright line"}
+        assert sp["provenance"]["refs"] == ["#/texts/0"] and sp["provenance"]["pages"] == [1]
+        have = {f"titles.{k}": v for k, v in info["titles"].items()}
+        have |= {f"identifiers.{k}": v for k, v in info["identifiers"].items()}
+        have |= {f"version.{k}": ver[k] for k in ("date", "label_detail", "amendment_detail")} | {"sponsor": sp}
+        assert {k for k, v in have.items() if v and "rules" in v} == {
+            "titles.official_title", "titles.acronym", "identifiers.sponsor_protocol_id", "identifiers.nct",
+            "version.date", "version.label_detail", "version.amendment_detail", "sponsor"}
+        changed = {"titles", "identifiers", "version", "sponsor", "identity_block", "provenance"}
+        assert {k: v for k, v in info.items() if k not in changed} == {
+            k: v for k, v in base.items() if k not in changed}
+        assert {"#/texts/1", "#/texts/3"} <= set(info["provenance"]["refs"])
+        # the identity block: the model's lines replace the rules' lines, every other line stays
+        before, lines = base["identity_block"].splitlines(), info["identity_block"].splitlines()
+        new = ["Title: A made-up title the model chose", "Acronym: XTP-1",
+               source_line("Sponsor protocol number", "ZZT-9", chosen["sponsor_protocol_id"]),
+               source_line("ClinicalTrials.gov (NCT) number", "NCT00000001", chosen["nct"]),
+               "Version: Amendment 7, 01-Jan-2020"]
+        assert [x for x in lines if x not in before] == new
+        gone = [x for x in before if x not in lines]
+        none_found = "none found in the document text (body, tables, headers/footers)"
+        assert len(gone) == 3 and gone[0].startswith("Title: ")
+        assert gone[1].startswith("Sponsor protocol number: H2Q-MC-LZZT")
+        assert gone[2] == f"ClinicalTrials.gov (NCT) number: {none_found}"
+        assert len([x for x in lines if none_found in x]) == 3  # EudraCT, EU CT, IND stay
+        # search: the same text, a ref per "(source ...)" line (the model's sources, in the order of the identifiers)
+        res = d.search(IDENTITY_QUESTION, k=2, rendered=True)
+        ident = res["identity"]
+        assert ident["text"] == info["identity_block"] and info["identity_block"] in res["context"]
+        assert res["context"].startswith("[1] Document identity")
+        found = identity_lines(ident["text"])
+        assert len(found) == 2
+        refs = []
+        for (label, page, layer, quoted), key in zip(found, ("sponsor_protocol_id", "nct")):
+            src = chosen[key]["source"]
+            assert (page, layer, quoted) == (src["page"], src["layer"], src["text"]), key
+            assert item_problem(d, src["ref"], page, layer, quoted) == "ok", key
+            refs.append(src["ref"])
+        assert refs == ["#/texts/3", "#/texts/1"]
+        assert ident["provenance"]["refs"] == list(dict.fromkeys(refs))
+        assert ident["pages"] == sorted({chosen[k]["source"]["page"] for k in ("sponsor_protocol_id", "nct")})
+        assert ident["provenance"]["section_id"] == next((s for s in (d._section_of(r) for r in refs) if s), None)
+
+
+@case
+def test_identity_json_model_field_replaces_a_rule_source():
+    """Lilly: the sponsor protocol id a model chose in the title paragraph replaces the rule's running header
+    (furniture) as value, source line and ref; the NCT line and its ref (rules) stay."""
+    if not public(LILLY):
+        return
+    import identity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = identity_folder("Lilly_NCT03421379", tmp)
+        plain = fake_open(folder)
+        base, record = plain.document_info(), plain.rules_identity_record()
+        rules = copy.deepcopy(record["fields"])
+        before = plain.search(IDENTITY_QUESTION, k=2)["identity"]
+        assert base["identifiers"]["sponsor_protocol_id"]["source"]["layer"] == "furniture"
+        field = model_field(plain, "I8R-JE-IGBJ", "#/texts/1", rules["sponsor_protocol_id"])
+        date = model_field(plain, "06-Dec-2017", "#/texts/3", rules["version_date"])
+        record["fields"].update({"sponsor_protocol_id": field, "version_date": date})
+        identity.write_record(folder / "chunks", record, source_sha256=plain.source_sha256, meta=plain.meta,
+                              model="a/model", prompt_version="x", llm={})
+        d = fake_open(folder)
+        info = d.document_info()
+        assert info["identifiers"]["sponsor_protocol_id"]["method"] == identity.MODEL_METHOD
+        assert info["identifiers"]["sponsor_protocol_id"]["source"] == field["source"]
+        assert info["identifiers"]["sponsor_protocol_id"]["rules"] == {
+            "value": "I8R-JE-IGBJ", "method": rules["sponsor_protocol_id"]["method"]} == field["rules"]
+        assert info["identifiers"]["nct"] == base["identifiers"]["nct"]  # a rule's value: no "rules" key
+        assert info["version"]["date"]["value"] == "06-Dec-2017" and info["version"]["date"]["rules"] == {
+            "value": "05-Dec-2017", "method": base["version"]["date"]["method"]}
+        ident = d.search(IDENTITY_QUESTION, k=2)["identity"]
+        lines, old = ident["text"].splitlines(), before["text"].splitlines()
+        assert [x for x in lines if x not in old] == [source_line("Sponsor protocol number", "I8R-JE-IGBJ", field),
+                                                      "Version: 06-Dec-2017"]
+        assert [x for x in old if x not in lines][0].endswith('(source p. 1, header/footer: "I8R-JE-IGBJ(a) Clinical '
+                                                              'Pharmacology Protocol")')
+        assert before["provenance"]["refs"] == ["#/texts/0", "#/texts/2"]
+        assert ident["provenance"]["refs"] == ["#/texts/1", "#/texts/2"]
+        assert ident["text"] == info["identity_block"]
+
+
+@case
+def test_identity_json_not_used_is_warned_and_rebuilt():
+    """A chunks/identity.json of another Docling JSON, one built from other stats.json values or without the stamp of
+    them (stale), one that is not JSON and one of another schema each give the rules' values (document_info and search
+    equal those without the file; the model field inside is not shown) plus the warning with the reason, added once."""
+    if not public(LZZT):
+        return
+    import identity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = identity_folder("LZZT_CDISC_Pilot", tmp)
+        path = folder / "chunks" / identity.RECORD_FILE
+        plain = fake_open(folder)
+        info, found = plain.document_info(), plain.search(IDENTITY_QUESTION, k=2, rendered=True)
+        record = plain.rules_identity_record()
+        record["fields"]["acronym"] = model_field(plain, "XTP-1", "#/texts/1", None)  # shows if the file is used
+
+        def other_document():
+            identity.write_record(folder / "chunks", record, source_sha256="0123456789abcdef", meta=plain.meta,
+                                  model="a/model", prompt_version="x", llm={})
+
+        def stale():  # built from other stats.json values (chunk_protocol.py was run again since)
+            identity.write_record(folder / "chunks", record, source_sha256=plain.source_sha256,
+                                  meta={**plain.meta, "version_label": "Amendment 99"}, model="a/model",
+                                  prompt_version="x", llm={})
+
+        def unstamped():  # a record written before the stamp existed: stale too
+            stale()
+            data = json.loads(path.read_text(encoding="utf-8"))
+            del data["meta_sha256"]
+            path.write_text(json.dumps(data), encoding="utf-8")
+
+        writers = [("other_document", other_document), ("stale", stale), ("stale", unstamped),
+                   ("unreadable", lambda: path.write_text("{not json", encoding="utf-8")),
+                   ("schema", lambda: path.write_text(json.dumps({"schema": 99, "fields": {}}), encoding="utf-8"))]
+        for reason, write in writers:
+            write()
+            warning = f"chunks/identity.json not used ({reason}): the identity was rebuilt with the rules"
+            d = fake_open(folder)
+            assert d.warnings == info["warnings"] + [warning], reason  # loaded when the document is opened
+            got = d.document_info()
+            assert got["warnings"] == info["warnings"] + [warning], (reason, got["warnings"])
+            assert {k: v for k, v in got.items() if k != "warnings"} == {
+                k: v for k, v in info.items() if k != "warnings"}
+            assert got["titles"]["acronym"] is None
+            assert d.document_info()["warnings"] == got["warnings"], reason  # the warning is added once
+            assert d.search(IDENTITY_QUESTION, k=2, rendered=True) == found, reason
+            assert d.warnings == info["warnings"] + [warning], reason
+            # whichever tool comes first (not an identity tool) already carries the warning, once
+            first = fake_open(folder)
+            assert first.outline()["warnings"] == info["warnings"] + [warning], reason
+            assert first.outline()["warnings"] == first.warnings == first.document_info()["warnings"], reason
+
+
+@case
+def test_identity_json_of_other_stats_values_is_stale():
+    """The reviewer's probe: a rules record is written, then stats.json changes (chunk_protocol.py run again after a
+    rule change; here its version label): the record is stale. The warning, the rules' values of the new stats.json in
+    document_info, and the identity block of document_info and of search consistent with them (not the record's)."""
+    if not public(ALEXION):
+        return
+    import identity
+
+    stale = "chunks/identity.json not used (stale): the identity was rebuilt with the rules"
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = identity_folder("Alexion_NCT04573309", tmp)
+        plain = fake_open(folder)
+        record = plain.rules_identity_record()
+        assert record["fields"]["version_label"]["value"] == "Amendment 3"
+        path = identity.write_record(folder / "chunks", record, source_sha256=plain.source_sha256, meta=plain.meta)
+        fresh = fake_open(folder)
+        assert fresh.warnings == plain.warnings and fresh._stored_identity is not None  # the same stats: used
+        assert json.loads(path.read_text(encoding="utf-8"))["meta_sha256"] == identity.meta_stamp(plain.meta)
+        stats_path = folder / "chunks" / "stats.json"
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        stats["document"]["version_label"] = "Amendment 3.1 (US)"
+        stats_path.write_text(json.dumps(stats, indent=1, ensure_ascii=False), encoding="utf-8")
+        d = fake_open(folder)
+        assert d.warnings == plain.warnings + [stale], d.warnings
+        info = d.document_info()
+        assert info["warnings"] == plain.warnings + [stale]
+        assert info["version"]["label"] == "Amendment 3.1 (US)", info["version"]["label"]
+        assert info["version"]["label_detail"]["method"] == "stored"  # the new stats value, located in its item
+        assert d._identity_record() == d.rules_identity_record()
+        assert "Version: Amendment 3.1 (US), 18 Mar 2022" in info["identity_block"].splitlines()
+        ident = d.search(IDENTITY_QUESTION, k=2)["identity"]
+        assert ident["text"] == info["identity_block"]
+        assert d.warnings == plain.warnings + [stale]  # once
+
+
+@case
+def test_identity_json_model_version_replaces_the_rules_version():
+    """Alexion: a version label and amendment the rules found, replaced by a model's. Without the file version.label /
+    amendment_detail carry the rules' method and source; with it MODEL_METHOD, the cited source and the replaced rule
+    value and method; "label" / "amendment" stay the plain values; the date, the provenance and the other lines stay."""
+    if not public(ALEXION):
+        return
+    import identity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = identity_folder("Alexion_NCT04573309", tmp)
+        plain = api.ProtocolDocument.open(folder)
+        base, record = plain.document_info(), plain.rules_identity_record()
+        rules = copy.deepcopy(record["fields"])
+        ver = base["version"]
+        assert (ver["label"], ver["amendment"]) == ("Amendment 3", "3")
+        for detail, key in (("label_detail", "version_label"), ("amendment_detail", "amendment")):
+            v = ver[detail]  # rules only: the rule's method and source, no "rules"
+            assert v == {"value": rules[key]["value"], "method": rules[key]["method"], "source": rules[key]["source"]}
+            assert v["method"] != identity.MODEL_METHOD and set(v["source"]) == SOURCE_KEYS, detail
+        label = model_field(plain, "Amendment 4", "#/texts/1", rules["version_label"])
+        number = model_field(plain, "4", "#/texts/1", rules["amendment"])
+        record["fields"].update({"version_label": label, "amendment": number})
+        identity.write_record(folder / "chunks", record, source_sha256=plain.source_sha256, meta=plain.meta,
+                              model="a/model", prompt_version="x", llm={})
+        info = api.ProtocolDocument.open(folder).document_info()
+        got = info["version"]
+        assert (got["label"], got["amendment"]) == ("Amendment 4", "4")
+        assert got["label_detail"] == {"value": "Amendment 4", "method": identity.MODEL_METHOD,
+                                       "source": label["source"],
+                                       "rules": {"value": "Amendment 3", "method": rules["version_label"]["method"]}}
+        assert got["amendment_detail"] == {"value": "4", "method": identity.MODEL_METHOD, "source": number["source"],
+                                           "rules": {"value": "3", "method": rules["amendment"]["method"]}}
+        assert {k: v for k, v in got.items() if k not in ("label", "amendment", "label_detail", "amendment_detail")} \
+            == {k: v for k, v in ver.items() if k not in ("label", "amendment", "label_detail", "amendment_detail")}
+        assert info["provenance"] == base["provenance"]  # the details are not part of the provenance
+        before, lines = base["identity_block"].splitlines(), info["identity_block"].splitlines()
+        assert [x for x in before if x not in lines] == ["Version: Amendment 3, 18 Mar 2022"]
+        assert [x for x in lines if x not in before] == ["Version: Amendment 4, 18 Mar 2022"]
+
+
+@case
+def test_identity_record_is_loaded_once_and_shared_with_the_search_builder():
+    """The document loads chunks/identity.json once, when it is opened, and gives that record to its search builder: the
+    identity block text and the refs of its "(source ...)" lines come from the same record, whatever the file says
+    later (here it is rewritten before the first search)."""
+    if not public(LZZT):
+        return
+    import identity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = identity_folder("LZZT_CDISC_Pilot", tmp)
+        plain = fake_open(folder)
+        record = plain.rules_identity_record()
+        rules = copy.deepcopy(record["fields"])
+        record["fields"]["acronym"] = model_field(plain, "XTP-1", "#/texts/1", rules["acronym"])
+        record["fields"]["nct"] = model_field(plain, "NCT00000001", "#/texts/3", rules["nct"])
+        write = lambda rec: identity.write_record(  # noqa: E731
+            folder / "chunks", rec, source_sha256=plain.source_sha256, meta=plain.meta, model="a/model",
+            prompt_version="x", llm={})
+        write(record)
+        calls, real_api, real_identity = [], api.load_record, identity.load_record
+
+        def counting(*args, **kwargs):
+            calls.append(args[0])
+            return real_identity(*args, **kwargs)
+
+        api.load_record = identity.load_record = counting
+        try:
+            d = fake_open(folder)
+            assert len(calls) == 1  # at open
+            other = copy.deepcopy(record)  # another record, written after the document was opened
+            other["fields"]["acronym"] = model_field(plain, "OTHER-2", "#/texts/0", rules["acronym"])
+            other["fields"]["nct"] = model_field(plain, "NCT00000002", "#/texts/0", rules["nct"])
+            write(other)
+            info = d.document_info()
+            res = d.search(IDENTITY_QUESTION, k=2, rendered=True)
+            d.search("What is the study design?", k=2)
+        finally:
+            api.load_record, identity.load_record = real_api, real_identity
+        assert len(calls) == 1, calls  # document_info and both searches loaded nothing more
+        assert info["titles"]["acronym"]["value"] == "XTP-1" and info["identifiers"]["nct"]["value"] == "NCT00000001"
+        ident = res["identity"]
+        assert "Acronym: XTP-1" in ident["text"]
+        assert "OTHER-2" not in ident["text"] and "NCT00000002" not in ident["text"]
+        assert ident["text"] == info["identity_block"]
+        found = identity_lines(ident["text"])
+        assert [(p, q) for _, p, _, q in found][-1] == (record["fields"]["nct"]["source"]["page"],
+                                                        record["fields"]["nct"]["source"]["text"])
+        assert ident["provenance"]["refs"][-1] == "#/texts/3" == info["identifiers"]["nct"]["source"]["ref"]
+        assert len(found) == len(ident["provenance"]["refs"]) == 2
+
+
+@case
+def test_identity_json_missing_adds_no_warning():
+    """No chunks/identity.json (the usual state of an older output) is not a problem: no warning, the rules' record."""
+    if not public(LZZT):
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = identity_folder("LZZT_CDISC_Pilot", tmp)
+        assert not (folder / "chunks" / "identity.json").exists()
+        d = api.ProtocolDocument.open(folder)
+        before = list(d.warnings)
+        info = d.document_info()
+        assert info["warnings"] == before and not any("identity.json" in w for w in d.warnings)
+        assert info["identity_block"].startswith("Title: Safety and Efficacy of the Xanomeline")
 
 
 # =========================================================================== outline / find

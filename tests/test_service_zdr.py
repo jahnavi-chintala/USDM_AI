@@ -35,6 +35,9 @@ unsets it inside a block and restores it. All content is synthetic (made-up text
   7. retries (429 / 503 / transport error, then 200; and exhausted) resend the same body on every attempt
   8. the shared client: one per process, made once even by concurrent first requests, reused by every call site and
      thread; no cookie kept or sent; none made by importing the modules
+  9. the identity check (identity_llm.refine / ask_model) on a synthetic title page: the numbered lines and the rule
+     values only, a cache hit sends nothing, offline refuses before anything is sent or written (a cached answer still
+     works), retries resend the same body, errors carry no response text
 Output: counts and booleans only.
 """
 
@@ -238,11 +241,12 @@ SET_COOKIES = [("set-cookie", "__cf_bm=made-up-cdn-token; Path=/; Domain=.openro
 
 class FakeOpenRouter:
     """Records every request; answers by path. `script`: per request in order, "ok", an HTTP status (int) or
-    "connect_error"; after the script, "ok"."""
+    "connect_error"; after the script, "ok". `chat_content`: the chat answer's text (default: a figure description)."""
 
-    def __init__(self, script=()) -> None:
+    def __init__(self, script=(), chat_content: str = "A made-up chart with one horizontal line.") -> None:
         self.requests: list[Captured] = []
         self.script = list(script)
+        self.chat_content = chat_content
         self.lock = threading.Lock()
 
     def handle(self, request, transport=None):
@@ -264,8 +268,7 @@ class FakeOpenRouter:
             answer = {"results": [{"index": i, "relevance_score": round(1.0 / (i + 1), 4)}
                                   for i in range(len(body["documents"]))]}
         elif cap.path.endswith("/chat/completions"):
-            answer = {"choices": [{"message": {"role": "assistant",
-                                               "content": "A made-up chart with one horizontal line."}}],
+            answer = {"choices": [{"message": {"role": "assistant", "content": self.chat_content}}],
                       "usage": {"prompt_tokens": 11, "completion_tokens": 7}}
         else:
             return httpx.Response(404, text="unknown path", request=request, headers=SET_COOKIES)
@@ -469,6 +472,30 @@ def figure_image():
     return d.pictures[0].get_image(d).convert("RGB")
 
 
+IDENTITY_LINES = ("Protocol Title: A Phase 3 Study of Zorblat in Adults With a Made-up Condition",
+                  "Protocol Number: QX-4417", "Short Title: QUOXA-7 Zorblat Study",
+                  "Sponsor: Quoxa Made-up Pharma GmbH")
+
+
+def identity_doc():
+    """A synthetic two-page document: a title page of four lines and a running header (made-up content)."""
+    from docling_core.types.doc import (BoundingBox, ContentLayer, CoordOrigin, DocItemLabel, DoclingDocument,
+                                        ProvenanceItem, Size)
+
+    def prov(page, top):
+        return ProvenanceItem(page_no=page, bbox=BoundingBox(l=72, t=top, r=540, b=top - 14,
+                                                             coord_origin=CoordOrigin.BOTTOMLEFT), charspan=(0, 0))
+
+    d = DoclingDocument(name="zdr-identity-fixture")
+    for page in (1, 2):
+        d.add_page(page_no=page, size=Size(width=612, height=792))
+        d.add_text(DocItemLabel.PAGE_HEADER, "Quoxa protocol QX-4417 Amendment 2", prov=prov(page, 780),
+                   content_layer=ContentLayer.FURNITURE)
+    for i, text in enumerate(IDENTITY_LINES):
+        d.add_text(DocItemLabel.TEXT, text, prov=prov(1, 700 - 30 * i))
+    return d
+
+
 # ---------------------------------------------------------------- 0. the guards themselves
 
 
@@ -520,6 +547,11 @@ EXPECTED_INVENTORY = sorted([
     ("figure_vlm.py", "OpenRouterRunner.ask", "provider:zdr"),
     ("figure_vlm.py", "describe_missing", "call:OpenRouterRunner"),
     ("figure_vlm.py", "main", "call:OpenRouterRunner"),  # the command line (--openrouter): the same client
+    ("identity_llm.py", "<module>", "url:https://openrouter.ai/api/v1/chat/completions"),
+    ("identity_llm.py", "ask_model", "import:httpx"),  # httpx.TransportError, retried
+    ("identity_llm.py", "ask_model", "import:openrouter_http.post_json"),
+    ("identity_llm.py", "ask_model", "call:openrouter_http.post_json"),
+    ("identity_llm.py", "ask_model", "provider:zdr"),
     ("openrouter_http.py", "_client", "import:httpx"),
     ("openrouter_http.py", "_client", "call:httpx.Client"),  # the one client: shared_client_problems()
     ("retrieve.py", "<module>", "url:https://openrouter.ai/api/v1/rerank"),
@@ -1391,6 +1423,67 @@ def test_no_cookie_is_kept() -> None:
         assert len(openrouter_http._shared[1].cookies.jar) == 0
 
 
+# ---------------------------------------------------------------- 9. the identity check
+
+
+def test_identity_check_zdr() -> None:
+    import identity_llm as il
+    from identity import build_identity
+    from retrieve import OfflineRefused
+
+    model = "openrouter:made-up-vendor/text-model-x"
+    doc = identity_doc()
+    lines = il.select_lines(doc)
+    short = next(x["id"] for x in lines if x["text"].startswith("Short Title"))
+    record = build_identity(doc, section_of=lambda r: None)
+    answer = json.dumps({"fields": {"acronym": {"value": "QUOXA-7", "lines": [short]}}})
+
+    def refine(cache):
+        return il.refine(doc, record, model=model, cache_dir=cache, section_of=lambda r: None)
+
+    with temp_dir() as tmp, online(), intercept(FakeOpenRouter(chat_content=answer)) as fake, capture_logs() as logs:
+        cache = tmp / "Private Folder QX" / "identity"
+        refined, llm = refine(cache)
+        assert llm["cache"] == "miss" and "acronym" in llm["accepted"], llm
+        assert len(fake.requests) == 1, fake.paths()
+        req = fake.requests[0]
+        assert_openrouter(req, "/api/v1/chat/completions")
+        assert set(req.body) == {"model", "temperature", "max_tokens", "messages", "provider"}, sorted(req.body)
+        assert req.body["model"] == model.split(":", 1)[1] and req.body["temperature"] == 0
+        assert all(t.encode() in req.raw for t in ("Zorblat", "QX-4417"))  # the lines themselves
+        assert b"zdr-identity-fixture" not in req.raw and not any(f in req.raw for f in path_forms(tmp))
+        assert refine(cache)[1]["cache"] == "hit" and len(fake.requests) == 1  # a cache hit sends nothing
+        assert_key_hidden(logs, folders=[tmp])
+    # offline: refused before anything is sent or written; an answer already cached still works
+    with temp_dir() as tmp, intercept(FakeOpenRouter(chat_content=answer)) as fake:
+        with online():
+            refine(tmp / "filled")
+        for k, spelling in enumerate(("1", "true", "yes", "on", " 1 ")):
+            with env(OPENROUTER_OFFLINE=spelling):
+                expect_error(lambda: refine(tmp / f"empty{k}"), OfflineRefused)
+                assert not (tmp / f"empty{k}").exists() or not any((tmp / f"empty{k}").iterdir())
+                assert refine(tmp / "filled")[1]["cache"] == "hit"
+        assert len(fake.requests) == 1
+    # retries resend the same body; an error carries no response text
+    messages = il.build_messages(lines, record)
+    with temp_dir() as tmp, online(), no_sleep(), capture_logs() as logs:
+        texts = []
+        for script, n, ok in (([429, "ok"], 2, True), (["connect_error", "ok"], 2, True), ([500, 500, 500], 3, False),
+                              ([400], 1, False)):
+            with intercept(FakeOpenRouter(script=script, chat_content=answer)) as fake:
+                if ok:
+                    il.ask_model(messages, model)
+                else:
+                    exc = expect_error(lambda: il.ask_model(messages, model), il.IdentityModelError)
+                    assert "simulated" not in str(exc), "response text in the error"
+                    texts.append(str(exc))
+            assert len(fake.requests) == n, (script, len(fake.requests))
+            for r in fake.requests:
+                assert_openrouter(r, "/api/v1/chat/completions")
+                assert r.raw == fake.requests[0].raw and r.headers == fake.requests[0].headers
+        assert_key_hidden(logs, texts=texts, folders=[tmp])
+
+
 # A fresh interpreter (this one imported the modules long ago): importing the request modules loads no HTTP stack, and
 # importing the service's entry modules (API and pipeline) on top makes no client; no network either.
 IMPORT_PROBE = r"""
@@ -1424,7 +1517,7 @@ def getaddrinfo(host, *args, **kwargs):
 
 
 socket.socket.connect, socket.getaddrinfo = connect, getaddrinfo
-import embed_chunks, figure_vlm, openrouter_http, retrieve
+import embed_chunks, figure_vlm, identity_llm, openrouter_http, retrieve
 httpx_loaded = "httpx" in sys.modules
 import httpx
 

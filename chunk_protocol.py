@@ -28,7 +28,7 @@ regenerated. See reports/chunking_design.md for the reasoning. Choices:
   * Document metadata (id, version, date, acronym) is detected from content
     (doc_metadata, built on detect_metadata, which also names the rule and the
     source item of each value; identity.py keeps those); the prefix holds
-    only fields found. Chunk ids are
+    only fields found, never the file name. Chunk ids are
     "{protocol_id}-A{amendment}-NNNN" when both are known, else
     "doc-<source sha>-NNNN". section_number uses only section numbers the
     heading-level step accepted. --quiet-text logs counts only.
@@ -1110,8 +1110,11 @@ def registry_identifiers(doc: DoclingDocument, meta: dict[str, Any] | None = Non
 
 
 def doc_prefix(meta: dict[str, Any]) -> str:
-    """Embedding-text prefix from the fields that were found ("None" is never written)."""
-    prefix = f"{meta['acronym'] or meta['doc_name']} protocol"
+    """Embedding-text prefix from the fields that were found ("None" is never written): "<ACRONYM> protocol <id>
+    (<version label>, <date>)", or "Protocol <id> (...)" without an acronym. Never the file name: the same PDF gets
+    the same embedding texts and chunk boundaries (the prefix counts against the token budget) whatever its Docling
+    JSON is called (the service names every result protocol.json)."""
+    prefix = f"{meta['acronym']} protocol" if meta["acronym"] else "Protocol"
     if meta["protocol_id"]:
         prefix += f" {meta['protocol_id']}"
     extra = [v for v in (meta["version_label"], meta["version_date"]) if v]

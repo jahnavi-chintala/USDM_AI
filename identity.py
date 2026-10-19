@@ -27,12 +27,25 @@ through the stored version label ("Amendment 4"), in that label's item (without 
 ref is the item the text was taken from (a table row: the table's ref, with row = the index in table.data.grid),
 refs every item the text spans (a cover label and its value on the next line: both; the first is ref), section_id
 the section of ref (None for header/footer items).
+
+The stored record, chunks/identity.json (write_record / load_record), is this record plus where it comes from:
+    {"schema", "source_sha256" (of the Docling JSON, as stats.json "document"), "meta_sha256" (meta_stamp of the
+     stats.json "document" block the rule values were built from), "pipeline_version", "model" (None: rules only),
+     "prompt_version", "fields", "cover_page", "others", "llm" (None: rules only)}
+A field a model chose (identity_llm) has method MODEL_METHOD, its source from the lines it cited, and "rules":
+{"value", "method"} when it replaced a rule value. A record whose meta_sha256 is not the stamp of the stats.json the
+reader holds (chunk_protocol.py was run again, or the record predates the stamp) is "stale": the reader rebuilds the
+rules record from that stats.json.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Any, Callable
 
 from docling_core.types.doc import ContentLayer, DoclingDocument, TableItem, TextItem
@@ -65,6 +78,7 @@ _COVER_FIELDS = [  # (field, label regex); order matters ("short title" before "
     ("approval_date", r"(?:protocol\s+)?(?:approval|issue|release|effective|version|document|protocol)\s+date|date\s+of\s+(?:protocol|issue|approval)"),
 ]
 _COVER_RX = [(f, re.compile(rf"(?i)^\s*(?:{rx})\s*(?:\([^)]{{0,40}}\))?\s*[:：]\s*(?P<value>.*)$")) for f, rx in _COVER_FIELDS]
+_LABEL_LINE = re.compile(r"[^:：]{1,60}[:：]")  # a short line ending with a colon: a label of its own, not a value
 _COPYRIGHT = re.compile(r"(?i:copyright)\s*(?:©|\((?i:c)\))?\s*(?:\d{4}(?:\s*[-–,]\s*\d{4})?\s*)?(?:(?i:by)\s+)?"
                         r"(?P<name>[A-Z][\w&'.-]*(?:\s+(?:[A-Z][\w&'.-]*|and|&|of))*)")
 _PROPERTY = re.compile(r"(?i:property\s+of)\s+(?:(?i:the)\s+)?"
@@ -96,7 +110,9 @@ def _sponsor_name(value: str) -> str:
 def cover_fields(doc: DoclingDocument) -> dict[str, dict]:
     """Label/value pairs of the title pages (pp. 1-3: "Short Title: ...", "Sponsor Name:" + the next line, ...):
     {field: {"value", "page", "text", "refs"}}; the first item per label wins, a value on the line after its
-    label lists both items (text "label / value")."""
+    label lists both items (text "label / value"). That next line is a value only when it is not itself a label:
+    one of the cover labels, or a short line ending with a colon ("Approval Date:" followed by "Sponsor
+    Signatory:" gives no approval date)."""
     items = [(t, _pages_of(t)[0]) for t, _ in doc.iterate_items(with_groups=False)
              if isinstance(t, TextItem) and t.text.strip() and _pages_of(t) and _pages_of(t)[0] <= 3]
     out: dict[str, dict] = {}
@@ -116,7 +132,7 @@ def cover_fields(doc: DoclingDocument) -> dict[str, dict]:
         value, src = m.group("value").strip(), [t]
         if not value and i + 1 < len(items) and items[i + 1][1] == page:
             nxt = _clean(items[i + 1][0].text)
-            if label_of(nxt)[0] is None and len(nxt) <= 400:
+            if label_of(nxt)[0] is None and not _LABEL_LINE.fullmatch(nxt) and len(nxt) <= 400:
                 value, src = nxt, [t, items[i + 1][0]]
         if value:
             out[f] = {"value": value, "page": page, "text": " / ".join(_clean(x.text) for x in src),
@@ -322,3 +338,98 @@ def build_identity(doc: DoclingDocument, meta: dict | None = None, *,
                        for k, v in cover.items()},
         "others": {k: list(v) for k, v in (stored_ids.get("others") or {}).items()},
     }
+
+
+# =========================================================================== the stored record (chunks/identity.json)
+# Written by the identity stage (identity_llm.run_identity) after chunking: the rules record, or the rules record with
+# the fields a model chose and the code verified in the cited lines. document_info, search, the production context's
+# identity block and the service's identifiers read it when it belongs to this Docling JSON, else build the rules
+# record themselves.
+
+RECORD_FILE = "identity.json"
+MODEL_METHOD = "model selection, verified in the cited lines"
+
+
+def meta_stamp(meta: dict) -> str:
+    """The stamp of a stats.json "document" block (first 16 hex digits of the SHA-256 of its sorted JSON): ties a
+    stored record to the stats values its rule values come from."""
+    text = json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def write_record(chunks_dir: str | Path, record: dict, *, source_sha256: str | None, meta: dict,
+                 model: str | None = None, prompt_version: str | None = None, llm: dict | None = None) -> Path:
+    """Write chunks/identity.json (the layout in the module docstring) and return its path. meta: the stats.json
+    "document" block the record was built from (stored as its meta_stamp). The same input gives the same bytes (no
+    timestamps; LF line ends); written to a temporary file first, then moved into place. Without a model,
+    prompt_version and llm are stored as None."""
+    from pipeline_version import PIPELINE_VERSION
+
+    out = {"schema": SCHEMA, "source_sha256": source_sha256, "meta_sha256": meta_stamp(meta),
+           "pipeline_version": PIPELINE_VERSION,
+           "model": model or None, "prompt_version": prompt_version if model else None,
+           "fields": {k: record["fields"].get(k) for k in FIELDS},
+           "cover_page": record.get("cover_page") or {}, "others": record.get("others") or {},
+           "llm": llm if model else None}
+    path = Path(chunks_dir) / RECORD_FILE
+    tmp = path.with_name(RECORD_FILE + ".tmp")
+    tmp.write_text(json.dumps(out, indent=1, ensure_ascii=False), encoding="utf-8", newline="\n")
+    os.replace(tmp, path)
+    return path
+
+
+_SOURCE_KEYS = ("page", "layer", "text", "ref", "refs", "row", "section_id")
+
+
+def _valid_source(src: Any) -> bool:
+    return (isinstance(src, dict) and all(k in src for k in _SOURCE_KEYS) and isinstance(src["text"], str)
+            and isinstance(src["refs"], list) and all(isinstance(r, str) for r in src["refs"])
+            and (src["ref"] is None or isinstance(src["ref"], str)))
+
+
+def _valid_field(key: str, f: Any) -> bool:
+    if f is None:
+        return True
+    if not (isinstance(f, dict) and isinstance(f.get("value"), str) and f["value"]
+            and (f.get("method") is None or isinstance(f["method"], str))
+            and (f.get("source") is None or _valid_source(f["source"]))):
+        return False
+    if "rules" in f and not (isinstance(f["rules"], dict) and {"value", "method"} <= set(f["rules"])):
+        return False
+    return key != "sponsor" or (isinstance(f.get("verbatim"), str) and _valid_source(f.get("source")))
+
+
+def _valid_record(data: Any) -> bool:
+    """The shape the readers rely on: every field None or {"value", "method", "source"} (a sponsor with its
+    "verbatim" and a source), cover-page pairs with value / page / text / refs, others as lists."""
+    if not (isinstance(data, dict) and data.get("schema") == SCHEMA and isinstance(data.get("fields"), dict)
+            and isinstance(data.get("cover_page"), dict) and isinstance(data.get("others"), dict)):
+        return False
+    if not all(k in data["fields"] and _valid_field(k, data["fields"][k]) for k in FIELDS):
+        return False
+    if not all(isinstance(c, dict) and isinstance(c.get("value"), str) and isinstance(c.get("text"), str)
+               and isinstance(c.get("refs"), list) and c["refs"] and "page" in c for c in data["cover_page"].values()):
+        return False
+    return all(isinstance(v, list) for v in data["others"].values())
+
+
+def load_record(chunks_dir: str | Path, source_sha256: str | None,
+                meta: dict | None = None) -> tuple[dict | None, str | None]:
+    """(the stored record, None), or (None, why not), checked in this order: "missing"; "unreadable" (not JSON);
+    "schema" (another schema or a shape the readers cannot use, see _valid_record); "other_document" (written for
+    another Docling JSON: its source_sha256 differs, or either is unknown); "stale" (meta given: the record's
+    meta_sha256 is missing or is not meta_stamp(meta), i.e. it was built from other stats.json values)."""
+    path = Path(chunks_dir) / RECORD_FILE
+    if not path.is_file():
+        return None, "missing"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, "unreadable"
+    if not _valid_record(data):
+        return None, "schema"
+    if not source_sha256 or data.get("source_sha256") != source_sha256:
+        return None, "other_document"
+    if meta is not None and data.get("meta_sha256") != meta_stamp(meta):
+        return None, "stale"
+    return data, None

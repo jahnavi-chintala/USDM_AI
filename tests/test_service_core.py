@@ -30,7 +30,7 @@ from service.pipeline import IDENTIFIER_KEYS  # noqa: E402
 from service.registry import (MAX_ATTEMPTS, DocumentBusy, Registry, inspect_pdf, inspect_pdf_in_process,  # noqa: E402
                               normalise_text, page_count, text_fingerprint)
 from service.storage import LocalStorage, UnsafePath, UploadRejected  # noqa: E402
-from service.worker import Worker  # noqa: E402
+from service.worker import Worker, result_from_json  # noqa: E402
 
 # ---------------------------------------------------------------- a minimal PDF writer (from test_text_reconcile)
 
@@ -110,6 +110,19 @@ def fake_pipeline(pdf_path, workdir, config, *, settings=None, progress=None, pa
                               "sponsor_protocol_id": sponsor.group(1).decode() if sponsor else None,
                               "version": None, "date": None, "sources": {"nct": {"text": "quoted text"}}},
         quality={"score": 1.0}, warnings=[], stages=[StageResult(name=s, status="done") for s in STAGES])
+
+
+OLD_STAGES = tuple(s for s in STAGES if s != "identity")  # the stages of a result made before the identity stage
+
+
+def old_stages_pipeline(pdf_path, workdir, config, *, settings=None, progress=None, password=None):
+    """fake_pipeline as an older pipeline version ran it: no identity stage."""
+    result = fake_pipeline(pdf_path, workdir, config, settings=settings, password=password)
+    for i, stage in enumerate(OLD_STAGES, 1):
+        if progress:
+            progress(stage, i, len(OLD_STAGES))
+    result.stages = [StageResult(name=s, status="done") for s in OLD_STAGES]
+    return result
 
 
 def failing_pipeline(pdf_path, workdir, config, **kwargs):
@@ -243,6 +256,10 @@ def test_safe_file_lookup() -> None:
         for bad_id in ("../" + doc, doc.upper(), "x" * 64, doc[:-1]):
             expect(UnsafePath, storage.resolve_file, bad_id, "protocol.md")
         expect(FileNotFoundError, storage.resolve_file, doc, "quality.json")  # allowed but not written
+        assert "chunks/identity.json" in st.SAFE_FILES
+        expect(FileNotFoundError, storage.resolve_file, doc, "chunks/identity.json")  # a result made before the stage
+        (storage.document_dir(doc) / "chunks" / "identity.json").write_text('{"titles": {}}', encoding="utf-8")
+        assert storage.resolve_file(doc, "chunks/identity.json").read_text(encoding="utf-8") == '{"titles": {}}'
         expect(FileNotFoundError, storage.resolve_file, "f" * 64, "protocol.md")  # unknown document
         try:  # a link inside the folder pointing outside it is refused too (needs symlink rights on Windows)
             os.symlink(config.registry_path, storage.document_dir(doc) / "images" / "link.png")
@@ -379,7 +396,7 @@ def test_duplicate_identical_and_in_progress() -> None:
         assert len(registry.list_jobs(doc_id=r1["doc_id"])) == 1 and len(CALLS) == 1
         assert storage.list_workdirs() == []  # duplicates leave no scratch behind
         j = registry.get_job(r1["job_id"])
-        assert j["stage"] == "quality" and j["progress"] == {"done": 8, "total": 8} and j["attempts"] == 1
+        assert j["stage"] == "quality" and j["progress"] == {"done": 9, "total": 9} and j["attempts"] == 1
         assert [s["name"] for s in j["stages"]] == list(STAGES) and j["error"] is None
 
 
@@ -483,6 +500,42 @@ def test_failed_job_keeps_completed_stages() -> None:
         worker(config, registry, storage).run_once()
         missing = registry.get_job(r3["job_id"])
         assert missing["state"] == "failed" and missing["error"]["type"] == "SourceMissing" and missing["stages"] == []
+
+
+def test_stage_list_and_results_before_identity() -> None:
+    """"identity" runs between chunk and embed; a result stored before that stage existed (no such entry in its
+    stages) still loads: as a finished job, from publish.json after a crash, and through result_from_json."""
+    assert STAGES[STAGES.index("chunk"):STAGES.index("chunk") + 3] == ("chunk", "identity", "embed")
+    assert len(STAGES) == 9 and OLD_STAGES == ("hash", "convert", "postprocess", "figures", "save", "chunk", "embed",
+                                               "quality")
+    reset()
+    with env() as (config, storage, registry):
+        w = worker(config, registry, storage, old_stages_pipeline)
+        r = ingest(registry, storage, make_pdf("Stored before identity"))
+        w.run_until_idle()
+        job = registry.get_job(r["job_id"])
+        assert job["state"] == "done" and job["stage"] == "quality", job
+        assert [s["name"] for s in job["stages"]] == list(OLD_STAGES) and job["progress"] == {"done": 8, "total": 8}
+        doc = registry.get_document(r["doc_id"], pipeline_version="1.0.0", fingerprint="fp-one")
+        assert doc["status"] == "done" and doc["has_result"] and not doc["stale"], doc
+        assert [s["name"] for s in doc["current_job"]["stages"]] == list(OLD_STAGES)
+        record = storage.read_publish_record(r["doc_id"])
+        loaded = result_from_json(record["result"])
+        assert [s.name for s in loaded.stages] == list(OLD_STAGES) and loaded.status == "done"
+        # a crash after the publish: recovery records the job from publish.json, whose stages predate the stage
+        r2 = ingest(registry, storage, make_pdf("Stored before identity, recovered"))
+        registry.record_success = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated crash"))
+        assert w._run(registry.claim_next_job()) == "running"
+        del registry.record_success
+        report = worker(config, registry, LocalStorage(config)).recover()
+        assert report["recorded"] == [r2["job_id"]], report
+        recovered = registry.get_job(r2["job_id"])
+        assert recovered["state"] == "done" and [s["name"] for s in recovered["stages"]] == list(OLD_STAGES)
+        # the current pipeline's run of the same document replaces it with the full list
+        CURRENT.update(version="1.1.0", fingerprint="fp-two")
+        again = ingest(registry, storage, make_pdf("Stored before identity"), reprocess=True)
+        worker(config, registry, storage).run_until_idle()
+        assert [s["name"] for s in registry.get_job(again["job_id"])["stages"]] == list(STAGES)
 
 
 def test_same_text_warning() -> None:
@@ -693,6 +746,68 @@ def test_delete_document() -> None:
         assert registry.list_documents() == [] and registry.list_jobs() == [] and storage.list_documents() == []
         assert not registry.delete_document(done["doc_id"], storage)
         assert w.run_once() is None
+
+
+def test_purge_caches_removes_one_documents_entries() -> None:
+    """LocalStorage.purge_caches: the document's conversion batches and, given its figure cache key, the entries of
+    that key in the figure cache and in the identity cache (the identity cache folder is created with the others);
+    other documents' entries, unreadable files and entries without a key stay."""
+    reset()
+    with env() as (config, storage, registry):
+        assert config.identity_cache_dir == config.cache_dir / "identity" and config.identity_cache_dir.is_dir()
+        doc_id, key, other = "a" * 64, "doc-0123456789ab", "doc-ba9876543210"
+        vlm, identity, batches = config.vlm_cache_dir, config.identity_cache_dir, config.batch_cache_dir
+        entries = {"vlm": (vlm, {"mine": key, "other": other}),
+                   "identity": (identity, {"mine-model-a": key, "mine-model-b": key, "other": other})}
+        for folder, named in entries.values():
+            for name, doc_key in named.items():
+                (folder / f"{name}.json").write_text(json.dumps({"doc_key": doc_key, "answer": "made up"}),
+                                                     encoding="utf-8")
+            (folder / "broken.json").write_text("{not json", encoding="utf-8")
+            (folder / "list.json").write_text("[1]", encoding="utf-8")
+            (folder / "nokey.json").write_text("{}", encoding="utf-8")
+            (folder / "note.txt").write_text(json.dumps({"doc_key": key}), encoding="utf-8")
+        run = batches / doc_id[:16] / "layout-cfg"
+        run.mkdir(parents=True)
+        for f in ("0001-0015.json", "manifest.json"):
+            (run / f).write_text("{}", encoding="utf-8")
+        # without the figure cache key only the batches go
+        assert storage.purge_caches(doc_id) == {"batches": 1, "figures": 0, "identity": 0}
+        assert len(list(vlm.glob("*"))) == 6 and len(list(identity.glob("*"))) == 7
+        assert storage.purge_caches(doc_id, key) == {"batches": 0, "figures": 1, "identity": 2}
+        assert sorted(p.name for p in vlm.glob("*")) == ["broken.json", "list.json", "nokey.json", "note.txt",
+                                                         "other.json"]
+        assert sorted(p.name for p in identity.glob("*")) == ["broken.json", "list.json", "nokey.json", "note.txt",
+                                                              "other.json"]
+        assert storage.purge_caches(doc_id, key) == {"batches": 0, "figures": 0, "identity": 0}  # nothing left
+        expect(UnsafePath, storage.purge_caches, "not-a-doc-id", key)
+        # an entry that cannot be deleted (a locked file on Windows) stays and does not stop the purge
+        for folder in (vlm, identity):
+            for name in ("a-locked", "b-free"):
+                (folder / f"{name}.json").write_text(json.dumps({"doc_key": key}), encoding="utf-8")
+        real_unlink = Path.unlink
+
+        def locked_unlink(self, missing_ok=False):
+            if self.name == "a-locked.json":
+                raise PermissionError(13, "in use")
+            return real_unlink(self, missing_ok=missing_ok)
+
+        Path.unlink = locked_unlink
+        try:
+            assert storage.purge_caches(doc_id, key) == {"batches": 0, "figures": 1, "identity": 1}
+        finally:
+            Path.unlink = real_unlink
+        for folder in (vlm, identity):
+            assert (folder / "a-locked.json").is_file() and not (folder / "b-free.json").exists()
+        assert storage.purge_caches(doc_id, key) == {"batches": 0, "figures": 1, "identity": 1}  # next time it goes
+        # a temporary file a killed process left ("<doc_key>.<random>.tmp", a real 16-hex key) goes too, uncounted;
+        # another document's stays
+        hexkey, otherhex = "0123456789abcdef", "fedcba9876543210"
+        (identity / f"{hexkey}.k3j2.tmp").write_text('{"doc_key": "partial', encoding="utf-8")
+        (identity / f"{otherhex}.z9.tmp").write_text("{", encoding="utf-8")
+        assert storage.purge_caches(doc_id, hexkey) == {"batches": 0, "figures": 0, "identity": 0}
+        assert sorted(p.name for p in identity.glob("*.tmp")) == [f"{otherhex}.z9.tmp"]
+        (identity / f"{otherhex}.z9.tmp").unlink()
 
 
 # ---------------------------------------------------------------- import of existing outputs

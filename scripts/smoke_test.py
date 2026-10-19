@@ -435,6 +435,9 @@ def openrouter_notice(run: Run) -> str:
              f"{', '.join(d.name for d in run.docs)} makes it send to OpenRouter (zero-data-retention routing, "
              "no fallbacks):",
              f"  - every figure image not yet in its figure cache -> {config.get('figure_model') or '(none)'}",
+             *([f"  - the first three pages' text and the running headers/footers of every document not yet in its "
+                f"identity cache (one request each) -> {config['identity_model']}"]
+               if config.get("identity_model") else []),
              f"  - the text of every chunk not yet in its embedding cache -> {config.get('embed_model')}",
              f"  - search checks: the query {SEARCH_QUERY!r} -> {config.get('embed_model')}, and the query with the "
              f"candidate chunk texts -> {config.get('rerank_model')}",

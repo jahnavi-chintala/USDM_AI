@@ -5,7 +5,7 @@
 import { PATHS, get, post } from "./api.js";
 import { badge, button, fmtSeconds, h, icon, parseDate, shortId, toast } from "./dom.js";
 
-export const STAGES = ["hash", "convert", "postprocess", "figures", "save", "chunk", "embed", "quality"];
+export const STAGES = ["hash", "convert", "postprocess", "figures", "save", "chunk", "identity", "embed", "quality"];
 export const FINAL = new Set(["done", "done_with_warnings", "failed", "cancelled"]);
 const STAGE_HELP = {
   hash: "SHA-256 of the PDF",
@@ -14,6 +14,7 @@ const STAGE_HELP = {
   figures: "figure descriptions (OpenRouter vision model; skipped offline)",
   save: "Markdown, JSON, HTML, images, tables",
   chunk: "chunks, parents, section index, glossary",
+  identity: "identity record: titles, sponsor, ids, version (optional model check on OpenRouter; skipped offline)",
   embed: "chunk embeddings (OpenRouter; skipped offline)",
   quality: "word coverage, table and figure checks",
 };

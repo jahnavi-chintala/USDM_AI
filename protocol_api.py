@@ -10,7 +10,9 @@ trace and verify every value it extracts, so every tool returns complete content
     doc = ProtocolDocument.open("output_public/LZZT_CDISC_Pilot")   # folder with the Docling JSON + chunks/
     doc.document_info()                      titles, acronym, sponsor protocol id, registry ids (with their verbatim
                                              source line), version/amendment/date, sponsor, page/section/SoA counts;
-                                             each value with its method and the item it was read from (identity.py)
+                                             each value with its method and the item it was read from (identity.py;
+                                             chunks/identity.json, else the rules), and the rule value a model's
+                                             choice replaced ("rules")
     doc.outline(max_level=None)              section tree: section_id, number, title, level, ICH M11 role, pages, tokens,
                                              parent_id, children
     doc.find_sections(role=None, query=None) sections by role and/or fuzzy title match, ranked
@@ -21,7 +23,9 @@ trace and verify every value it extracts, so every tool returns complete content
     doc.get_table("#/tables/3" | "caption words")   whole table: Markdown + grid + merged cells + footnotes, chains joined
     doc.get_soa()                            soa.extract_soa(doc, index) (+ Markdown), cached; "not available" until soa.py exists
     doc.search("question", k=PRODUCTION_K)   dense + BM25 candidates, reranked, production parent-aware context
-                                             (retrieve.production_builder): ranked blocks + the identity block
+                                             (retrieve.production_builder): ranked blocks + the identity block (its
+                                             Title line: the detected title, or the official title when the identity
+                                             model step's verified choice replaced it)
     doc.abbreviation("AE" | "adverse event") glossary lookup in both directions
     doc.quote_check("verbatim text", section_id=None)   does the text occur in the document? where?
     doc.tool_schemas() / doc.call_tool(name, args)       JSON-Schema tool definitions and a dispatcher
@@ -53,7 +57,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from identity import build_identity
+from identity import MODEL_METHOD, build_identity, load_record
 from structure import ROLE_INFO, ROLES, SectionIndex, _norm, _tokens as _title_tokens, _w, heading_role
 from tokenizer_cache import shared_tokenizer
 
@@ -292,6 +296,12 @@ class ProtocolDocument:
         self.source_sha256: str | None = self.meta.get("source_sha256")
         self.warnings: list[str] = []
         self.index = self._load_section_index()
+        # The stored identity record (chunks/identity.json) is loaded once, here, so a file that cannot be used is
+        # warned about from the first tool call on; the rules' record is built later, only if it is needed. It must
+        # belong to this Docling JSON and to these stats.json values ("stale": chunk_protocol.py was run again).
+        self._stored_identity, reason = load_record(chunks_dir, self.source_sha256, self.meta)
+        if self._stored_identity is None and reason != "missing":
+            self.warnings.append(f"chunks/identity.json not used ({reason}): the identity was rebuilt with the rules")
         self.glossary = None
         gpath = next((p for p in (chunks_dir / "glossary.json", chunks_dir / "abbreviations.json") if p.exists()), None)
         if gpath is not None:
@@ -310,7 +320,7 @@ class ProtocolDocument:
         self._sizes: dict[str, tuple[int, int]] | None = None
         self._streams: dict[str, list[_Stream]] | None = None
         self._words: tuple[list[str], list[int], list[_Seg]] | None = None
-        self._identity: dict | None = None  # identity.build_identity record, built on first use
+        self._identity: dict | None = None  # the identity record: the stored one, else the rules' (built on first use)
         self._info: dict | None = None  # document_info's result (without the call-time warnings)
         self._soa: list[dict] | None = None
         self._builder = None
@@ -691,17 +701,35 @@ class ProtocolDocument:
     # ================================================================== tools
     # ------------------------------------------------------------------ document_info
     def _identity_record(self) -> dict:
-        """The identity record of the protocol (identity.build_identity): every identity value with the item it was
-        read from. Built once per open document, with this module's section assignment (the reading-order repair)."""
+        """The identity record of the protocol: every identity value with the item it was read from. The stored
+        chunks/identity.json when it belongs to this Docling JSON (the rules' values and the fields a model chose and
+        the code verified; loaded and warned about when the document is opened), else the rules' record
+        (rules_identity_record), built on first use. The same record serves document_info, the identity block of
+        search and the refs of its "(source ...)" lines."""
         if self._identity is None:
-            self._identity = build_identity(self.doc, self.meta, section_of=self._section_of)
+            self._identity = (self._stored_identity if self._stored_identity is not None
+                              else self.rules_identity_record())
         return self._identity
+
+    def rules_identity_record(self) -> dict:
+        """The identity record built with the rules (identity.build_identity with this module's section
+        assignment), never the stored chunks/identity.json: what the identity stage starts from."""
+        return build_identity(self.doc, self.meta, section_of=self._section_of)
 
     def document_info(self) -> dict:
         """Identity of the protocol for StudyTitle / StudyIdentifier / StudyVersion / sponsor Organization, each
         value with the rule that found it (method) and the item it was read from (page, layer, text, item ref, the
         refs the text spans, the table row, section): the identity record, no search. Computed once; every call
-        returns its own copy with the document's warnings at that moment."""
+        returns its own copy with the document's warnings at that moment.
+
+        A value's method is the rule that found it, or "model selection, verified in the cited lines": a value a model
+        chose in the identity stage and the code found in the lines it cited (source). Such a value also has "rules":
+        {"value", "method"}, the rule value it replaced (both None when the rules found none); the key is absent on a
+        value the rules found. The record is chunks/identity.json when it belongs to this Docling JSON, else the rules'
+        record (a warning says why when the file is there but unusable, from the first call of any tool on).
+
+        version: "label" and "amendment" are the plain values; "label_detail" and "amendment_detail" (None when there is
+        none) are the same fields as the titles are: value, method, source, and "rules" for a model's choice."""
         if self._info is None:
             self._info = self._build_document_info()
         out = copy.deepcopy(self._info)
@@ -710,7 +738,7 @@ class ProtocolDocument:
 
     def _build_document_info(self) -> dict:
         """document_info's result from the identity record (without the call-time warnings)."""
-        from retrieve import IDENTITY_FIELDS, identity_block
+        from retrieve import IDENTITY_FIELDS, identity_block, identity_overlay
 
         meta = self.meta
         ids = meta.get("identifiers")
@@ -723,18 +751,21 @@ class ProtocolDocument:
         prov_refs: list[str] = []
         prov_pages: set[int] = set()
 
-        def sourced(key: str) -> dict | None:
+        def sourced(key: str, track: bool = True) -> dict | None:
             f = fields[key]
             if not f:
                 return None
             src = f["source"]
             if src is not None:
                 src = {**src, "refs": list(src["refs"])}
-                if src["ref"]:
+                if track and src["ref"]:
                     prov_refs.append(src["ref"])
-                if src["page"]:
+                if track and src["page"]:
                     prov_pages.add(src["page"])
-            return {"value": f["value"], "method": f["method"], "source": src}
+            out = {"value": f["value"], "method": f["method"], "source": src}
+            if f.get("rules") is not None:  # a model's choice: the rule value it replaced
+                out["rules"] = copy.deepcopy(f["rules"])
+            return out
 
         def cover_value(key: str) -> dict | None:
             c = cover.get(key)
@@ -756,6 +787,9 @@ class ProtocolDocument:
         version = {
             "label": (fields["version_label"] or {}).get("value"),
             "amendment": (fields["amendment"] or {}).get("value"),
+            # the same two fields with method and source (and "rules" for a model's choice); not in the provenance
+            "label_detail": sourced("version_label", track=False),
+            "amendment_detail": sourced("amendment", track=False),
             "date": sourced("version_date"),
             "cover_amendment": cover_value("amendment"), "cover_version": cover_value("version"),
             "cover_approval_date": cover_value("approval_date"),
@@ -765,6 +799,8 @@ class ProtocolDocument:
             src = {**sp["source"], "refs": list(sp["source"]["refs"])}
             sponsor = {"name": sp["value"], "value": sp["verbatim"], "method": sp["method"], "source": src,
                        "provenance": self._prov(self._section_of(src["ref"]), [src["page"]], src["refs"])}
+            if sp.get("rules") is not None:
+                sponsor["rules"] = copy.deepcopy(sp["rules"])
         soa_tables = self._soa_tables()
         roles: dict[str, list[str]] = {}
         for r in ROLES:
@@ -788,7 +824,7 @@ class ProtocolDocument:
             "soa_tables": soa_tables,
             "roles_found": roles,
             "reading_order_repairs": self.reading_order_repairs(),
-            "identity_block": identity_block(meta, ids).text,
+            "identity_block": identity_block(*identity_overlay(meta, ids, record)).text,
             "provenance": self._prov(title_secs[0], prov_pages or {1}, prov_refs),
         }
 
@@ -1272,9 +1308,11 @@ class ProtocolDocument:
                 return original(query, chunks, model)
 
             r.rerank = guarded
-            # the builder reuses this document's objects (same JSON, SHA-checked) instead of loading them again
+            # the builder reuses this document's objects (same JSON, SHA-checked, and its stored identity record)
+            # instead of loading them again
             self._builder = production_builder(r, self.doc_path, doc=self.doc, serializer=self.serializer,
-                                               tok=self.tokenizer, index=self.index, tables=self.tables)
+                                               tok=self.tokenizer, index=self.index, tables=self.tables,
+                                               identity_record=self._stored_identity)
         return self._builder
 
     def _query_vector(self, text: str, query: str):
@@ -1317,9 +1355,10 @@ class ProtocolDocument:
 
     def search(self, query: str, k: int | None = None, rendered: bool = False) -> dict:
         """Semantic search for scattered facts. Returns the production context: the identity block (title, sponsor
-        id, registry ids, version) and the ranked blocks (whole sections/parents, tables, retrieved passages) with
-        kind, text, section, pages, item refs; the glossary definitions of abbreviations used. rendered=True adds
-        the context string exactly as an answering model sees it."""
+        id, registry ids, version; the Title line is the detected title, or the official title when the identity
+        model step's verified choice replaced it) and the ranked blocks (whole sections/parents, tables, retrieved
+        passages) with kind, text, section, pages, item refs; the glossary definitions of abbreviations used.
+        rendered=True adds the context string exactly as an answering model sees it."""
         from retrieve import BLOCK_LABELS, PRODUCTION_K
 
         res, ctx = self.search_context(query, k)
@@ -1707,6 +1746,10 @@ TOOLS: list[dict] = [
                     "title, acronym, sponsor protocol number, registry ids (NCT, EudraCT, EU CT, IND, WHO UTN) each "
                     "with the verbatim line it was found in, version/amendment and date, sponsor name, cover-page "
                     "label/value pairs, page/section/SoA-table counts and the outermost section per ICH M11 role. "
+                    f"A value with method '{MODEL_METHOD}' was chosen by a model and found in the lines it cited "
+                    "(source); its 'rules' is the rule value it replaced (value and method, both null when the "
+                    "rules found none). version.label and version.amendment are plain values; version.label_detail "
+                    "and version.amendment_detail give the same fields with method, source and 'rules'. "
                     "Call it first.",
      "input_schema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "outline", "method": "outline",
@@ -1765,8 +1808,10 @@ TOOLS: list[dict] = [
          "additionalProperties": False}},
     {"name": "search", "method": "search",
      "description": "Semantic search for scattered facts (a dose, a window, a definition stated somewhere in the "
-                    "body). Returns the identity block and ranked context blocks (whole sections or parents, tables, "
-                    "passages) with section, pages and item refs. Not for complete lists: use read_section.",
+                    "body). Returns the identity block (its Title line is the detected title, or the official title "
+                    "when the identity model step's verified choice replaced it) and ranked context blocks (whole "
+                    "sections or parents, tables, passages) with section, pages and item refs. Not for complete "
+                    "lists: use read_section.",
      "input_schema": {"type": "object", "properties": {
          "query": {"type": "string", "description": "A natural-language question."},
          "k": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Retrieved passages (default 8)."},

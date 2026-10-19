@@ -321,12 +321,15 @@ IDENTITY_FIELDS = (("sponsor_protocol_id", "Sponsor protocol number"), ("nct", "
                    ("eudract", "EudraCT number"), ("eu_ct", "EU CT number"), ("ind", "IND number"),
                    ("who_utn", "WHO Universal Trial Number"))
 IDENTITY_REPORT_MISSING = {"sponsor_protocol_id", "nct", "eudract", "eu_ct", "ind"}
+_UNSET = object()  # ContextBuilder(identity_record=...) not given: the builder loads chunks/identity.json itself
 
 
 def identity_block(meta: dict, ids: dict) -> Block:
     """The "Document" block: title, sponsor protocol id, registry ids and version, each identifier with
     the verbatim text it was found in (page, layer) so a value can be traced and checked. Registry ids
-    sit in page headers or on the cover page, which no chunk holds (headers/footers are furniture)."""
+    sit in page headers or on the cover page, which no chunk holds (headers/footers are furniture). The Title
+    line is meta["title"]: the detected title of stats.json, or the official title when the identity model step's
+    verified choice replaced it (identity_overlay)."""
     lines = []
     if meta.get("title"):
         lines.append(f"Title: {' '.join(str(meta['title']).split())}")
@@ -355,6 +358,42 @@ def identity_block(meta: dict, ids: dict) -> Block:
     return Block("document", "\n".join(lines), "Document identity", sorted(pages), [])
 
 
+def identity_overlay(meta: dict, ids: dict, record: dict | None) -> tuple[dict, dict]:
+    """Copies of meta and ids (stats.json "document" and its "identifiers") for identity_block, where the fields a model
+    chose in the stored identity record (chunks/identity.json, identity.load_record) replace the stats values:
+    official_title -> meta["title"] (so the block's Title line is the detected title, or the official title the model
+    chose), acronym, version_label, version_date, and each identifier of IDENTITY_FIELDS ->
+    ids[key] with ids["sources"][key] = {"page", "layer", "text"} of the field's source. Only fields whose method is
+    identity.MODEL_METHOD count: a rule's value stays the stats value, so no record, or a record of rules only, gives
+    copies equal to the arguments and an identity_block text that does not change."""
+    import copy
+
+    meta, ids = copy.deepcopy(meta), copy.deepcopy(ids)
+    fields = (record or {}).get("fields")
+    if not fields:
+        return meta, ids
+    from identity import MODEL_METHOD
+
+    def chosen(key: str) -> dict | None:
+        f = fields.get(key)
+        return f if isinstance(f, dict) and f.get("method") == MODEL_METHOD and f.get("value") else None
+
+    for key, name in (("official_title", "title"), ("acronym", "acronym"), ("version_label", "version_label"),
+                      ("version_date", "version_date")):
+        if f := chosen(key):
+            meta[name] = f["value"]
+    for key, _ in IDENTITY_FIELDS:
+        if f := chosen(key):
+            ids[key] = f["value"]
+            ids["sources"] = sources = dict(ids.get("sources") or {})
+            src = f.get("source")
+            if src and src.get("text"):
+                sources[key] = {"page": src.get("page"), "layer": src.get("layer"), "text": src["text"]}
+            else:
+                sources.pop(key, None)  # the replaced rule value's source does not belong to the model's value
+    return meta, ids
+
+
 class ContextBuilder:
     """Small-to-big context assembly for answering (see build_context).
 
@@ -364,7 +403,8 @@ class ContextBuilder:
 
     mode="chunks" (default) is the original assembly (every retrieved table/figure part expanded whole,
     stitched or dropped to fit). mode="parents" assembles from the structural partition (parents.py):
-      * a "Document" identity block first, always (title, sponsor id, NCT/EudraCT/EU CT/IND, version);
+      * a "Document" identity block first, always (title, sponsor id, NCT/EudraCT/EU CT/IND, version; the title
+        is the detected title, or the official title when the identity model step's verified choice replaced it);
       * the top-k children grouped by parent (score = best child score + parent_bonus per extra child);
       * enumeration-like questions: when the top parents lie in one section whose whole subtree fits in
         the remaining budget, that section is included whole (complete lists);
@@ -381,18 +421,22 @@ class ContextBuilder:
     The keyword-only doc / serializer / tok / index / tables take what the caller already holds for this document
     (a ProtocolDocument's own objects; index as parents.section_index returns it, tables as {table_id: record} of
     tables.jsonl) instead of loading or building it again. The tokenizer, when not given, is the process-wide one
-    of tokenizer_cache.
+    of tokenizer_cache. identity_record is the document's stored identity record (identity.load_record's result, None:
+    it has none usable) for the Document block, so the block and the refs a ProtocolDocument gives for it come from one
+    record; not given, the builder loads chunks/identity.json itself (identity_overlay).
 
     Not thread-safe: use one lock per document, as service.app_service does (the document, its section index and the
     search builder share lazily built state).
     """
 
     _index = None  # the section index given to __init__; None: the parent store builds it from self.doc
+    _stored_identity = _UNSET  # the identity record given to __init__ (None: none usable); unset: load it when needed
 
     def __init__(self, retriever: Retriever, doc_json: str | Path | None = None,
                  tokenizer: str = "Qwen/Qwen3-Embedding-8B", budget: int = CONTEXT_BUDGET,
                  mode: str = "chunks", identity: bool = True, section_expand: bool = True, *,
-                 doc=None, serializer=None, tok=None, index=None, tables: dict | None = None):
+                 doc=None, serializer=None, tok=None, index=None, tables: dict | None = None,
+                 identity_record=_UNSET):
         from docling_core.types.doc import DoclingDocument
 
         from chunk_protocol import ProtocolSerializerProvider
@@ -424,6 +468,7 @@ class ContextBuilder:
                            else ProtocolSerializerProvider().get_serializer(self.doc))
         self.tok = tok if tok is not None else shared_tokenizer(tokenizer)
         self._index = index
+        self._stored_identity = identity_record
         if tables is None:
             tables_file = retriever.cache_dir / "tables.jsonl"
             tables = {t["table_id"]: t for t in map(json.loads, tables_file.read_text(encoding="utf-8").splitlines())}
@@ -618,7 +663,16 @@ class ContextBuilder:
                 from chunk_protocol import registry_identifiers
 
                 ids = registry_identifiers(self.doc, meta)
-            self._identity = identity_block(meta, ids)
+            # The stored identity record (fields a model chose and the code verified): the one the caller gave, else
+            # chunks/identity.json when it belongs to this Docling JSON and to this stats.json; any reason it cannot
+            # be used (missing, other document, stale, ...) leaves the stats values, which are the rules' (no warning
+            # in a context).
+            record = self._stored_identity
+            if record is _UNSET:
+                from identity import load_record
+
+                record, _ = load_record(self.retriever.cache_dir, meta.get("source_sha256"), meta)
+            self._identity = identity_block(*identity_overlay(meta, ids, record))
             self._identity.tokens = self.count(self._identity.render(0))
         return copy.copy(self._identity)
 
@@ -885,5 +939,6 @@ PRODUCTION_BUDGET = 12000
 
 def production_builder(retriever: "Retriever", doc_json: str | Path | None = None, **shared) -> "ContextBuilder":
     """The context builder the answering / USDM agent path should use. `shared`: objects the caller already holds
-    for this document (doc=, serializer=, tok=, index=, tables=; see ContextBuilder), used instead of loading them."""
+    for this document (doc=, serializer=, tok=, index=, tables=, identity_record=; see ContextBuilder), used instead
+    of loading them."""
     return ContextBuilder(retriever, doc_json, **shared).with_mode("parents", budget=PRODUCTION_BUDGET)

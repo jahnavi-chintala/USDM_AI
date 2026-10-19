@@ -425,11 +425,12 @@ def create_app(service: ProtocolService | None = None, *, manage_lifecycle: bool
     @app.delete("/documents/{doc_id}", tags=["documents"], summary="Delete a document, its jobs and files",
                 responses=_errors(400, 404, 409))
     def delete_document(doc_id: str, service: ServiceDep,
-                        purge_caches: Annotated[bool, Query(description="Also remove this PDF's conversion batches "
-                                                            "and figure descriptions from the shared caches: no "
-                                                            "trace of it stays under DATA_DIR.")] = False
+                        purge_caches: Annotated[bool, Query(description="Also remove this PDF's conversion batches, "
+                                                            "figure descriptions and identity-model answers from "
+                                                            "the shared caches: no trace of it stays under "
+                                                            "DATA_DIR.")] = False
                         ) -> JSONResponse:
-        """{"doc_id", "deleted": true[, "purged": {"batches", "figures"}]}: 409 while a job of it runs."""
+        """{"doc_id", "deleted": true[, "purged": {"batches", "figures", "identity"}]}: 409 while a job of it runs."""
         return _ok(service.delete_document(doc_id, purge_caches=purge_caches))
 
     @app.post("/documents/{doc_id}/reprocess", tags=["documents"], status_code=202,
@@ -489,7 +490,7 @@ def create_app(service: ProtocolService | None = None, *, manage_lifecycle: bool
     def get_file(doc_id: str, name: str, service: ServiceDep) -> FileResponse:
         """protocol.md / .json / .html, protocol.decisions.json, quality.json, chunks/*.jsonl|json, images (images/
         <file> or <stem>_images/<file>); short names such as md, json, html, decisions, chunks.jsonl,
-        sections.json are accepted (GET /documents/{doc_id}/files lists them)."""
+        sections.json, identity.json are accepted (GET /documents/{doc_id}/files lists them)."""
         path, media_type, canonical = service.file(doc_id, name)
         headers = {"X-Content-Type-Options": "nosniff"}
         if media_type.startswith("text/html"):

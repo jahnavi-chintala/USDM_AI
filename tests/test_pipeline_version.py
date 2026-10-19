@@ -19,8 +19,30 @@ def test_semver_and_inputs() -> None:
     json.dumps(inputs)  # serialisable as is
     assert inputs["pipeline_version"] == pv.PIPELINE_VERSION
     assert inputs["packages"]["docling"], inputs["packages"]
-    assert set(inputs["models"]) == {"figure", "embedding", "reranker", "tokenizer"}
+    assert set(inputs["models"]) == {"figure", "identity", "embedding", "reranker", "tokenizer"}
     assert inputs["settings"] == json.loads(json.dumps(inputs["settings"]))
+
+
+def test_identity_model_in_the_fingerprint() -> None:
+    """IDENTITY_MODEL: unset -> the default model, stripped, "" -> off; each model is another fingerprint."""
+    import os
+
+    old = os.environ.pop("IDENTITY_MODEL", None)
+    try:
+        assert pv.identity_model() == pv.DEFAULT_IDENTITY_MODEL == "openrouter:anthropic/claude-opus-5.5"
+        base = pv.pipeline_fingerprint()
+        os.environ["IDENTITY_MODEL"] = "  openrouter:x/y "
+        assert pv.identity_model() == "openrouter:x/y"
+        assert pv.fingerprint_inputs()["models"]["identity"] == "openrouter:x/y"
+        assert pv.pipeline_fingerprint() != base
+        os.environ["IDENTITY_MODEL"] = ""
+        assert pv.identity_model() == "" and pv.pipeline_fingerprint() != base
+        os.environ["IDENTITY_MODEL"] = pv.DEFAULT_IDENTITY_MODEL
+        assert pv.pipeline_fingerprint() == base
+    finally:
+        os.environ.pop("IDENTITY_MODEL", None)
+        if old is not None:
+            os.environ["IDENTITY_MODEL"] = old
 
 
 def test_fingerprint_stable_and_sensitive() -> None:

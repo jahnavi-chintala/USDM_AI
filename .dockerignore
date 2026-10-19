@@ -13,6 +13,7 @@
 !glossary.py
 !hybrid_backend.py
 !identity.py
+!identity_llm.py
 !keyterm_match.py
 !openrouter_http.py
 !parents.py

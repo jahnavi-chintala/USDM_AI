@@ -2,7 +2,7 @@
 
 What every REST route, MCP tool, protocol tool and published file of the protocol service returns, field by field,
 and what each field means. Written for anyone who connects an application, an agent or a user interface to the
-service. It describes pipeline version 2.0.0; `GET /version` shows what a running service has.
+service. It describes pipeline version 2.1.0; `GET /version` shows what a running service has.
 
 - How to build, run and configure the service: [DEPLOY.md](../DEPLOY.md).
 - How an agent should use the protocol tools to build USDM data: [protocol_api.md](protocol_api.md).
@@ -257,7 +257,7 @@ Parameters: none.
 <!-- fields: rest:GET /version -->
 | Field | Type | Meaning |
 |---|---|---|
-| `pipeline_version` | string | Semantic version of the pipeline, for example `2.0.0`. A new major version changes output formats or identifiers. |
+| `pipeline_version` | string | Semantic version of the pipeline, for example `2.1.0`. A new major version changes output formats or identifiers. |
 | `fingerprint` | string | 16 hex characters: a hash of `fingerprint_inputs`. A stored result with another fingerprint is stale. |
 | `fingerprint_inputs` | object \| null | Everything the fingerprint covers. Null when it could not be computed (the service logs why). |
 | `fingerprint_inputs.pipeline_version` | string | Same as `pipeline_version`. |
@@ -269,6 +269,7 @@ Parameters: none.
 | `fingerprint_inputs.converter.<name>` | string \| number \| boolean | One configuration value. |
 | `fingerprint_inputs.models` | object | The model ids that shape results. |
 | `fingerprint_inputs.models.figure` | string | Figure-description model (`FIGURE_MODEL`). |
+| `fingerprint_inputs.models.identity` | string | Identity-check model (`IDENTITY_MODEL`, default `openrouter:anthropic/claude-opus-5.5`); empty when the identity stage uses the rules only. |
 | `fingerprint_inputs.models.embedding` | string | Embedding model (`EMBED_MODEL`). |
 | `fingerprint_inputs.models.reranker` | string | Search reranker (`RERANK_MODEL`). |
 | `fingerprint_inputs.models.tokenizer` | string | Hugging Face tokenizer that counts chunk tokens. |
@@ -276,6 +277,7 @@ Parameters: none.
 | `packages.<package>` | string \| null | Installed version; null when not installed. |
 | `models` | object | The models the service is configured with. |
 | `models.figure` | string | `FIGURE_MODEL`, for example `openrouter:anthropic/claude-opus-5.5`; empty when figure descriptions are turned off. |
+| `models.identity` | string | `IDENTITY_MODEL`: `openrouter:anthropic/claude-opus-5.5` by default; empty when the identity stage uses the rules only. |
 | `models.embedding` | string | `EMBED_MODEL`. |
 | `models.reranker` | string | `RERANK_MODEL`. |
 | `models.tokenizer` | string | The chunk tokenizer. Absent when `fingerprint_inputs` is null. |
@@ -284,6 +286,7 @@ Parameters: none.
 | `config.data_dir` | string | `DATA_DIR`: `/data` in the container. |
 | `config.offline` | boolean | Same as `offline`. |
 | `config.figure_model` | string | Same as `models.figure`. |
+| `config.identity_model` | string | Same as `models.identity`. |
 | `config.embed_model` | string | Same as `models.embedding`. |
 | `config.rerank_model` | string | Same as `models.reranker`. |
 | `config.worker_concurrency` | integer | Documents converted at the same time (`WORKER_CONCURRENCY`). |
@@ -300,24 +303,25 @@ Invoke-RestMethod http://127.0.0.1:8000/version | ConvertTo-Json -Depth 5
 
 ```json
 {
-  "pipeline_version": "2.0.0",
-  "fingerprint": "e5b95040132248ca",
+  "pipeline_version": "2.1.0",
+  "fingerprint": "0a443c565565cf22",
   "fingerprint_inputs": {
-    "pipeline_version": "2.0.0",
+    "pipeline_version": "2.1.0",
     "settings": {"heading_levels": "multi_signal", "heading_source": "auto", /* 31 more */},
     "packages": {"docling": "2.131.0", "docling-core": "2.99.0", "docling-parse": "7.22.1", "docling-ibm-models": "4.0.3"},
     "converter": {"backend": "hybrid(docling-parse text, pdfium images, render_pages=False)", /* 5 more */},
-    "models": {"figure": "openrouter:anthropic/claude-opus-5.5", "embedding": "qwen/qwen3-embedding-8b",
+    "models": {"figure": "openrouter:anthropic/claude-opus-5.5", "identity": "openrouter:anthropic/claude-opus-5.5", "embedding": "qwen/qwen3-embedding-8b",
                "reranker": "qwen/qwen3-reranker-8b", "tokenizer": "Qwen/Qwen3-Embedding-8B"}
   },
   "packages": {"docling": "2.131.0", "docling-core": "2.99.0", "docling-parse": "7.22.1", "fastapi": "0.143.0", "mcp": "2.3.0"},
-  "models": {"figure": "openrouter:anthropic/claude-opus-5.5", "embedding": "qwen/qwen3-embedding-8b",
+  "models": {"figure": "openrouter:anthropic/claude-opus-5.5", "identity": "openrouter:anthropic/claude-opus-5.5", "embedding": "qwen/qwen3-embedding-8b",
              "reranker": "qwen/qwen3-reranker-8b", "tokenizer": "Qwen/Qwen3-Embedding-8B"},
   "offline": true,
   "config": {
     "data_dir": "/data",
     "offline": true,
     "figure_model": "openrouter:anthropic/claude-opus-5.5",
+    "identity_model": "openrouter:anthropic/claude-opus-5.5",
     "embed_model": "qwen/qwen3-embedding-8b",
     "rerank_model": "qwen/qwen3-reranker-8b",
     "worker_concurrency": 1,
@@ -393,7 +397,7 @@ before this key set keeps its older keys until the document is reprocessed or im
 | `figures.described` | integer | Pictures with an AI-generated description. |
 | `chunks` | integer | Records in `chunks/chunks.jsonl`. |
 | `stages` | object (map) | Status of each pipeline stage, keyed by stage name. |
-| `stages.<stage>` | string | `done`, `skipped`, `skipped_offline`, `partial` or `failed` (see [the stage object](#the-job-object)). Stage names: `hash`, `convert`, `postprocess`, `figures`, `save`, `chunk`, `embed`, `quality`. |
+| `stages.<stage>` | string | `done`, `skipped`, `skipped_offline`, `partial` or `failed` (see [the stage object](#the-job-object)). Stage names: `hash`, `convert`, `postprocess`, `figures`, `save`, `chunk`, `identity` (from pipeline 2.1.0), `embed`, `quality`. |
 
 <!-- fields: shared:svc-document-error -->
 | Field | Type | Meaning |
@@ -527,8 +531,8 @@ Invoke-RestMethod http://127.0.0.1:8000/documents/dbadb3709bb5c41f1ede5ccf60412e
   "identifiers": {"nct": null, "sponsor_protocol_id": "H2Q-MC-LZZT", "eudract": null, "eu_ct": null, "ind": null,
                   "who_utn": null, "version": null, "amendment": null, "date": null},
   "status": "done",
-  "pipeline_version": "2.0.0",
-  "fingerprint": "e5b95040132248ca",
+  "pipeline_version": "2.1.0",
+  "fingerprint": "0a443c565565cf22",
   "has_result": true,
   "published_at": "2026-10-13T08:21:09+00:00",
   "stale": false,
@@ -537,7 +541,7 @@ Invoke-RestMethod http://127.0.0.1:8000/documents/dbadb3709bb5c41f1ede5ccf60412e
     "figures": {"pictures": 11, "skipped_logo_like": 0, "described": 0},
     "chunks": 180,
     "stages": {"hash": "done", "convert": "done", "postprocess": "done", "figures": "done", "save": "done",
-               "chunk": "done", "embed": "done", "quality": "done"}
+               "chunk": "done", "identity": "done", "embed": "done", "quality": "done"}
   },
   "error": null,
   "current_job_id": "7b316d956a2d4d04aa7e2291888ae6b9",
@@ -569,13 +573,13 @@ Notes:
 #### DELETE /documents/{doc_id}
 
 Deletes the record, all jobs (a queued job never starts), the published files and the job work folders. The shared
-caches keep the PDF's conversion batches and figure descriptions, so a later upload of the same PDF is fast and
-sends nothing to OpenRouter, unless you pass `purge_caches=true`.
+caches keep the PDF's conversion batches, figure descriptions and identity-model answers, so a later upload of the
+same PDF is fast and sends nothing to OpenRouter, unless you pass `purge_caches=true`.
 
 | Parameter | In | Type | Default | Meaning |
 |---|---|---|---|---|
 | `doc_id` | path | string | | The document id. |
-| `purge_caches` | query | boolean | false | Also remove this PDF's conversion batches and figure descriptions from the shared caches, so that no trace of it stays under `DATA_DIR`. Other documents' cache entries stay. |
+| `purge_caches` | query | boolean | false | Also remove this PDF's conversion batches, figure descriptions and identity-model answers from the shared caches, so that no trace of it stays under `DATA_DIR`. Other documents' cache entries stay. |
 
 | Status | Meaning |
 |---|---|
@@ -593,6 +597,7 @@ sends nothing to OpenRouter, unless you pass `purge_caches=true`.
 | `purged` | object | Only with `purge_caches=true`: what was removed from the shared caches. |
 | `purged.batches` | integer | Cached conversion batch files removed. |
 | `purged.figures` | integer | Cached figure descriptions removed. 0 when the result had no readable `protocol.json`. |
+| `purged.identity` | integer | Cached identity-model answers removed (none when `IDENTITY_MODEL` is empty). 0 when the result had no readable `protocol.json`. A cache file that cannot be removed (locked) is skipped and not counted. |
 
 Example:
 
@@ -601,7 +606,7 @@ Invoke-RestMethod -Method Delete "http://127.0.0.1:8000/documents/a94c35b9e940b3
 ```
 
 ```json
-{"doc_id": "a94c35b9e940b3cd1b7dc326c11ab004f88f8cea4e0df2fa20d4b28b4be16eba", "deleted": true, "purged": {"batches": 0, "figures": 0}}
+{"doc_id": "a94c35b9e940b3cd1b7dc326c11ab004f88f8cea4e0df2fa20d4b28b4be16eba", "deleted": true, "purged": {"batches": 0, "figures": 0, "identity": 0}}
 ```
 
 Without `purge_caches` the answer is `{"doc_id": "…", "deleted": true}`. Deletion cannot be undone; the jobs of the
@@ -779,7 +784,7 @@ the same time.
 | `kind` | string | `process` (first conversion), `reprocess` (a document that has a result, converted again), or `import`. |
 | `reprocess` | boolean | `true` when `kind` is `reprocess`. |
 | `filename` | string \| null | File name of the upload that created the job; for `POST /reprocess`, the document's first file name. |
-| `stage` | string \| null | The last stage the job reported: `hash`, `convert`, `postprocess`, `figures`, `save`, `chunk`, `embed`, `quality`. Null before the first report (queued, just started, imports, cancelled). For a failed job: the stage it failed in. |
+| `stage` | string \| null | The last stage the job reported: `hash`, `convert`, `postprocess`, `figures`, `save`, `chunk`, `identity`, `embed`, `quality`. Null before the first report (queued, just started, imports, cancelled). For a failed job: the stage it failed in. |
 | `progress` | object | Progress inside `stage`. After the job finished: the last stage's counts (`quality` reports none, so a finished job shows `{"done": null, "total": null}`). |
 | `progress.done` | integer \| null | Units done in this stage (for example conversion batches or embedding requests); null when the stage reports no counts. |
 | `progress.total` | integer \| null | Units in this stage; null when unknown. |
@@ -796,11 +801,11 @@ the same time.
 <!-- fields: shared:svc-stage -->
 | Field | Type | Meaning |
 |---|---|---|
-| `name` | string | `hash`, `convert`, `postprocess`, `figures`, `save`, `chunk`, `embed` or `quality`. |
-| `status` | string | `done`; `skipped` (figures with `FIGURE_MODEL` empty); `skipped_offline` (figures or embeddings not made because the service is offline); `partial` (some figures could not be described); `failed` (embeddings failed: search is unavailable for the document; or, in a failed job, the stage the job failed in). |
+| `name` | string | `hash`, `convert`, `postprocess`, `figures`, `save`, `chunk`, `identity`, `embed` or `quality`. Results made before pipeline 2.1.0 have no `identity` stage. |
+| `status` | string | `done`; `skipped` (figures with `FIGURE_MODEL` empty); `skipped_offline` (figures, embeddings or the identity model check not made because the service is offline; `chunks/identity.json` then holds the rule values); `partial` (some figures could not be described; or the identity model check failed and the rule values were kept); `failed` (embeddings failed: search is unavailable for the document; the identity record could not be written: `document_info` uses the rules; or, in a failed job, the stage the job failed in). |
 | `seconds` | number | Wall-clock time of the stage, rounded to 0.1 s. |
 | `detail` | object (map) | Counts of the stage, keyed by name; `{}` when it has none. Never document text. |
-| `detail.<count>` | integer \| number \| string | For example `convert`: `pages`; `save`: `tables`, `pictures`; `chunk`: `chunks`, `parents`; `embed`: `chunks`, `cached`, `embedded` (or `error`, the exception type, when it failed); `quality`: `coverage`, `pages_below_97`; `postprocess`: the number of changes per repair; `figures`: counts such as `offline` and `failed`, or `reason`. |
+| `detail.<count>` | integer \| number \| string | For example `convert`: `pages`; `save`: `tables`, `pictures`; `chunk`: `chunks`, `parents`; `embed`: `chunks`, `cached`, `embedded` (or `error`, the exception type, when it failed); `quality`: `coverage`, `pages_below_97`; `postprocess`: the number of changes per repair; `figures`: counts such as `offline` and `failed`, or `reason`; `identity`: `accepted`, `confirmed`, `kept_rules` (fields the model chose, confirmed, or whose answer was refused), `model` and `cache` (`hit` or `miss`) when a model was asked, and `error` (the exception type) and / or `reason` (`unsupported model`, `no source hash`) when the check failed. |
 
 #### GET /documents/{doc_id}/jobs
 
@@ -937,6 +942,7 @@ Invoke-RestMethod http://127.0.0.1:8000/jobs/3b93754e6ea04d8aafd99819b8e98870 | 
   "stages": [
     /* hash, convert, postprocess, figures, save */
     {"name": "chunk", "status": "done", "seconds": 2.5, "detail": {"chunks": 153, "parents": 39}},
+    {"name": "identity", "status": "done", "seconds": 0.5, "detail": {"accepted": 0, "confirmed": 0, "kept_rules": 0}},
     {"name": "embed", "status": "skipped_offline", "seconds": 0.0, "detail": {}},
     {"name": "quality", "status": "done", "seconds": 1.4, "detail": {"coverage": 0.9974, "pages_below_97": 4}}
   ]
@@ -1036,7 +1042,7 @@ accepts. See [Published files](#6-published-files) for each file.
 | Field | Type | Meaning |
 |---|---|---|
 | `doc_id` | string | The document. |
-| `files` | string[] | Served files present in this result, sorted: `protocol.md`, `protocol.json`, `protocol.html`, `protocol.decisions.json`, `quality.json`, `chunks/chunks.jsonl`, `chunks/parents.jsonl`, `chunks/sections.json`, `chunks/tables.jsonl`, `chunks/glossary.json`, `chunks/stats.json`. |
+| `files` | string[] | Served files present in this result, sorted: `protocol.md`, `protocol.json`, `protocol.html`, `protocol.decisions.json`, `quality.json`, `chunks/chunks.jsonl`, `chunks/parents.jsonl`, `chunks/sections.json`, `chunks/tables.jsonl`, `chunks/glossary.json`, `chunks/stats.json`, `chunks/identity.json` (results from pipeline 2.1.0 on). |
 | `images` | string[] | Image files, as `<folder>/<file>`: `images/…` for results converted by the service, `<stem>_images/…` (for example `protocol_images/…`) for imported results. These are the paths that `protocol.json` and the chunk records refer to. |
 | `aliases` | object (map) | The short names of the files this result has, keyed by short name (an imported result without `quality.json` has no `quality`). The files route accepts these short names. |
 | `aliases.<short name>` | string | The file the short name stands for, such as `chunks.jsonl` → `chunks/chunks.jsonl` or `md` → `protocol.md`. |
@@ -1593,8 +1599,10 @@ Example (Python):
 ### document_info
 
 The identity of the study: titles, registry identifiers, version and date, sponsor, cover-page label/value pairs,
-counts, and the outermost section of each role. Every value comes with the verbatim line it was read from. Call it
-first; it takes no arguments.
+counts, and the outermost section of each role. Every value comes with the method that chose it and the verbatim
+line it was read from. The values are those of the stored identity record
+([chunks/identity.json](#chunksidentityjson)); for a result without one (made before pipeline 2.1.0) the same
+record is built with the rules when the document is opened. Call it first; it takes no arguments.
 
 #### Arguments
 
@@ -1614,7 +1622,7 @@ None.
 | `titles.official_title` | object (shared: tool-sourced-value) \| null | The full title: the value of a cover-page title label ("Protocol Title:", "Full Title:", "Title:", ...), else the detected title. |
 | `titles.brief_title` | object (shared: tool-sourced-value) \| null | The value of a "Short / Brief / Public / Lay Title:" cover-page label; null without one. |
 | `titles.acronym` | object (shared: tool-sourced-value) \| null | The value of an "Acronym:" cover-page label, else the acronym detected in the text. |
-| `titles.detected_title` | object (shared: tool-sourced-value) \| null | The title found by heuristics on the first pages, without labels. It is the title `search` shows in its identity block. |
+| `titles.detected_title` | object (shared: tool-sourced-value) \| null | The title found by heuristics on the first pages, without labels. It is the title `search` shows in its identity block, unless the identity model check replaced `official_title`: then the block shows that one. |
 | `identifiers` | object | Study identifiers found by pattern anywhere in the document, including tables and running headers/footers. All six keys are always present; a key is null when nothing was found. A value counts as the study's own when it stands in a header or footer, on pages 1-3, or right after its label; per kind, the own value seen on the most pages wins. |
 | `identifiers.sponsor_protocol_id` | object (shared: tool-identifier) \| null | Sponsor protocol number: the protocol id detected with the document metadata, else the value after a "Protocol Number:" label. |
 | `identifiers.nct` | object (shared: tool-identifier) \| null | ClinicalTrials.gov number: `NCT` and 8 digits. |
@@ -1624,9 +1632,11 @@ None.
 | `identifiers.who_utn` | object (shared: tool-identifier) \| null | WHO Universal Trial Number: `UNNNN-NNNN-NNNN`. |
 | `other_identifiers_cited` | object (map) | Values of the same kinds that occur in the document but are not this study's own, such as another trial's NCT number cited in the background. Empty object when there are none. |
 | `other_identifiers_cited.<kind>` | string[] | The other values of one kind, in order of appearance. `<kind>` is one of the `identifiers` keys. |
-| `version` | object | Version, amendment and date. All six keys are always present. |
+| `version` | object | Version, amendment and date. All eight keys are always present. |
 | `version.label` | string \| null | The detected version label, such as `Amendment 3` or `Version 2.0`. |
 | `version.amendment` | string \| null | The amendment number when the label is an amendment (`3`), else null. |
+| `version.label_detail` | object (shared: tool-sourced-value) \| null | `label` with its method and source line. |
+| `version.amendment_detail` | object (shared: tool-sourced-value) \| null | `amendment` with its method and source line. |
 | `version.date` | object (shared: tool-sourced-value) \| null | The detected version or approval date, as printed (`05-Dec-2017`). |
 | `version.cover_amendment` | object (shared: tool-sourced-value) \| null | The value of an "Amendment (Number):" cover-page label. |
 | `version.cover_version` | object (shared: tool-sourced-value) \| null | The value of a "Version:" cover-page label. |
@@ -1634,7 +1644,10 @@ None.
 | `sponsor` | object \| null | The sponsor organisation; null when no method finds one. |
 | `sponsor.name` | string | The organisation's name. From a cover-page label it is the value cut before the address (at a comma followed by a digit, a long number or a semicolon). |
 | `sponsor.value` | string | The verbatim label value (with the address) for `cover-page label`; otherwise the same as `name`. |
-| `sponsor.method` | string | How the name was found, tried in this order: `cover-page label`, `copyright line`, `'property of' line`, `company-name pattern on the title pages (unverified)`. Treat every method but the first as a guess and check it with `quote_check`. |
+| `sponsor.method` | string | How the name was found, tried in this order: `cover-page label`, `copyright line`, `'property of' line`, `company-name pattern on the title pages (unverified)`. Treat every method but the first as a guess and check it with `quote_check`. `model selection, verified in the cited lines` when the identity model check chose it (see [chunks/identity.json](#chunksidentityjson)). |
+| `sponsor.rules` | object | Only when the model check replaced the rules' sponsor: the rule value and method (both null when the rules found none). |
+| `sponsor.rules.value` | string \| null | The rules' sponsor name. |
+| `sponsor.rules.method` | string \| null | The rules' method. |
 | `sponsor.source` | object | The line the name was read from. |
 | `sponsor.source.page` | integer | PDF page of the line. |
 | `sponsor.source.text` | string | The line, whitespace-normalised (for a cover-page label: the label line, ` / `, and the next line when the value is there). |
@@ -1663,21 +1676,27 @@ None.
 | `reading_order_repairs[].to_section` | string | Section id every tool now uses for it. |
 | `identity_block` | string | The identity text that `search` puts first in its context, one fact per line: title, acronym, sponsor protocol number and registry ids each with the verbatim line it was found in, a "none found" line for each missing id (except WHO UTN), and the version. |
 | `provenance` | object (shared: provenance) | The first title-page section (`S0` when no section has role `title_page`), with the pages and refs of the located sources above (page 1 when none was located). |
-| `warnings` | string[] | Problems with this result, such as a `sections.json` that could not be loaded (the section index was then rebuilt from the Docling JSON), or an item ref that does not resolve. Rendering by other tools can add warnings, so the list can grow during a session. |
+| `warnings` | string[] | Problems with this result, such as a `sections.json` that could not be loaded (the section index was then rebuilt from the Docling JSON), a `chunks/identity.json` that could not be used (`chunks/identity.json not used (<reason>): the identity was rebuilt with the rules`, reason `unreadable`, `schema`, `other_document` or `stale`), or an item ref that does not resolve. Rendering by other tools can add warnings, so the list can grow during a session. |
 
 <!-- fields: shared:tool-sourced-value -->
 | Field | Type | Meaning |
 |---|---|---|
 | `value` | string | The value as written in the document. |
-| `method` | string | How the value was found: `cover-page label`, `title page` (the first long text after the first heading on page 1; for an acronym, a page-1 heading that looks like one), `running header` (pages 1-3), `labelled pattern` (after a label such as "Version" or a date pattern in the title pages and headers/footers), `history table` (the latest row of a document-history table) or `stored` (the stored value is not what the current rules find; then `source` is the first item holding it as a whole token, or null). Absent for `version.cover_*`, which are always cover-page labels. |
-| `source` | object (shared: tool-value-source) \| null | The line the value was read from; null when the value cannot be located in the text. |
+| `method` | string | How the value was found: `cover-page label`, `title page` (the first long text after the first heading on page 1; for an acronym, a page-1 heading that looks like one), `running header` (pages 1-3), `labelled pattern` (after a label such as "Version" or a date pattern in the title pages and headers/footers), `history table` (the latest row of a document-history table), `stored` (the stored value is not what the current rules find; then `source` is the first item holding it as a whole token, or null) or `model selection, verified in the cited lines` (the identity model check chose it and the code found it in the cited lines, see [chunks/identity.json](#chunksidentityjson)). Absent for `version.cover_*`, which are always cover-page labels. |
+| `source` | object (shared: tool-value-source) \| null | The line the value was read from; null when the value cannot be located in the text. For a model value: the cited lines, their texts joined with ` / `. |
+| `rules` | object | Only on a model value: the rule value it replaced. |
+| `rules.value` | string \| null | The rule value; null when the rules found none. |
+| `rules.method` | string \| null | The rule's method; null when the rules found none. |
 
 <!-- fields: shared:tool-identifier -->
 | Field | Type | Meaning |
 |---|---|---|
 | `value` | string | The identifier as written. |
-| `method` | string | `registry pattern` for NCT, EudraCT, EU CT, IND and WHO UTN. For the sponsor protocol number, how the document metadata decided it: `running header` ("Protocol <id>" in the pages 1-3 header), `labelled pattern` (after a "Protocol Number:"-style label), `header/footer frequency` (the id repeated in most headers/footers); `stored` as above. The method describes how the value was chosen; `source` is the line shown as its evidence, which can be another line holding the same value. |
+| `method` | string | `registry pattern` for NCT, EudraCT, EU CT, IND and WHO UTN. For the sponsor protocol number, how the document metadata decided it: `running header` ("Protocol <id>" in the pages 1-3 header), `labelled pattern` (after a "Protocol Number:"-style label), `header/footer frequency` (the id repeated in most headers/footers); `stored` as above; `model selection, verified in the cited lines` as above (a registry id is only ever filled in by the model check, never replaced). The method describes how the value was chosen; `source` is the line shown as its evidence, which can be another line holding the same value. |
 | `source` | object (shared: tool-value-source) \| null | The line the identifier was read from; null when it cannot be located. |
+| `rules` | object | Only on a model value: the rule value it replaced or filled (`value` and `method` null when the rules found none). |
+| `rules.value` | string \| null | The rule value. |
+| `rules.method` | string \| null | The rule's method. |
 | `label` | string | Readable name of the kind: `Sponsor protocol number`, `ClinicalTrials.gov (NCT) number`, `EudraCT number`, `EU CT number`, `IND number` or `WHO Universal Trial Number`. |
 
 <!-- fields: shared:tool-value-source -->
@@ -1738,6 +1757,8 @@ Lilly_NCT03421379, as REST returns it (trimmed):
   "version": {
     "label": null,
     "amendment": null,
+    "label_detail": null,
+    "amendment_detail": null,
     "date": {"value": "05-Dec-2017", "method": "labelled pattern",
              "source": {"page": 1, "layer": "body", "text": "Approval Date: 05-Dec-2017", "ref": "#/texts/3",
                         "refs": ["#/texts/3"], "row": null, "section_id": "S0"}},
@@ -1777,6 +1798,9 @@ Lilly_NCT03421379, as REST returns it (trimmed):
 
 - Titles, version and sponsor come from heuristics (`method` says which). Verify each value with `quote_check`
   before you store it.
+- With the identity model check (`IDENTITY_MODEL`, on by default), some values can have method `model selection, verified in the cited lines`: a model
+  chose them from the first pages and the code found each one in the lines it cited; `rules` then shows the rule
+  value it replaced. Registry ids are only ever filled in this way, never replaced.
 - `source.ref` is the item the value was read from, recorded when the value was extracted: it holds
   `source.text` (for a table row, row `source.row` of that table does). Highlight it directly (above,
   `sponsor_protocol_id` is read from the page-1 running header `#/texts/0`).
@@ -2631,10 +2655,13 @@ has.
 | `chunks/tables.jsonl` | `tables.jsonl` | `application/x-ndjson` | Every chunked table as Markdown. |
 | `chunks/glossary.json` | `glossary.json` | `application/json` | Abbreviations and their definitions. |
 | `chunks/stats.json` | `stats.json` | `application/json` | Chunking statistics, checks and document metadata. |
+| `chunks/identity.json` | `identity.json` | `application/json` | The identity record `document_info` is built from: every identity value with the line it was read from. |
 | `images/<file>` or `<stem>_images/<file>` | | `image/png`, `image/jpeg`, `image/gif`, `image/webp` | Figure images. |
 
-- A result converted by the service has all eleven files. An imported result has the files of its source folder;
-  the public imports, for example, have no `quality.json`. A missing file is `404 file_not_found`.
+- A result converted by the service has all twelve files (eleven before pipeline 2.1.0, or when its `identity`
+  stage failed: no `chunks/identity.json`).
+  An imported result has the files of its source folder; the public imports, for example, have no `quality.json`.
+  A missing file is `404 file_not_found`.
 - Images are in `images/` for results converted by the service and in `<stem>_images/` (such as `protocol_images/`)
   for imported results. `protocol.json`, `protocol.md`, `protocol.html` and the chunk records refer to them by
   these relative paths, so a path from any of them can be passed to the files route as it is.
@@ -2670,7 +2697,7 @@ embedding text (`stats.json` lists exceptions under `checks.oversized_chunks`).
 | `doc_item_refs` | string[] | [Item refs](#ids) of the chunk's items in `protocol.json`, in order: resolve them to draw [boxes](#pages-and-boxes). |
 | `n_tokens` | integer | Tokens of `embed_text` (Qwen3-Embedding-8B tokenizer). |
 | `text` | string | The chunk text. Tables are written one row per line (`Row: Column = value; …`) with the caption and a `Columns:` line repeated in each part. |
-| `embed_text` | string | The text that is embedded: a document prefix (name, protocol id, version), the heading path joined by ` > `, then `text`. |
+| `embed_text` | string | The text that is embedded: a document prefix (`<ACRONYM> protocol <id> (<version>, <date>)`, or `Protocol <id> (…)` without an acronym; only the parts found, never the file name), the heading path joined by ` > `, then `text`. |
 | `tables` | object[] | Only in chunks that hold tables: one entry per table. |
 | `tables[].table_id` | string | The table's item ref, such as `#/tables/2`; pass it to `get_table` or find it in `tables.jsonl`. |
 | `tables[].caption` | string \| null | The table's caption. |
@@ -2696,7 +2723,7 @@ Example (LZZT, one figure chunk, trimmed):
  "page_start": 9, "page_end": 9, "pages": [9], "chunk_type": "figure", "element_types": ["picture"],
  "doc_item_refs": ["#/pictures/0"], "n_tokens": 194,
  "text": "Figure: Figure LZZT.1. Illustration of study design for Protocol H2Q-MC-LZZT(c). [flow chart]\nText in figure: …",
- "embed_text": "protocol protocol H2Q-MC-LZZT\n3. Investigational Plan > 3.1. Summary of Study Design\nFigure: …",
+ "embed_text": "Protocol H2Q-MC-LZZT\n3. Investigational Plan > 3.1. Summary of Study Design\nFigure: …",
  "figures": [{"figure_id": "#/pictures/0", "class": "flow_chart",
               "caption": "Figure LZZT.1. Illustration of study design for Protocol H2Q-MC-LZZT(c).",
               "image_path": "protocol_images/image_000000_0855bad9…7114.png", "has_description": false, "has_mermaid": false}],
@@ -2946,7 +2973,7 @@ Example (LZZT, trimmed):
 
 ```json
 {"settings": {"tokenizer": "Qwen/Qwen3-Embedding-8B", "max_tokens": 512, "table_format": "rows", "merge_peers": true,
-              "prefix": "protocol protocol H2Q-MC-LZZT"},
+              "prefix": "Protocol H2Q-MC-LZZT"},
  "document": {"doc_name": "protocol", "protocol_id": "H2Q-MC-LZZT", "acronym": null,
               "title": "Safety and Efficacy of the Xanomeline Transdermal Therapeutic System (TTS) in Patients with Mild to Moderate Alzheimer's Disease",
               "amendment": null, "version_date": null, "source_json": "protocol.json", "source_sha256": "8e6c04adbc131d75",
@@ -2969,6 +2996,84 @@ Example (LZZT, trimmed):
              "index": "structure", "chunks_spanning_sections": 0, "atoms_spanning_sections": 0, "atoms_without_parent": 0,
              "chunks": 180, "chunks_mapped": 180, "chunks_in_several_parents": 0, "chunks_without_unit": 0}}
 ```
+
+### chunks/identity.json
+
+The identity record of the study, written by the `identity` stage (pipeline 2.1.0 on): titles, acronym, sponsor,
+sponsor protocol number, registry ids and version, each value with the rule (or model check) that chose it and the
+line it was read from. `document_info`, the identity block of `search` and the service's `identifiers` are built
+from it. By default (`IDENTITY_MODEL`) a model chose values from the first three pages and the running
+headers/footers and the code kept only those it could verify in the lines the model cited (see the notes); with
+`IDENTITY_MODEL` empty, or offline without a cached answer, it holds the rule values.
+
+<!-- fields: file:chunks/identity.json -->
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | integer | Format version of this file: `1`. |
+| `source_sha256` | string | First 16 hex characters of the SHA-256 of the `protocol.json` the record belongs to (as `stats.json` `document.source_sha256`). The tools use the file only when it matches. |
+| `meta_sha256` | string | First 16 hex characters of the SHA-256 of the `stats.json` `document` block the rule values were built from. The tools use the file only when it matches: after a re-chunk the record is `stale` until the identity step runs again. |
+| `pipeline_version` | string | The pipeline version that wrote the file. |
+| `model` | string \| null | The identity model whose verified values the record holds; null when the record holds rule values only. |
+| `prompt_version` | string \| null | Version of the model request; null without a model. |
+| `fields` | object | One entry per identity field; every key is always present, null when nothing was found: `official_title`, `brief_title`, `acronym`, `detected_title`, `sponsor`, `sponsor_protocol_id`, `nct`, `eudract`, `eu_ct`, `ind`, `who_utn`, `version_label`, `amendment`, `version_date`. |
+| `fields.official_title` | object (shared: file-identity-field) \| null | The full title. |
+| `fields.brief_title` | object (shared: file-identity-field) \| null | A short / public title printed as such. |
+| `fields.acronym` | object (shared: file-identity-field) \| null | The study acronym. |
+| `fields.detected_title` | object (shared: file-identity-field) \| null | The title the rules found on the title page (never changed by a model). |
+| `fields.sponsor` | object (shared: file-identity-field) \| null | The sponsor organisation. |
+| `fields.sponsor_protocol_id` | object (shared: file-identity-field) \| null | The sponsor protocol number. |
+| `fields.nct` | object (shared: file-identity-field) \| null | ClinicalTrials.gov number. |
+| `fields.eudract` | object (shared: file-identity-field) \| null | EudraCT number. |
+| `fields.eu_ct` | object (shared: file-identity-field) \| null | EU CT number. |
+| `fields.ind` | object (shared: file-identity-field) \| null | US IND number. |
+| `fields.who_utn` | object (shared: file-identity-field) \| null | WHO Universal Trial Number. |
+| `fields.version_label` | object (shared: file-identity-field) \| null | The version label, such as `Amendment 3` or `Version 2.0`. |
+| `fields.amendment` | object (shared: file-identity-field) \| null | The amendment number or letter. |
+| `fields.version_date` | object (shared: file-identity-field) \| null | The date of this version, as printed. |
+| `cover_page` | object (map) | Label/value pairs of pages 1-3, as `document_info` `cover_page`. |
+| `cover_page.<field>` | object | One pair. |
+| `cover_page.<field>.value` | string | The label's value. |
+| `cover_page.<field>.page` | integer | PDF page (1-3). |
+| `cover_page.<field>.text` | string | The label line, plus ` / ` and the next line when the value came from it. |
+| `cover_page.<field>.refs` | string[] | Item refs of those lines. |
+| `others` | object (map) | Values of the registry kinds cited in the document that are not the study's own, as `document_info` `other_identifiers_cited`. |
+| `others.<kind>` | string[] | The other values of one kind. |
+| `llm` | object \| null | What the model check did; null without a model. |
+| `llm.accepted` | string[] | Fields whose verified model value replaced the rule value (or filled a missing one). |
+| `llm.confirmed` | string[] | Fields where the model gave the rule value. |
+| `llm.kept_rules` | object[] | Fields whose model answer was refused; the rule value stays. |
+| `llm.kept_rules[].field` | string | The field. |
+| `llm.kept_rules[].reason` | string | Why, a fixed phrase such as `not in the cited lines`, `no such line`, `lines not consecutive`, `not a token` or `registry id: the rule value is kept`. |
+| `llm.cache` | string | `hit` (the stored answer was used; nothing was sent) or `miss` (one request was sent). |
+| `llm.lines` | integer | Number of lines the model was shown. |
+| `llm.usage` | object (map) | Token counts OpenRouter reported for the request (empty for a cache hit made before counts were recorded). |
+| `llm.usage.<count>` | integer \| number \| object | One count, such as `prompt_tokens` or `completion_tokens`, or a group of details (`prompt_tokens_details`, `completion_tokens_details`, `cost_details`). |
+| `llm.usage.<count>.<detail>` | integer \| number \| null | One detail of a group, such as `cached_tokens` or `reasoning_tokens`, as OpenRouter reports it. |
+
+<!-- fields: shared:file-identity-field -->
+| Field | Type | Meaning |
+|---|---|---|
+| `value` | string | The value as printed (a registry id with its dashes written as `-`). |
+| `method` | string | The rule that chose it (the methods `document_info` lists), or `model selection, verified in the cited lines`. |
+| `source` | object (shared: tool-value-source) \| null | The line the value was read from (for a model value: the cited lines, their texts joined with ` / `). |
+| `verbatim` | string | Sponsor only: the name as written (a cover-page label value keeps its address). |
+| `rules` | object | Only on a model value: the rule value it replaced. |
+| `rules.value` | string \| null | The rule value; null when the rules found none. |
+| `rules.method` | string \| null | The rule's method; null when the rules found none. |
+
+Notes:
+- The model check (`IDENTITY_MODEL`, on by default; empty turns it off) sends one request per document with zero-data-retention
+  routing: the text of the first three pages and the distinct running headers/footers as numbered lines, and the
+  rule values. It never sends the PDF. The model only selects: a value is kept only when it occurs in the lines it
+  cited (one to four consecutive lines of one page and one layer; a header or footer alone), has its field's shape
+  (a title of three words or more; an acronym or protocol number that is a whole token; a registry id that matches
+  its pattern; an amendment number right after "Amendment"), and a registry id is only ever filled in, never
+  replaced. Any other answer keeps the rule value and is listed under `llm.kept_rules`.
+- The answer is cached (`DATA_DIR/cache/identity/`), so a reprocess sends nothing; `DELETE ?purge_caches=true`
+  removes it.
+- A file that cannot be used (unreadable, another format, written for another `protocol.json`, or `stale`: built
+  from another `stats.json`, as after a re-chunk without the identity step) is ignored: the tools rebuild the record
+  with the rules and add a warning.
 
 ### quality.json
 
@@ -3036,7 +3141,7 @@ Example (LZZT, trimmed):
              "figures": {"pictures": 11, "skipped_logo_like": 0, "described": 0}, "chunks": 180,
              "stages": {"hash": "done", "convert": "done", /* 6 more */}},
  "warnings": [],
- "stages": [{"name": "chunk", "status": "done", "seconds": 3.2, "detail": {"chunks": 180, "parents": 52}}, /* 7 more */]}
+ "stages": [{"name": "chunk", "status": "done", "seconds": 3.2, "detail": {"chunks": 180, "parents": 52}}, /* 8 more */]}
 ```
 
 Use it to flag pages for review: pages with `expected: false` and a low `coverage` may have lost text, and a table
@@ -3314,9 +3419,9 @@ description and Mermaid diagram, labelled as such: show the same label in your U
 Found while this reference was written; each is described where it occurs. They may be fixed later, which would
 change the affected values.
 
-| Where | Issue |
-|---|---|
-| `chunks.jsonl` `embed_text` | The embedding prefix reads `protocol protocol <id> …` when no acronym was found and the Docling JSON is named `protocol.json` (every result made by the service). Harmless for search (the word is in every chunk); a fix would change every embedding text, so it waits for the next change that re-embeds. |
+None at the moment. (Pipeline 2.1.0 fixed the last one: the embedding prefix of a document without an acronym read
+`protocol protocol <id> …` for every result made by the service; it now reads `Protocol <id> …` and never holds the
+file name.)
 
 ## 9. Keeping this reference current
 

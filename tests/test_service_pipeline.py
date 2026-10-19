@@ -3,9 +3,12 @@
 Covers: ServiceConfig from the environment and its defaults agreeing with the modules; figure descriptions
 (figure_vlm.describe_missing) with a fake client: described and cached, retried then failed, offline, unsupported
 model; the identifier set of a document folder (document_identifiers, also what the import records); the stages
-a failed run keeps (in process and in the child process); and an end-to-end process_document run on a public
-protocol (LZZT) from its cached conversion batches, offline: every stage, the output layout, and chunks identical
-to output_public/. The end-to-end test is skipped when output_public/LZZT_CDISC_Pilot has no batch cache.
+a failed run keeps (in process and in the child process); the identity stage on a small made-up document (between
+chunk and embed, its result keys, the skipped_offline / partial warnings, a failing stage function that only
+warns); and an end-to-end process_document run on a public protocol (LZZT) from its cached conversion batches,
+offline: every stage, the output layout, and chunks identical to output_public/. The end-to-end test is skipped
+when output_public/LZZT_CDISC_Pilot has no batch cache; the one identity-stage test that chunks for real (the
+others replace the chunk step) when the chunk tokenizer is not in the local Hugging Face cache.
 """
 
 import json
@@ -53,26 +56,43 @@ def test_config_from_env_and_defaults() -> None:
     import embed_chunks
     import pipeline_version
     import retrieve
-    from service.config import (DEFAULT_EMBED_MODEL, DEFAULT_FIGURE_MODEL, DEFAULT_RERANK_MODEL,
-                                ServiceConfig)
+    from service.config import (DEFAULT_EMBED_MODEL, DEFAULT_FIGURE_MODEL, DEFAULT_IDENTITY_MODEL,
+                                DEFAULT_RERANK_MODEL, ServiceConfig)
 
     assert DEFAULT_FIGURE_MODEL == pipeline_version.DEFAULT_FIGURE_MODEL
+    assert DEFAULT_IDENTITY_MODEL == pipeline_version.DEFAULT_IDENTITY_MODEL
     if not os.environ.get("EMBED_MODEL"):
         assert DEFAULT_EMBED_MODEL == embed_chunks.MODEL
     if not os.environ.get("RERANK_MODEL"):
         assert DEFAULT_RERANK_MODEL == retrieve.RERANK_MODEL
     with tempfile.TemporaryDirectory() as tmp:
         with env(DATA_DIR=tmp, OPENROUTER_OFFLINE="1", FIGURE_MODEL="", WORKER_CONCURRENCY="3",
-                 MAX_UPLOAD_MB="7", LOG_LEVEL="debug", EMBED_MODEL=None, RERANK_MODEL=None):
+                 MAX_UPLOAD_MB="7", LOG_LEVEL="debug", EMBED_MODEL=None, RERANK_MODEL=None, IDENTITY_MODEL=None):
             c = ServiceConfig.from_env()
         assert c.data_dir == Path(tmp).resolve() and c.offline and c.figure_model == ""
         assert (c.worker_concurrency, c.max_upload_mb, c.log_level) == (3, 7, "DEBUG")
         assert c.embed_model == DEFAULT_EMBED_MODEL and c.rerank_model == DEFAULT_RERANK_MODEL
         assert c.registry_path == c.data_dir / "registry.sqlite" and c.vlm_cache_dir == c.data_dir / "cache" / "vlm"
         assert "api_key_set" in c.public() and not any("KEY" in str(v) for v in c.public().values())
-        with env(DATA_DIR=tmp, FIGURE_MODEL=None, OPENROUTER_OFFLINE=None):
+        with env(DATA_DIR=tmp, FIGURE_MODEL=None, OPENROUTER_OFFLINE=None, IDENTITY_MODEL=None):
             d = ServiceConfig.from_env()
         assert d.figure_model == DEFAULT_FIGURE_MODEL and not d.offline
+        # the identity model: unset -> the default (on), set -> stripped, "" -> off; shared cache folder; in the
+        # models the fingerprint covers and in what /version shows
+        default = "openrouter:anthropic/claude-opus-5.5"
+        assert c.identity_model == DEFAULT_IDENTITY_MODEL == default and d.identity_model == DEFAULT_IDENTITY_MODEL
+        with env(DATA_DIR=tmp, IDENTITY_MODEL="  openrouter:test/identity  "):
+            e = ServiceConfig.from_env()
+        assert e.identity_model == "openrouter:test/identity"
+        with env(DATA_DIR=tmp, IDENTITY_MODEL="  "):
+            assert ServiceConfig.from_env().identity_model == ""
+        assert e.identity_cache_dir == e.data_dir / "cache" / "identity"
+        assert e.models()["identity"] == "openrouter:test/identity" and c.models()["identity"] == default
+        assert e.public()["identity_model"] == "openrouter:test/identity" and c.public()["identity_model"] == default
+        assert set(e.models()) == {"figure", "identity", "embedding", "reranker"}
+        assert pipeline_version.pipeline_fingerprint(None, e.models()) != pipeline_version.pipeline_fingerprint(
+            None, c.models())
+        assert pipeline_version.fingerprint_inputs(None, e.models())["models"]["identity"] == e.identity_model
 
 
 # ------------------------------------------------------------------ figure descriptions
@@ -156,6 +176,13 @@ def test_process_document_end_to_end_offline() -> None:
         shutil.copy2(ROOT / "public_protocols" / LZZT / "protocol.pdf", work / "source.pdf")
         for cache in (src_out / "chunks").glob("embedding_cache.*.json"):
             shutil.copy2(cache, work / "chunks" / cache.name)  # what the worker does on a reprocess
+        # the identity model's cached answers (identity_llm.py's default cache of the public output), when there are
+        # any: offline the stage then uses them (done); without, it keeps the rules (skipped_offline)
+        cached_identity = sorted((src_out / "identity_cache").glob("*.json"))
+        if cached_identity:
+            config.identity_cache_dir.mkdir(parents=True, exist_ok=True)
+            for entry in cached_identity:
+                shutil.copy2(entry, config.identity_cache_dir / entry.name)
         events = []
         res = process_document(work / "source.pdf", work, config,
                                progress=lambda s, d=None, t=None: events.append(s))
@@ -165,6 +192,9 @@ def test_process_document_end_to_end_offline() -> None:
         assert list(dict.fromkeys(events)) == list(STAGES), events
         st = {s.name: s.status for s in res.stages}
         assert st["figures"] == "skipped_offline" and st["embed"] == "done" and st["convert"] == "done", st
+        # the default identity model, offline: a cached answer is used, else the rules are kept with a warning
+        assert st["identity"] == ("done" if cached_identity else "skipped_offline"), st
+        assert any(w.startswith("identity:") for w in res.warnings) != bool(cached_identity), res.warnings
         assert res.status == "done_with_warnings" and any("OPENROUTER_OFFLINE" in w for w in res.warnings)
         assert res.pages == 97 and len(res.sha256) == 64 and res.identifiers["sponsor_protocol_id"] == "H2Q-MC-LZZT"
         from service.pipeline import IDENTIFIER_KEYS
@@ -173,7 +203,7 @@ def test_process_document_end_to_end_offline() -> None:
         assert res.identifiers["sponsor"] == "Eli Lilly and Company", res.identifiers["sponsor"]
         for name in ("protocol.json", "protocol.md", "protocol.html", "protocol.decisions.json", "quality.json",
                      "pipeline.json", "images", "tables", "logs/pipeline.log", "chunks/chunks.jsonl",
-                     "chunks/embeddings.npy", "chunks/sections.json"):
+                     "chunks/embeddings.npy", "chunks/sections.json", "chunks/identity.json"):
             assert (work / name).exists(), name
         quality = json.loads((work / "quality.json").read_text(encoding="utf-8"))
         assert quality["coverage"]["coverage"] > 0.99 and quality["figures"]["pictures"] == 11
@@ -350,6 +380,222 @@ def test_failed_run_keeps_completed_stages() -> None:
             assert [(s.name, s.status) for s in exc.pipeline_stages] == [("hash", "failed")]
         else:
             raise AssertionError("expected FileNotFoundError")
+
+
+# ------------------------------------------------------------------ the identity stage (small made-up document)
+
+class patched:
+    """Temporarily replace module attributes: patched(module, name=value, ...)."""
+
+    def __init__(self, module, **attrs):
+        self.module, self.attrs, self.old = module, attrs, {}
+
+    def __enter__(self):
+        for k, v in self.attrs.items():
+            self.old[k] = getattr(self.module, k)
+            setattr(self.module, k, v)
+
+    def __exit__(self, *exc):
+        for k, v in self.old.items():
+            setattr(self.module, k, v)
+
+
+def _stub_chunk(json_path, chunks_dir, **kwargs):
+    """A chunk_protocol.chunk_document that only makes the folder and returns the counts process_document reads:
+    for the tests of the stage bookkeeping, which need no chunked document (and no tokenizer)."""
+    Path(chunks_dir).mkdir(parents=True, exist_ok=True)
+    return {"chunks": 1, "parents": {"parents": 0}}
+
+
+def _identity_run(tmp: Path, name: str, *, identity=None, model: str = "", quality=None, chunk=None):
+    """process_document on a made-up document, offline. The conversion is replaced by a function that saves the
+    synthetic Docling document of tests/test_service_api.py, embedding by one that records whether
+    chunks/identity.json exists by then, and the quality report by a fixed one (the made-up PDF has one page, the
+    document six); the stage bookkeeping runs for real. `identity` replaces identity_llm.run_identity (None: the
+    real one, which needs the real chunker), `quality` / `chunk` the quality report / chunking (None: the real
+    chunker, which needs the chunk tokenizer; _stub_chunk, or a function that fails, for instance).
+    Returns a namespace: result (PipelineResult) or error (the exception), events (progress stages), work,
+    config, seen (identity: the (out_dir, kwargs) of each run_identity call, identity_json_at_embed)."""
+    import types
+
+    import chunk_protocol
+    import convert_protocol
+    import embed_chunks
+    import identity_llm
+    import validate_output
+    from service.config import ServiceConfig
+    from service.pipeline import process_document
+    from test_service_api import synthetic_protocol
+    from test_service_core import make_pdf
+
+    config = ServiceConfig(data_dir=tmp / name, offline=True, figure_model="", identity_model=model)
+    work = config.work_dir / "job1"
+    work.mkdir(parents=True)
+    (work / "source.pdf").write_bytes(make_pdf("Quillmore study protocol", "Made-up text for an identity test"))
+    seen = {"identity": [], "identity_json_at_embed": None}
+    run = types.SimpleNamespace(result=None, error=None, events=[], work=work, config=config, seen=seen)
+
+    def convert(src, out, *, progress=None, **kwargs):
+        for stage in ("convert", "postprocess", "figures", "save"):
+            progress(stage)
+        synthetic_protocol().save_as_json(out / "protocol.json")
+        return {"stem": "protocol", "pages": 6, "tables": 1, "pictures": 0, "postprocess": {}, "figures": {}}
+
+    real_identity = identity_llm.run_identity
+
+    def run_identity(out_dir, **kwargs):
+        seen["identity"].append((Path(out_dir), kwargs))
+        return (identity or real_identity)(out_dir, **kwargs)
+
+    def embed(chunks_path, model, progress=None):
+        seen["identity_json_at_embed"] = (Path(chunks_path).parent / "identity.json").is_file()
+        return {"embedded": 1}
+
+    def quality_report(doc, pdf, decisions):
+        return {"coverage": {"coverage": 1.0, "pages_below_threshold": 0}, "tables": {"tables": 1, "marks_missing": 0},
+                "figures": {"pictures": 0}}
+
+    with patched(convert_protocol, convert_document=convert), patched(embed_chunks, embed_document=embed), \
+            patched(identity_llm, run_identity=run_identity), \
+            patched(validate_output, quality_report=quality or quality_report), \
+            patched(chunk_protocol, chunk_document=chunk or chunk_protocol.chunk_document):
+        try:
+            run.result = process_document(work / "source.pdf", work, config,
+                                          progress=lambda s, d=None, t=None: run.events.append(s))
+        except Exception as exc:  # noqa: BLE001 - the tests read the stages the exception carries
+            run.error = exc
+    return run
+
+
+def test_identity_stage_between_chunk_and_embed() -> None:
+    """The one run with the real chunker and the real run_identity. Rules only (IDENTITY_MODEL off, the default): the
+    stage runs after chunk and before embed, with the configured model and the shared cache folder, and writes
+    chunks/identity.json. Then a model set without network: the contract of the stage function - a status the
+    pipeline knows, the rules record still written, a warning - without more (the fake-result tests below cover the
+    texts per status)."""
+    from service.contracts import STAGES
+    from test_service_api import TOKENIZER, tokenizer_cached
+
+    i = STAGES.index("chunk")
+    assert STAGES[i:i + 3] == ("chunk", "identity", "embed")
+    if not tokenizer_cached():
+        print(f"   (skipped the run: tokenizer {TOKENIZER} not in the local Hugging Face cache)")
+        return
+    offline = "identity: the model step was skipped (OPENROUTER_OFFLINE is set); the rule values are kept"
+    with tempfile.TemporaryDirectory() as tmp:
+        run = _identity_run(Path(tmp), "rules")
+        assert run.error is None, type(run.error)
+        res = run.result
+        assert [s.name for s in res.stages] == list(STAGES), [s.name for s in res.stages]
+        assert list(dict.fromkeys(run.events)) == list(STAGES), run.events
+        stage = next(s for s in res.stages if s.name == "identity")
+        assert stage.status == "done" and stage.seconds >= 0, stage
+        assert res.status == "done" and res.warnings == [], (res.status, res.warnings)
+        assert (run.work / "chunks" / "identity.json").is_file() and run.seen["identity_json_at_embed"] is True
+        assert run.seen["identity"] == [(run.work, {"model": "", "cache_dir": run.config.identity_cache_dir})]
+        assert json.loads((run.work / "pipeline.json").read_text(encoding="utf-8"))["stages"][6]["name"] == "identity"
+        # a model set, no network: offline without a cached answer is "skipped_offline"; a model id the stage cannot
+        # use is some other non-"done" status. Either way the job finishes with one warning and a record.
+        for name, model, statuses in (("offline", "openrouter:test/identity", ("skipped_offline",)),
+                                      ("unusable", "test/identity", ("skipped_offline", "partial"))):
+            run = _identity_run(Path(tmp), name, model=model)
+            assert run.error is None, (name, type(run.error))
+            res = run.result
+            stage = next(s for s in res.stages if s.name == "identity")
+            assert stage.status in statuses, (name, stage)
+            assert set(stage.detail) <= {"model", "accepted", "confirmed", "kept_rules", "cache", "error", "reason"}
+            assert len(res.warnings) == 1 and res.status == "done_with_warnings", (name, res.warnings)
+            if stage.status == "skipped_offline":
+                assert res.warnings == [offline], (name, res.warnings)
+            else:
+                assert res.warnings[0].startswith("identity: the model step failed (") and \
+                    res.warnings[0].endswith("); the rule values are kept"), (name, res.warnings)
+            assert (run.work / "chunks" / "identity.json").is_file() and run.seen["identity_json_at_embed"] is True
+
+
+def test_identity_stage_results_and_warnings() -> None:
+    """The result's other keys that are not None become the stage's detail; skipped_offline and partial are
+    warnings (done_with_warnings) naming the fixed reason, else the error type, never more."""
+    model = "openrouter:test/identity"
+    counts = {"model": model, "accepted": 3, "confirmed": 2, "kept_rules": 4}
+    cases = [
+        ("hit", {"status": "done", **counts, "cache": "hit"}, "done", {**counts, "cache": "hit"}, None),
+        ("offline", {"status": "skipped_offline", **counts, "cache": None}, "skipped_offline", counts,
+         "identity: the model step was skipped (OPENROUTER_OFFLINE is set); the rule values are kept"),
+        ("error", {"status": "partial", **counts, "cache": "miss", "error": "ConnectionError"}, "partial",
+         {**counts, "cache": "miss", "error": "ConnectionError"},
+         "identity: the model step failed (ConnectionError); the rule values are kept"),
+        ("reason", {"status": "partial", **counts, "cache": "miss", "reason": "the answer was not valid"}, "partial",
+         {**counts, "cache": "miss", "reason": "the answer was not valid"},
+         "identity: the model step failed (the answer was not valid); the rule values are kept"),
+        ("both", {"status": "partial", **counts, "cache": "miss", "error": "IdentityModelError",
+                  "reason": "unsupported model"}, "partial",
+         {**counts, "cache": "miss", "error": "IdentityModelError", "reason": "unsupported model"},  # the label wins
+         "identity: the model step failed (unsupported model); the rule values are kept"),
+        ("neither", {"status": "partial", **counts, "cache": None}, "partial", counts,
+         "identity: the model step failed (unknown); the rule values are kept")]
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, answer, status, detail, warning in cases:
+            run = _identity_run(Path(tmp), name, identity=lambda out_dir, answer=answer, **kw: dict(answer),
+                                model=model, chunk=_stub_chunk)
+            assert run.error is None, (name, type(run.error))
+            res = run.result
+            stage = next(s for s in res.stages if s.name == "identity")
+            assert (stage.status, stage.detail) == (status, detail), (name, stage)
+            assert res.warnings == ([warning] if warning else []), (name, res.warnings)
+            assert res.status == ("done_with_warnings" if warning else "done"), (name, res.status)
+            assert run.seen["identity"] == [(run.work, {"model": model, "cache_dir": run.config.identity_cache_dir})]
+            assert [s.name for s in res.stages].index("embed") == [s.name for s in res.stages].index("identity") + 1
+
+
+def test_identity_stage_failure_is_a_warning() -> None:
+    """run_identity raising does not fail the job: the stage is "failed" with the exception type only, a warning
+    says so, the later stages run and the message (which can quote the document) is nowhere in the outputs."""
+    secret = "Patient 0042 said something confidential"
+
+    def failing(out_dir, **kwargs):
+        raise ValueError(secret)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run = _identity_run(Path(tmp), "failing", identity=failing, model="openrouter:test/identity",
+                            chunk=_stub_chunk)
+        assert run.error is None, type(run.error)
+        res = run.result
+        st = {s.name: s for s in res.stages}
+        assert (st["identity"].status, st["identity"].detail) == ("failed", {"error": "ValueError"}), st["identity"]
+        assert st["embed"].status == "done" and st["quality"].status == "done", st
+        assert res.status == "done_with_warnings"
+        assert res.warnings == ["identity record not written (ValueError): document_info uses the rules"], res.warnings
+        assert not (run.work / "chunks" / "identity.json").exists()
+        everything = "".join(p.read_text(encoding="utf-8", errors="replace") for p in run.work.rglob("*")
+                             if p.is_file() and p.suffix in (".json", ".log", ".md", ".jsonl"))
+        assert secret not in everything and "ValueError" in everything
+        log = (run.work / "logs" / "pipeline.log").read_text(encoding="utf-8")
+        assert "identity stage failed: ValueError at tests/test_service_pipeline.py:" in log, log
+
+
+def test_failures_around_identity_keep_the_stages() -> None:
+    """A fatal error after the identity stage lists it as completed; one in chunking (before it) does not list it. A
+    quality report that fails leaves no PDF handle open (Windows would keep source.pdf locked)."""
+    def failing(*args, **kwargs):
+        raise ValueError("made-up message")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run = _identity_run(Path(tmp), "early", chunk=failing)
+        assert isinstance(run.error, ValueError) and run.result is None
+        assert [(s.name, s.status) for s in run.error.pipeline_stages] == [
+            ("hash", "done"), ("convert", "done"), ("postprocess", "done"), ("figures", "skipped"), ("save", "done"),
+            ("chunk", "failed")], run.error.pipeline_stages
+        assert run.seen["identity"] == []
+        run = _identity_run(Path(tmp), "late", quality=failing, chunk=_stub_chunk,
+                            identity=lambda out_dir, **kw: {"status": "done", "model": None, "accepted": 0,
+                                                            "confirmed": 0, "kept_rules": 0, "cache": None})
+        assert isinstance(run.error, ValueError) and run.result is None
+        assert [(s.name, s.status) for s in run.error.pipeline_stages] == [
+            ("hash", "done"), ("convert", "done"), ("postprocess", "done"), ("figures", "skipped"), ("save", "done"),
+            ("chunk", "done"), ("identity", "done"), ("embed", "done"), ("quality", "failed")], \
+            run.error.pipeline_stages
+        (run.work / "source.pdf").unlink()  # PermissionError on Windows while the quality stage's handle is open
 
 
 def test_isolated_failure_keeps_completed_stages() -> None:

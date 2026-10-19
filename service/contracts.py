@@ -15,6 +15,8 @@ Pipeline entry point (service.pipeline.process_document; the worker takes any ca
     "failed"; the worker records them on the failed job (without it the job has no stages).
   - Non-fatal problems (a figure the model could not describe, a stage skipped because OPENROUTER_OFFLINE is
     set) come back as warnings with status "done_with_warnings".
+  - A stored result may predate a stage (results made before "identity" have no such entry): consumers read the
+    stages list as it is, never against STAGES.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ JOB_FINAL = ("done", "done_with_warnings", "failed", "cancelled")
 DOC_STATES = ("none", "queued", "running", "done", "done_with_warnings", "failed", "cancelled")
 
 # ---- pipeline stages, in order (progress reports use these names)
-STAGES = ("hash", "convert", "postprocess", "figures", "save", "chunk", "embed", "quality")
+STAGES = ("hash", "convert", "postprocess", "figures", "save", "chunk", "identity", "embed", "quality")
 STAGE_STATUSES = ("done", "skipped", "skipped_offline", "partial", "failed")
 
 

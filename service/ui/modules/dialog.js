@@ -70,6 +70,8 @@ export function showDialog({ title, body, wide = true, closeLabel = "Close" }) {
 
 // ---------------------------------------------------------------- OpenRouter: badge and confirmation
 
+const IDENTITY_WHAT = "the text of the first three pages and the running headers/footers (one request, for the identity check)";
+
 const WHAT = {
   upload: "figure images (PNG crops) for the figure descriptions and the text of every chunk for the embeddings",
   reprocess: "figure images not yet in the figure cache and chunk texts not yet in the embedding cache (a reprocess of an unchanged PDF usually finds everything cached and sends nothing)",
@@ -87,9 +89,10 @@ export function openRouterBadge(kind = "search") {
   const paint = () => {
     const offline = isOffline();
     const label = offline ? "OpenRouter: offline" : "Calls OpenRouter";
+    const identity = kind !== "search" && models().identity_model ? `; ${IDENTITY_WHAT}` : "";
     const title = offline
       ? "The service runs with OPENROUTER_OFFLINE=1: nothing is sent to OpenRouter."
-      : `May send to OpenRouter (zero-data-retention routing): ${WHAT[kind] || WHAT.search}.`;
+      : `May send to OpenRouter (zero-data-retention routing): ${WHAT[kind] || WHAT.search}${identity}.`;
     el.classList.toggle("is-offline", Boolean(offline));
     el.title = title;
     el.setAttribute("aria-label", `${label}. ${title}`);
@@ -121,13 +124,17 @@ export async function confirmOpenRouter(kind, { title, action, extra, checkboxes
       "OPENROUTER_OFFLINE is set: nothing is sent to OpenRouter. Figures are not described, embeddings are skipped "
       + "and search answers only cached queries.")));
   } else {
+    const identity = kind !== "search" && cfg.identity_model;
     const modelLine = kind === "search"
       ? `${cfg.embed_model || "embedding model"} (query embedding) and ${cfg.rerank_model || "reranker"} (reranking)`
-      : `${cfg.figure_model || "figure model"} (figure descriptions) and ${cfg.embed_model || "embedding model"} (embeddings)`;
+      : `${cfg.figure_model || "figure model"} (figure descriptions)`
+        + (identity ? `, ${cfg.identity_model} (identity check)` : "")
+        + ` and ${cfg.embed_model || "embedding model"} (embeddings)`;
+    const what = (WHAT[kind] || WHAT.search) + (identity ? `; ${IDENTITY_WHAT}` : "");
     body.push(h("p", { class: "mt-0" }, action || "This action may call OpenRouter."));
     body.push(h("div", { class: "alert alert-violet" }, icon("cloud"), h("div", { class: "alert-body" },
       h("div", { class: "alert-title" }, "Sent to OpenRouter, with zero-data-retention routing"),
-      h("div", null, `What: ${WHAT[kind] || WHAT.search}.`),
+      h("div", null, `What: ${what}.`),
       h("div", { class: "small muted" }, `Models: ${modelLine}. Every request carries provider data_collection "deny", `
         + "zdr true and no fallbacks. The PDF itself, file names and whole documents are never sent."))));
     if (state.version === null) {
