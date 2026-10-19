@@ -34,7 +34,8 @@ services:
     # Measured (2026-10-12, Sanofi 152 pages / 63 tables, fresh conversion, WORKER_CONCURRENCY=1): peak 5.0 GiB
     # resident (the Docling batch subprocess during conversion; ~1.7 GiB in the other stages), 5.6 GiB for the
     # whole container including page cache. 8g leaves ~40 % headroom for larger documents and the API's open
-    # documents. Each extra concurrent job (WORKER_CONCURRENCY) needs about 5 GiB more.
+    # documents. Each extra batch process needs about 5 GiB more: WORKER_CONCURRENCY x CONVERT_WORKERS of them run at
+    # once (CONVERT_WORKERS=2 under 8g peaked at 7.6 GiB and gave a 152-page protocol no gain; DEPLOY.md, Limits).
     mem_limit: 8g
     healthcheck:  # /health: 200 healthy, 503 not (urlopen raises: exit 1); the image has no curl
       test:

@@ -67,10 +67,15 @@ def test_config_from_env_and_defaults() -> None:
         assert DEFAULT_RERANK_MODEL == retrieve.RERANK_MODEL
     with tempfile.TemporaryDirectory() as tmp:
         with env(DATA_DIR=tmp, OPENROUTER_OFFLINE="1", FIGURE_MODEL="", WORKER_CONCURRENCY="3",
-                 MAX_UPLOAD_MB="7", LOG_LEVEL="debug", EMBED_MODEL=None, RERANK_MODEL=None, IDENTITY_MODEL=None):
+                 MAX_UPLOAD_MB="7", LOG_LEVEL="debug", EMBED_MODEL=None, RERANK_MODEL=None, IDENTITY_MODEL=None,
+                 CONVERT_WORKERS="2"):
             c = ServiceConfig.from_env()
         assert c.data_dir == Path(tmp).resolve() and c.offline and c.figure_model == ""
         assert (c.worker_concurrency, c.max_upload_mb, c.log_level) == (3, 7, "DEBUG")
+        assert c.convert_workers == c.public()["convert_workers"] == 2
+        assert ServiceConfig(data_dir=c.data_dir).convert_workers == 1
+        with env(DATA_DIR=tmp, CONVERT_WORKERS="0"):
+            assert ServiceConfig.from_env().convert_workers == 1  # at least 1
         assert c.embed_model == DEFAULT_EMBED_MODEL and c.rerank_model == DEFAULT_RERANK_MODEL
         assert c.registry_path == c.data_dir / "registry.sqlite" and c.vlm_cache_dir == c.data_dir / "cache" / "vlm"
         assert "api_key_set" in c.public() and not any("KEY" in str(v) for v in c.public().values())
@@ -407,7 +412,8 @@ def _stub_chunk(json_path, chunks_dir, **kwargs):
     return {"chunks": 1, "parents": {"parents": 0}}
 
 
-def _identity_run(tmp: Path, name: str, *, identity=None, model: str = "", quality=None, chunk=None):
+def _identity_run(tmp: Path, name: str, *, identity=None, model: str = "", quality=None, chunk=None,
+                  convert_workers: int = 1):
     """process_document on a made-up document, offline. The conversion is replaced by a function that saves the
     synthetic Docling document of tests/test_service_api.py, embedding by one that records whether
     chunks/identity.json exists by then, and the quality report by a fixed one (the made-up PDF has one page, the
@@ -415,7 +421,8 @@ def _identity_run(tmp: Path, name: str, *, identity=None, model: str = "", quali
     real one, which needs the real chunker), `quality` / `chunk` the quality report / chunking (None: the real
     chunker, which needs the chunk tokenizer; _stub_chunk, or a function that fails, for instance).
     Returns a namespace: result (PipelineResult) or error (the exception), events (progress stages), work,
-    config, seen (identity: the (out_dir, kwargs) of each run_identity call, identity_json_at_embed)."""
+    config, seen (identity: the (out_dir, kwargs) of each run_identity call, identity_json_at_embed, convert: the
+    conversion's keyword arguments)."""
     import types
 
     import chunk_protocol
@@ -428,14 +435,16 @@ def _identity_run(tmp: Path, name: str, *, identity=None, model: str = "", quali
     from test_service_api import synthetic_protocol
     from test_service_core import make_pdf
 
-    config = ServiceConfig(data_dir=tmp / name, offline=True, figure_model="", identity_model=model)
+    config = ServiceConfig(data_dir=tmp / name, offline=True, figure_model="", identity_model=model,
+                           convert_workers=convert_workers)
     work = config.work_dir / "job1"
     work.mkdir(parents=True)
     (work / "source.pdf").write_bytes(make_pdf("Quillmore study protocol", "Made-up text for an identity test"))
-    seen = {"identity": [], "identity_json_at_embed": None}
+    seen = {"identity": [], "identity_json_at_embed": None, "convert": None}
     run = types.SimpleNamespace(result=None, error=None, events=[], work=work, config=config, seen=seen)
 
     def convert(src, out, *, progress=None, **kwargs):
+        seen["convert"] = kwargs
         for stage in ("convert", "postprocess", "figures", "save"):
             progress(stage)
         synthetic_protocol().save_as_json(out / "protocol.json")
@@ -511,6 +520,19 @@ def test_identity_stage_between_chunk_and_embed() -> None:
                 assert res.warnings[0].startswith("identity: the model step failed (") and \
                     res.warnings[0].endswith("); the rule values are kept"), (name, res.warnings)
             assert (run.work / "chunks" / "identity.json").is_file() and run.seen["identity_json_at_embed"] is True
+
+
+def test_convert_workers_reach_the_conversion() -> None:
+    """CONVERT_WORKERS (config.convert_workers) is what the conversion gets, with the shared batch cache and the job's
+    convert.log (the parallel batches' output goes there, never to the child's marked stdout)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run = _identity_run(Path(tmp), "workers", chunk=_stub_chunk, convert_workers=3,
+                            identity=lambda out_dir, **kw: {"status": "done", "model": "", "cache": None})
+        assert run.error is None, type(run.error)
+        kwargs = run.seen["convert"]
+        assert kwargs["convert_workers"] == 3, kwargs.get("convert_workers")
+        assert kwargs["batch_root"] == run.config.batch_cache_dir
+        assert kwargs["subprocess_log"] == run.work / "logs" / "convert.log"
 
 
 def test_identity_stage_results_and_warnings() -> None:

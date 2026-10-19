@@ -4,11 +4,11 @@ RUNTIME_ENTRY lists the modules the service runs; runtime_files() adds every pro
 directly or not (static scan of import statements, including imports inside functions), plus the non-Python
 files they use. Evaluation, gold-set, regression and report scripts are research code: not in the image.
 
-The Docker build context is exactly context_files(): the runtime files, the service self-tests of the image's
-test target (test_files()) and the build inputs (BUILD_FILES). .dockerignore is generated from it (a whitelist),
-and the Dockerfile copies the runtime and test files out of the context with --copy-to / --copy-tests-to, so this
-module is the single list of what the image holds. It needs only the standard library (the build runs it as
-`python service/runtime.py` before any package is installed).
+The Docker build context is exactly context_files(): the runtime files, the self-tests of the image's test
+target (test_files(): the service's and the batch scheduler's) and the build inputs (BUILD_FILES).
+.dockerignore is generated from it (a whitelist), and the Dockerfile copies the runtime and test files out of the
+context with --copy-to / --copy-tests-to, so this module is the single list of what the image holds. It needs only
+the standard library (the build runs it as `python service/runtime.py` before any package is installed).
 
   python -m service.runtime                       # print the runtime files
   python -m service.runtime --check               # exit 1 if an entry imports a research-only module
@@ -54,8 +54,10 @@ UI_SUFFIXES = (".html", ".css", ".js", ".svg", ".png", ".ico")
 # Build inputs that are not runtime files (in the build context, never in the production image).
 BUILD_FILES = ["Dockerfile", "requirements.in", "requirements.lock", "docker/check_context.sh",
                "docker/fetch_models.py", "docker/lock_report.py"]
-# The offline service self-tests of the image's test target (they import runtime modules and each other).
+# The offline self-tests of the image's test target (they import runtime modules and each other): the service
+# tests, and the parallel batch scheduler's (subprocesses and pipes behave differently on Linux).
 TEST_GLOB = "tests/test_service_*.py"
+TEST_EXTRA = ["tests/test_convert_batches.py"]
 
 
 def _module_path(name: str) -> Path | None:
@@ -113,7 +115,7 @@ def runtime_files() -> list[str]:
 
 
 def test_files() -> list[str]:
-    return sorted(p.relative_to(ROOT).as_posix() for p in ROOT.glob(TEST_GLOB))
+    return sorted([p.relative_to(ROOT).as_posix() for p in ROOT.glob(TEST_GLOB)] + TEST_EXTRA)
 
 
 def context_files() -> list[str]:

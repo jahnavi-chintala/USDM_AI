@@ -65,6 +65,7 @@
 !service/ui/modules/view_tools.js
 !service/ui/modules/view_usecases.js
 !service/ui/styles.css
+!tests/test_convert_batches.py
 !tests/test_service_api.py
 !tests/test_service_core.py
 !tests/test_service_mcp.py

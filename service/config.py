@@ -10,6 +10,8 @@
   EMBED_MODEL          chunk and query embeddings (default qwen/qwen3-embedding-8b)
   RERANK_MODEL         search reranker (default qwen/qwen3-reranker-8b)
   WORKER_CONCURRENCY   documents processed at the same time (default 1)
+  CONVERT_WORKERS      conversion batches (15 pages) converted at the same time per document, each in its own
+                       process with 4 CPU threads (default 1); the outputs do not depend on it
   FIGURE_CONCURRENCY   figure-description requests in flight per document (default 4)
   MAX_UPLOAD_MB        largest accepted PDF (default 100)
   LOG_LEVEL            default INFO
@@ -84,6 +86,7 @@ class ServiceConfig:
     embed_model: str = DEFAULT_EMBED_MODEL
     rerank_model: str = DEFAULT_RERANK_MODEL
     worker_concurrency: int = 1
+    convert_workers: int = 1
     figure_concurrency: int = 4
     max_upload_mb: int = 100
     log_level: str = "INFO"
@@ -101,6 +104,7 @@ class ServiceConfig:
             embed_model=os.environ.get("EMBED_MODEL") or DEFAULT_EMBED_MODEL,
             rerank_model=os.environ.get("RERANK_MODEL") or DEFAULT_RERANK_MODEL,
             worker_concurrency=max(1, _int("WORKER_CONCURRENCY", 1)),
+            convert_workers=max(1, _int("CONVERT_WORKERS", 1)),
             figure_concurrency=max(1, _int("FIGURE_CONCURRENCY", 4)),
             max_upload_mb=max(1, _int("MAX_UPLOAD_MB", 100)),
             log_level=(os.environ.get("LOG_LEVEL") or "INFO").upper(),
@@ -167,6 +171,7 @@ class ServiceConfig:
         return {"data_dir": str(self.data_dir), "offline": self.offline, "figure_model": self.figure_model,
                 "identity_model": self.identity_model, "embed_model": self.embed_model,
                 "rerank_model": self.rerank_model,
-                "worker_concurrency": self.worker_concurrency, "figure_concurrency": self.figure_concurrency,
+                "worker_concurrency": self.worker_concurrency, "convert_workers": self.convert_workers,
+                "figure_concurrency": self.figure_concurrency,
                 "max_upload_mb": self.max_upload_mb, "allowed_hosts": list(self.allowed_hosts),
                 "api_key_set": bool(os.environ.get("OPENROUTER_API_KEY"))}

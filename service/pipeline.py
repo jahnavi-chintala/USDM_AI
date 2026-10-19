@@ -4,7 +4,8 @@ process_document(pdf_path, workdir, config, settings=None, progress=None, passwo
 
 Stages (contracts.STAGES), all writing into `workdir` in the final documents/<doc_id>/ layout:
   hash         SHA-256 of the PDF bytes (the document id)
-  convert      Docling in 15-page batches, each in a subprocess; batches cached under config.batch_cache_dir
+  convert      Docling in 15-page batches, each in a subprocess (config.convert_workers at a time); batches
+               cached under config.batch_cache_dir
   postprocess  protocol_postprocess.postprocess (decisions log -> protocol.decisions.json)
   figures      figure descriptions: figure_vlm.describe_missing runs config.figure_model through OpenRouter
                (zero-data-retention routing) for every figure that is not skipped and not cached in the shared
@@ -184,7 +185,8 @@ def process_document(pdf_path: Path, workdir: Path, config: ServiceConfig, *, se
             pdf_path, workdir, settings=settings, stem=STEM, images_dir=IMAGES_DIR, force=True,
             batch_root=config.batch_cache_dir, figure_model=config.figure_model, vlm_cache=config.vlm_cache_dir,
             describe_figures=bool(config.figure_model), figure_concurrency=config.figure_concurrency,
-            password=password, progress=report, subprocess_log=workdir / "logs" / "convert.log")
+            password=password, progress=report, subprocess_log=workdir / "logs" / "convert.log",
+            convert_workers=config.convert_workers)
         for name in ("convert", "postprocess"):
             finish(name, **({"pages": conv["pages"]} if name == "convert" else
                             {k: v for k, v in conv["postprocess"].items() if isinstance(v, int) and v}))

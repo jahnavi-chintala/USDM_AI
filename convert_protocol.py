@@ -24,7 +24,8 @@ Caching and output folders: pages are converted in batches, each in a fresh
 process, and batches are cached under <out>/_chunks/<pdf sha>/<layout>-<config
 hash>/ with a manifest, so a different PDF or different converter settings can
 never reuse another run's batches. One output folder holds one document: a
-folder already holding a different PDF is refused (use another --out).
+folder already holding a different PDF is refused (use another --out). Batches
+can run in parallel (--workers N at a time); the document does not depend on N.
 """
 
 import argparse
@@ -43,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from importlib.metadata import version
 from pathlib import Path
 
@@ -193,50 +195,159 @@ def claim_output_folder(out: Path, src: Path, pdf_sha: str, force: bool) -> None
     marker.write_text(json.dumps({"pdf_name": src.name, "pdf_sha256": pdf_sha}, indent=1), encoding="utf-8")
 
 
+def _worker_command(src: Path, out: Path, layout: str, batches: Path, first: int, last: int,
+                    password: str | None) -> tuple[list[str], dict[str, str]]:
+    """The command and environment of the process converting pages first-last (one batch)."""
+    cmd = [sys.executable, str(Path(__file__).resolve()), str(src), "--out", str(out), "--layout", layout,
+           "--batch-dir", str(batches), "--range", str(first), str(last)]
+    # The password reaches the worker through its environment, not its command line.
+    env = {**os.environ, **({"PDF_PASSWORD": password} if password else {})}
+    return cmd, env
+
+
+def _not_converted(first: int, last: int) -> RuntimeError:
+    return RuntimeError(f"Pages {first}-{last}: Docling did not convert them completely (see log)")
+
+
+def _convert_alone(cmd: list[str], env: dict[str, str], first: int, last: int, subprocess_log: Path | None) -> None:
+    """Run one batch's worker, up to 3 attempts, its output streamed to `subprocess_log` (appended) or stdout."""
+    for attempt in range(1, 4):
+        if subprocess_log is not None:
+            with open(subprocess_log, "a", encoding="utf-8") as fh:
+                rc = subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT).returncode
+        else:
+            rc = subprocess.run(cmd, env=env).returncode
+        if rc == 0:
+            return
+        if rc == NOT_CONVERTED:
+            raise _not_converted(first, last)
+        log.warning("Pages %d-%d: worker crashed (attempt %d), retrying", first, last, attempt)
+    raise RuntimeError(f"Pages {first}-{last} failed after 3 attempts")
+
+
+def _attempt_captured(first: int, last: int, cmd: list[str], env: dict[str, str]) -> tuple:
+    """One attempt of one batch, its output captured: ((first, last), return code, output bytes).
+    Runs in a pool thread, so it does no logging."""
+    done = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return (first, last), done.returncode, done.stdout
+
+
+def _write_log(data: bytes, subprocess_log: Path | None) -> None:
+    """Append `data` to `subprocess_log`, else write it to stdout (a text-only stream gets it decoded)."""
+    if subprocess_log is not None:
+        with open(subprocess_log, "ab") as fh:
+            fh.write(data)
+    elif getattr(sys.stdout, "buffer", None) is not None:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    elif sys.stdout is not None:  # pythonw has no stdout at all
+        sys.stdout.write(data.decode("utf-8", "replace"))
+        sys.stdout.flush()
+
+
+def _convert_parallel(jobs: list, workers: int, subprocess_log: Path | None, finished) -> None:
+    """Convert the batches in `jobs` ((first, last, cmd, env) in page order), `workers` at a time.
+
+    Pool threads only run one attempt and return its result; the output, the logging and `finished(first, last)`
+    stay in this thread (the service's job log keeps only the calling thread's records). At most `workers`
+    batches are in flight and the next one is submitted only after a result was handled, so nothing is queued
+    behind a failure: a batch Docling did not convert, a crashed one, an exception of a pool task, or an exception
+    in this thread that is not a console interrupt (progress, the log file) starts no further batch; the running
+    ones finish (the pool waits for them, no process is killed) and stay cached. A Ctrl+C in a console reaches
+    the workers too: they stop without writing their batch. A crashed batch (e.g. killed for memory) and the
+    batches not yet started are then converted alone, in page order, once the pool has drained.
+    """
+    size = min(workers, len(jobs))
+    log.info("Converting %d batches, %d at a time", len(jobs), size)
+    commands = {(first, last): (cmd, env) for first, last, cmd, env in jobs}
+    waiting, running = list(jobs), {}  # not yet submitted (page order); future -> (first, last)
+    unconverted, crashed, error = [], [], None
+    with ThreadPoolExecutor(max_workers=size) as pool:
+        while True:
+            while waiting and len(running) < size and error is None and not unconverted and not crashed:
+                job = waiting.pop(0)
+                running[pool.submit(_attempt_captured, *job)] = job[:2]
+            if not running:
+                break
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in sorted(done, key=running.get):
+                del running[future]
+                if future.exception() is not None:
+                    error = error or future.exception()
+                    continue
+                (first, last), rc, output = future.result()
+                if output and not output.endswith(b"\n"):  # a killed worker can stop mid-line
+                    output += b"\n"
+                _write_log(f"=== pages {first}-{last} ===\n".encode() + output, subprocess_log)
+                if rc == 0:
+                    finished(first, last)
+                elif rc == NOT_CONVERTED:
+                    unconverted.append((first, last))
+                else:
+                    log.warning("Pages %d-%d: worker crashed in parallel mode (exit code %d)", first, last, rc)
+                    crashed.append((first, last))
+    if error is not None:
+        raise error
+    if unconverted:
+        raise _not_converted(*min(unconverted))
+    for first, last in sorted(crashed + [job[:2] for job in waiting]):
+        if (first, last) in crashed:
+            log.info("Pages %d-%d: retrying alone after a crash in parallel mode", first, last)
+            _write_log(f"=== pages {first}-{last} (retried alone) ===\n".encode(), subprocess_log)
+        else:
+            log.info("Pages %d-%d: converting alone after a crash in parallel mode", first, last)
+        _convert_alone(*commands[(first, last)], first, last, subprocess_log)
+        finished(first, last)
+
+
 def convert_batches(src: Path, out: Path, *, chunk: int = 15, layout: str = DEFAULT_LAYOUT,
                     password: str | None = None, batch_root: Path | None = None,
-                    progress=None, subprocess_log: Path | None = None) -> tuple[DoclingDocument, int]:
+                    progress=None, subprocess_log: Path | None = None,
+                    workers: int = 1) -> tuple[DoclingDocument, int]:
     """Convert the PDF in page batches (cached) and concatenate them: (raw document, page count).
 
     Each batch runs in a fresh process: memory grows across conversions in one process and
     eventually crashes natively on a long protocol. Finished batches are cached, so a rerun
-    resumes where it left off. progress("convert", i, n) after each batch; the workers'
-    output goes to `subprocess_log` when given (appended), else to this process's stdout.
+    resumes where it left off. progress("convert", i, n) after each batch (cached ones first);
+    the workers' output goes to `subprocess_log` when given (appended), else to this process's
+    stdout. Up to `workers` batches run at the same time. The document does not depend on
+    `workers` (the batches are concatenated in page order).
     """
+    if workers < 1:
+        raise ValueError(f"workers must be at least 1 (got {workers})")
     pdf_sha = file_sha256(src)
     probe = pdfium.PdfDocument(str(src), password=password)
     n_pages = len(probe)
     probe.close()  # an open handle would keep the file locked on Windows
     batches = batch_cache(out, src, pdf_sha, layout, n_pages, chunk, root=batch_root)
     start = time.time()
-    batch_files = []
     ranges = [(first, min(first + chunk - 1, n_pages)) for first in range(1, n_pages + 1, chunk)]
-    for k, (first, last) in enumerate(ranges, start=1):
-        dest = batches / f"{first:04d}-{last:04d}.json"
-        batch_files.append(dest)
+    batch_files = [batches / f"{first:04d}-{last:04d}.json" for first, last in ranges]
+    reported = 0
+
+    def report() -> None:
+        nonlocal reported
+        reported += 1
+        if progress is not None:
+            progress("convert", reported, len(ranges))
+
+    def finished(first: int, last: int) -> None:
+        log.info("Pages %d-%d done (%.0fs elapsed)", first, last, time.time() - start)
+        report()
+
+    jobs = []
+    for (first, last), dest in zip(ranges, batch_files):
         if dest.exists():
             log.info("Pages %d-%d cached", first, last)
+            report()
         else:
-            cmd = [sys.executable, str(Path(__file__).resolve()), str(src), "--out", str(out), "--layout", layout,
-                   "--batch-dir", str(batches), "--range", str(first), str(last)]
-            # The password reaches the worker through its environment, not its command line.
-            env = {**os.environ, **({"PDF_PASSWORD": password} if password else {})}
-            for attempt in range(1, 4):
-                if subprocess_log is not None:
-                    with open(subprocess_log, "a", encoding="utf-8") as fh:
-                        rc = subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT).returncode
-                else:
-                    rc = subprocess.run(cmd, env=env).returncode
-                if rc == 0:
-                    break
-                if rc == NOT_CONVERTED:
-                    raise RuntimeError(f"Pages {first}-{last}: Docling did not convert them completely (see log)")
-                log.warning("Pages %d-%d: worker crashed (attempt %d), retrying", first, last, attempt)
-            else:
-                raise RuntimeError(f"Pages {first}-{last} failed after 3 attempts")
-            log.info("Pages %d-%d done (%.0fs elapsed)", first, last, time.time() - start)
-        if progress is not None:
-            progress("convert", k, len(ranges))
+            jobs.append((first, last, *_worker_command(src, out, layout, batches, first, last, password)))
+    if min(workers, len(jobs)) <= 1:  # nothing can run in parallel: today's path
+        for first, last, cmd, env in jobs:
+            _convert_alone(cmd, env, first, last, subprocess_log)
+            finished(first, last)
+    else:
+        _convert_parallel(jobs, workers, subprocess_log, finished)
     doc = DoclingDocument.concatenate([DoclingDocument.load_from_json(f) for f in batch_files])
     # Record the source PDF (concatenation keeps no origin), as Docling does: binary_hash from the SHA-256 of the
     # bytes. Chunk ids derive from it (chunk_protocol.doc_metadata), so they depend on the PDF alone, not on the
@@ -313,7 +424,7 @@ def convert_document(src: Path, out: Path, *, chunk: int = 15, layout: str = DEF
                      vlm_cache: Path = Path("vlm_cache"), describe_figures: bool = False,
                      figure_concurrency: int = 4, force: bool = False, password: str | None = None,
                      stem: str | None = None, images_dir: str | None = None, batch_root: Path | None = None,
-                     progress=None, subprocess_log: Path | None = None) -> dict:
+                     progress=None, subprocess_log: Path | None = None, convert_workers: int = 1) -> dict:
     """The whole conversion: batches -> post-processing -> figure descriptions -> saved outputs.
 
     Outputs go to `out` as <stem>.json/.md/.html, <stem>.decisions.json, <images_dir>/ and
@@ -322,13 +433,15 @@ def convert_document(src: Path, out: Path, *, chunk: int = 15, layout: str = DEF
     `figure_model` (OpenRouter, zero-data-retention) for every figure not skipped and not
     cached in `vlm_cache`; then the cached results are attached. Without it, only cached
     results are attached (the command line's behaviour). progress(stage, done, total) with
-    stages "convert", "postprocess", "figures", "save". Returns counts and the figure stats.
+    stages "convert", "postprocess", "figures", "save". convert_workers batches are converted at the same time
+    (the document does not depend on it). Returns counts and the figure stats.
     """
     stem = stem or src.stem
     images_dir = images_dir or f"{stem}_images"
     claim_output_folder(out, src, file_sha256(src), force)
     doc, n_pages = convert_batches(src, out, chunk=chunk, layout=layout, password=password,
-                                   batch_root=batch_root, progress=progress, subprocess_log=subprocess_log)
+                                   batch_root=batch_root, progress=progress, subprocess_log=subprocess_log,
+                                   workers=convert_workers)
     doc.name = stem
 
     if progress is not None:
@@ -362,6 +475,14 @@ def convert_document(src: Path, out: Path, *, chunk: int = 15, layout: str = DEF
     return {"stem": stem, "json": out / f"{stem}.json", **saved, "postprocess": counts, "figures": figures}
 
 
+def at_least_one(text: str) -> int:
+    """argparse type: an integer >= 1."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("pdf", nargs="?", default=str(main_pdf()), help="default: the main protocol (project_paths)")
@@ -377,6 +498,8 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="replace another document in --out")
     parser.add_argument("--password", default=os.environ.get("PDF_PASSWORD"),
                         help="PDF password (or set PDF_PASSWORD); passed to both parsers")
+    parser.add_argument("--workers", type=at_least_one, default=1,
+                        help="batches converted at the same time, each in its own process")
     parser.add_argument("--batch-dir", help=argparse.SUPPRESS)  # internal: worker mode
     parser.add_argument("--range", type=int, nargs=2, metavar=("FIRST", "LAST"),
                         help=argparse.SUPPRESS)  # internal: worker mode
@@ -396,7 +519,7 @@ def main() -> None:
     # that calls a model); the service passes describe_figures=True.
     convert_document(src, out, chunk=args.chunk, layout=args.layout, settings=ProtocolSettings.load(args.settings),
                      figure_model=args.figure_model, vlm_cache=Path(args.vlm_cache), force=args.force,
-                     password=args.password)
+                     password=args.password, convert_workers=args.workers)
 
 
 if __name__ == "__main__":

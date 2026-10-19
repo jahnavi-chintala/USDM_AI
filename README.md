@@ -49,7 +49,7 @@ Set `OPENROUTER_OFFLINE=1` to forbid any API call: cache misses then raise inste
 
 | Stage | Module | What it does |
 |---|---|---|
-| Conversion | `convert_protocol.py`, `hybrid_backend.py` | Docling standard PDF pipeline (docling-parse text, pdfium page images), `layout_heron_101`, TableFormer ACCURATE, RapidOCR on bitmaps only; batches run in subprocesses and are cached per configuration |
+| Conversion | `convert_protocol.py`, `hybrid_backend.py` | Docling standard PDF pipeline (docling-parse text, pdfium page images), `layout_heron_101`, TableFormer ACCURATE, RapidOCR on bitmaps only; batches run in subprocesses (`--workers N` converts N at once) and are cached per configuration |
 | Post-processing | `protocol_postprocess.py`, `protocol_settings.py` | furniture, figure OCR (`figure_ocr.py`), list repair, symbol glyphs, repeated table titles and footnotes, text reconciliation, table lattice, table merge, heading levels, TOC, reading-order repair |
 | Text repair | `text_reconcile.py` | superscripts / subscripts / footnote markers ("10^9/L", "Response^a"), dropped line-end hyphens, merged words, cover-page label/value pairs, all from pdfium glyph geometry |
 | Tables | `table_lattice.py`, `table_merge.py` | TableFormer grids verified against the PDF's ruling lines and rebuilt on fully ruled (and row-ruled) tables; page-split tables merged |
@@ -68,7 +68,7 @@ Set `OPENROUTER_OFFLINE=1` to forbid any API call: cache misses then raise inste
 No pytest needed: `.venv\Scripts\python tests\test_<name>.py` for each file in `tests/`.
 - Most tests build synthetic documents and PDFs.
 - `test_protocol_api.py`, `test_soa.py` and `test_usdm_gold.py` also read converted public protocols from `output_public/` when present.
-- The service suites (`test_service_*.py`) also run inside the image (`docker run --rm --network none protocol-service:test`).
+- The service suites (`test_service_*.py`) and the batch scheduler's (`test_convert_batches.py`) also run inside the image (`docker run --rm --network none protocol-service:test`).
 - `scripts/smoke_test.py` tests a running service end to end.
 
 ## Data handling

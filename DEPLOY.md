@@ -34,7 +34,7 @@ docker compose ps                                    # wait for "(healthy)", abo
 
 ```powershell
 docker build --target test -t protocol-service:test .
-docker run --rm --network none protocol-service:test           # 6 service test suites, ~1.5 min, no network
+docker run --rm --network none protocol-service:test           # 6 service test suites + the batch scheduler's, ~1.5 min, no network
 ```
 
 **End-to-end smoke test** against the running container:
@@ -108,6 +108,7 @@ Settings come from environment variables. In compose they come from `.env` (docu
 | `EMBED_MODEL` | `qwen/qwen3-embedding-8b` | Chunk and query embeddings. |
 | `RERANK_MODEL` | `qwen/qwen3-reranker-8b` | Search reranker. |
 | `WORKER_CONCURRENCY` | `1` | Documents converted at the same time. Each needs about 5 GB at peak: raise `mem_limit` with it. |
+| `CONVERT_WORKERS` | `1` | Conversion batches (15 pages) of one document converted at the same time, each in its own process with 4 threads. The outputs do not depend on it. It pays off only with about 4 free vCPUs per extra batch process, and each one needs memory: raise `mem_limit` with it (see [Limits](#8-limits)). |
 | `FIGURE_CONCURRENCY` | `4` | Figure-description requests in flight per document. |
 | `MAX_UPLOAD_MB` | `100` | Largest accepted PDF. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
@@ -333,12 +334,13 @@ The fingerprint covers the pipeline version, the settings, the Docling versions,
 - **Speed and memory:** measured on a 4-core laptop CPU, Docker with 8 logical CPUs.
   - Conversion takes about 7.5–11 s per page: LZZT, 97 pages, 14 min end to end; Sanofi, 152 pages, about 30 min.
   - Figure descriptions take 70–90 s per document; embeddings 15–20 s.
-  - Peak memory is about 5 GB per job while converting (1.7 GB otherwise). The end-to-end test measured 6.0 GB for the whole container with agents querying during a conversion; the 8 GB limit covers that.
-  - The converter uses 4 threads per job, so more CPUs only help with more concurrent jobs.
+  - Peak memory is about 5 GB per batch process while converting (1.7 GB otherwise); with the default `CONVERT_WORKERS=1` a job runs one at a time. The end-to-end test measured 6.0 GB for the whole container with agents querying during a conversion; the 8 GB limit covers that.
+  - A batch process uses 4 threads and keeps about 3.5–4 CPUs busy. `CONVERT_WORKERS` converts several batches of one document at once. On the laptop's host Python (2026-10-18/19), 2 batch processes converted Alexion (74 pages) in 724 s instead of 922–999 s and Sanofi (152 pages) in 1,348 s instead of 1,782 s (1.3–1.4x); a third added nothing (710 s). The outputs were the same in content; the bytes differed only by the float noise of any two fresh conversions (below), and `protocol.decisions.json` by its figure-OCR timings, as between any two runs.
+  - In the container (end-to-end test, 2026-10-19, `mem_limit` 8 GB, `CONVERT_WORKERS=2`) the peak was 7.6 GB and no batch process was killed. Conversion took 704 s for Alexion (863 s with 1 worker) and 842 s for Bayer (1,310 s), but 1,591 s for Sanofi (1,535 s): at 8 GB the large protocol gained nothing, the container being at its limit. Size the limit for every batch process that can run at once: `mem_limit` ≈ 5 GB × `WORKER_CONCURRENCY` × `CONVERT_WORKERS` + 2–3 GB (13 GB for 2 workers); the compose default of 8 GB suits `CONVERT_WORKERS=1`. A batch process killed for memory is converted again alone after the others, and the batches after it run one at a time, so while one batch process fits in the limit the job should only get slower (not yet seen in the container); if even one does not fit, the job fails as with `CONVERT_WORKERS=1`.
 - **Uploads:** at most `MAX_UPLOAD_MB` (100 MB). MCP `data_base64` uploads are held in memory.
 - **Lost passwords:** a PDF password is lost if the service restarts before its job starts; the job then fails. Reprocess the document with its password (`POST /documents/{doc_id}/reprocess` with `{"force": true, "password": "…"}`) or upload it again.
 - **Search needs embeddings,** made online at ingest. A document processed offline must be reprocessed online to search it.
-- **Chunk ids:** `<protocol id>-A<amendment>-0000` when both are detected, else `doc-<12 hex of the PDF's hash>-0000`. The same PDF gets the same ids on every platform and in every run. After a reprocess with a newer pipeline, an id may cover slightly different text: compare `content_hash`. Fresh conversions on Windows and Linux can differ in tiny model floats in `protocol.json` (relative 1e-5); the text content is the same.
+- **Chunk ids:** `<protocol id>-A<amendment>-0000` when both are detected, else `doc-<12 hex of the PDF's hash>-0000`. The same PDF gets the same ids on every platform and in every run. After a reprocess with a newer pipeline, an id may cover slightly different text: compare `content_hash`. Fresh conversions on Windows and Linux can differ in tiny model floats in `protocol.json` (relative 1e-5); the text content is the same. Two fresh conversions on the same machine can too (a few coordinates, about 1e-4 pt: Docling groups pages for its layout model by timing), whatever `CONVERT_WORKERS` is; cached batches are reused as they are.
 - **Content limits** of the conversion and of the tools (reading order, unruled tables, footnote markers, ...) are listed in [docs/protocol_api.md](docs/protocol_api.md#limits). Tool provenance has section, page and item references, but no bounding boxes.
 - **No system fonts in the image.** PDFs with non-embedded fonts render page images with pdfium's built-in fallback fonts; the text layer is unaffected.
 
@@ -377,7 +379,7 @@ All file access goes through `service/storage.py`: the abstract class `Storage` 
   - Either a persistent local volume (one instance, SQLite) or a cloud adapter (section 9).
   - Never a network file share for the registry.
 - [ ] **Resource sizing:**
-  - At least 4 vCPU and 12 GB RAM for one job at a time (container limit 8 GB); 8 vCPU and 24–32 GB for `WORKER_CONCURRENCY=2` (raise `mem_limit` by about 5 GB per extra job).
+  - At least 4 vCPU and 12 GB RAM for one job at a time (container limit 8 GB); 8 vCPU and 24–32 GB for `WORKER_CONCURRENCY=2` or `CONVERT_WORKERS=2` (raise `mem_limit` by about 5 GB per extra batch process: `WORKER_CONCURRENCY` × `CONVERT_WORKERS` of them run at once).
   - Disk: the image (3.3 GB) plus about 75 MB per large protocol, plus backups.
 - [ ] **Backups** scheduled (section 3), stored as securely as the documents, and a restore tested.
 - [ ] **Image hygiene:**

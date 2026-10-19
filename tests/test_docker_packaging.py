@@ -187,7 +187,8 @@ def test_real_context() -> None:
     assert whitelist == runtime.runtime_files() + runtime.test_files() + runtime.BUILD_FILES
     assert set(runtime.test_files()) == {"tests/test_service_api.py", "tests/test_service_core.py",
                                          "tests/test_service_mcp.py", "tests/test_service_pipeline.py",
-                                         "tests/test_service_ui.py", "tests/test_service_zdr.py"}
+                                         "tests/test_service_ui.py", "tests/test_service_zdr.py",
+                                         "tests/test_convert_batches.py"}
     ui = [f for f in runtime.runtime_files() if f.startswith(runtime.UI_DIR + "/")]
     assert ui and all(f.endswith(runtime.UI_SUFFIXES) for f in ui) and "service/ui/index.html" in ui
     assert not any(f.lower().endswith(".pdf") or f.startswith(("output", "test_protocols", "reports", "data/"))

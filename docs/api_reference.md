@@ -290,6 +290,7 @@ Parameters: none.
 | `config.embed_model` | string | Same as `models.embedding`. |
 | `config.rerank_model` | string | Same as `models.reranker`. |
 | `config.worker_concurrency` | integer | Documents converted at the same time (`WORKER_CONCURRENCY`). |
+| `config.convert_workers` | integer | Conversion batches (15 pages each) converted at the same time per document (`CONVERT_WORKERS`). |
 | `config.figure_concurrency` | integer | Figure-description requests in flight per document (`FIGURE_CONCURRENCY`). |
 | `config.max_upload_mb` | integer | Largest accepted PDF in MiB (`MAX_UPLOAD_MB`). |
 | `config.allowed_hosts` | string[] | `ALLOWED_HOSTS`: host names clients may address the service by. |
@@ -325,6 +326,7 @@ Invoke-RestMethod http://127.0.0.1:8000/version | ConvertTo-Json -Depth 5
     "embed_model": "qwen/qwen3-embedding-8b",
     "rerank_model": "qwen/qwen3-reranker-8b",
     "worker_concurrency": 1,
+    "convert_workers": 1,
     "figure_concurrency": 4,
     "max_upload_mb": 100,
     "allowed_hosts": ["localhost", "127.0.0.1", "::1"],
