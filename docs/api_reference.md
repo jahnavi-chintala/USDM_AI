@@ -25,7 +25,8 @@ service. It describes pipeline version 2.1.0; `GET /version` shows what a runnin
    means the service already has a current result for these bytes. Keep the `doc_id`: it is the SHA-256 of the
    PDF, so the same file always gets the same id.
 2. **Poll** `GET /jobs/{job_id}` every 15–30 seconds until the job is `done`, `done_with_warnings`, `failed` or
-   `cancelled`. A large protocol takes 10–25 minutes.
+   `cancelled`. On a laptop a large protocol takes 10–25 minutes; on the hosted 8-vCPU VM the 97-page LZZT protocol
+   took 4.4 minutes end to end.
 3. **Read** the protocol with the tools (`read_section`, `get_soa`, …), passing the `doc_id`, or download the files.
 4. **Verify** every value you extract with `quote_check`, and keep the provenance it returns.
 5. **Show** the source: page numbers come with every result; exact boxes come from `protocol.json`.
@@ -141,14 +142,16 @@ The REST API is the service's JSON-over-HTTP interface: upload PDFs, follow thei
 published files, and run the protocol tools. The interactive page `/docs` and the schema `/openapi.json` list the
 same routes; this section adds what every response field means.
 
-**Base URL:** `http://127.0.0.1:8000`.
+**Base URL:** `http://127.0.0.1:8000` on the machine the service runs on; `https://<host>` for a
+[hosted service](#hosted-service-behind-the-proxy).
 
 - Docker Compose publishes port 8000 on 127.0.0.1 only, so the service is reachable from the machine it runs on.
 - The demo UI (`/ui/`), the MCP endpoint (`/mcp`) and the API share this origin, so the UI calls the API without
   CORS. `GET /` redirects to `/ui/`.
 
-**Authentication:** none today. Anyone who can reach the port can call every route, including delete. Put an
-authenticating proxy in front before the port is reachable from anywhere else
+**Authentication:** none in the service itself. Anyone who can reach the port can call every route, including
+delete. A hosted service has a proxy in front that requires an API key on every request; see
+[Hosted service](#hosted-service-behind-the-proxy). Never make the port reachable from elsewhere without one
 ([DEPLOY.md](../DEPLOY.md#10-before-hosting-checklist)).
 
 **Host and Origin checks** apply to every route, `/mcp` and `/ui/` included (see [Errors](#errors)):
@@ -191,6 +194,58 @@ The examples below come from a service running offline (`OPENROUTER_OFFLINE=1`) 
 protocols, plus made-up one-page PDFs where a job state needed one. For the two public protocols the Docling
 conversion was replaced by their stored conversion, so their job timestamps and `convert` stage times are seconds
 where a real conversion takes minutes.
+
+### Hosted service (behind the proxy)
+
+A hosted service runs the same container behind a proxy (Caddy) that terminates HTTPS and checks an API key; see
+[hosting_gcp.md](hosting_gcp.md) for one Google Cloud VM. Routes, fields, statuses and the MCP envelope are exactly
+as this reference describes them. The proxy adds:
+
+- **Base URL:** `https://<host>`; the runbook's host is the VM's IP with dashes plus `.sslip.io`. Plain HTTP is
+  redirected to HTTPS.
+- **An API key on every request:** the header `Authorization: Bearer <key>`, for REST and for `/mcp`. Only `/health`
+  answers without it, for uptime checks.
+- **Its own answers** carry no JSON error body, so branch on the status:
+  - `401`: the header is missing or the key is wrong. The plain-text body reads
+    `unauthorized: send the header Authorization: Bearer <API key>`.
+  - `413`: a request body above 110 MB. The service itself refuses PDFs above `MAX_UPLOAD_MB` (100 MB) with
+    `413 too_large`. The proxy's limit also caps an MCP `ingest_document` with `data_base64` at about 80 MB of PDF.
+- **Host and Origin:** the host name is in `ALLOWED_HOSTS`, so requests to `https://<host>` pass the service's checks.
+  A web page on another site calling the API from a browser is still refused (`403 invalid_origin`); the service sends
+  no CORS headers.
+- **No browser pages:** a browser cannot send the key header, so the demo UI and `/docs` do not work through the host.
+  Open them through an SSH tunnel to the VM
+  ([hosting_gcp.md, step 3.5](hosting_gcp.md#35-the-demo-ui-and-docs-optional)). `/openapi.json` works with the
+  header.
+
+PowerShell. Set the URL and the key once; the key prompt hides what you type:
+
+```powershell
+$env:PROTOCOL_SERVICE_URL = Read-Host 'Service URL'
+$s = Read-Host 'API key' -AsSecureString
+$env:PROTOCOL_SERVICE_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
+$h = @{ Authorization = "Bearer $env:PROTOCOL_SERVICE_API_KEY" }
+Invoke-RestMethod "$env:PROTOCOL_SERVICE_URL/documents" -Headers $h
+curl.exe -H "Authorization: Bearer $env:PROTOCOL_SERVICE_API_KEY" -F "file=@C:\path\to\protocol.pdf" "$env:PROTOCOL_SERVICE_URL/documents"
+```
+
+Python, with the same two environment variables:
+
+```python
+import os
+
+import httpx
+
+api = httpx.Client(base_url=os.environ["PROTOCOL_SERVICE_URL"], timeout=120,
+                   headers={"Authorization": f"Bearer {os.environ['PROTOCOL_SERVICE_API_KEY']}"})
+print(api.get("/version").json()["pipeline_version"])
+```
+
+MCP clients use `https://<host>/mcp` with the same header. Any client that can set HTTP headers works; for Claude Code:
+
+```powershell
+claude mcp add --scope user --transport http protocol-service "$env:PROTOCOL_SERVICE_URL/mcp" --header "Authorization: Bearer $env:PROTOCOL_SERVICE_API_KEY"
+```
 
 ### Service
 
@@ -1310,7 +1365,8 @@ returns exactly the JSON of the matching REST route. Setting up Claude Code or C
 
 ### HTTP endpoint
 
-- **URL:** `http://127.0.0.1:8000/mcp`, exactly this path: no trailing slash, no redirect.
+- **URL:** `http://127.0.0.1:8000/mcp`, or `https://<host>/mcp` for a
+  [hosted service](#hosted-service-behind-the-proxy); exactly this path: no trailing slash, no redirect.
 - **Transport:** Streamable HTTP, stateless. There is no `Mcp-Session-Id`; every POST stands alone, and a restart of
   the service loses nothing.
 - **POST only.** Each POST gets one `application/json` answer (no SSE stream). `GET` and `DELETE` answer `405` with
@@ -1322,8 +1378,9 @@ returns exactly the JSON of the matching REST route. Setting up Claude Code or C
 - **Host and Origin:** the same `ALLOWED_HOSTS` checks as REST (`421` / `403` JSON error bodies), plus the MCP SDK's
   own DNS-rebinding protection.
 - **Body size:** at most a base64 PDF of `MAX_UPLOAD_MB` plus 1 MiB (about 134 MiB for the default 100); larger
-  bodies get `413` from the transport.
-- **No authentication**, as for REST.
+  bodies get `413` from the transport. Behind the hosted proxy, bodies above 110 MB get `413` from the proxy.
+- **Authentication:** none in the service, as for REST. A hosted service's proxy requires
+  `Authorization: Bearer <key>` on every POST ([Hosted service](#hosted-service-behind-the-proxy)).
 - **Server info:** name `protocol-service`, version = the pipeline version. Its instructions give agents the
   suggested flow: find or ingest a document, poll `get_document`, then `document_info`, `outline` /
   `find_sections`, `read_section`, and `quote_check` for every extracted value.
