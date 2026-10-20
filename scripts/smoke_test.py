@@ -887,7 +887,7 @@ async def mcp_http(run: Run) -> None:
                     not result.is_error and text_ok and sc.get("duplicate") is True and sc.get("job_id") is None
                     and sc.get("queued") is False and sc.get("doc_id") == d.doc_id and after == before,
                     f"duplicate {sc.get('duplicate')}, job_id {sc.get('job_id')}, jobs {before} -> {after}")
-    async with Client(url, read_timeout_seconds=TOOL_TIMEOUT) as client:  # the SDK's default era
+    async with Client(mcp_target(url), read_timeout_seconds=TOOL_TIMEOUT) as client:  # the SDK's default era
         names = [t.name for t in (await client.list_tools()).tools]
         r.check("6", "default-era client: 12 tools", len(names) == 12, f"protocol {client.protocol_version}")
 
