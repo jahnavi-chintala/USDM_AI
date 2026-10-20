@@ -236,11 +236,13 @@ Expected:
 
 ### 3.1 URL and key in the session
 
-Run this in PowerShell in the project folder. Paste the site URL (`https://...sslip.io`) and the key when asked.
+Run this in PowerShell in the project folder. Paste the site URL (`https://...sslip.io`) and the key when asked. The key
+prompt hides what you type (a plain `Read-Host` would show the key on screen and leave it in the terminal history).
 
 ```powershell
 $env:PROTOCOL_SERVICE_URL = Read-Host 'Service URL'
-$env:PROTOCOL_SERVICE_API_KEY = Read-Host 'API key'
+$s = Read-Host 'API key' -AsSecureString
+$env:PROTOCOL_SERVICE_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
 $h = @{ Authorization = "Bearer $env:PROTOCOL_SERVICE_API_KEY" }
 Invoke-RestMethod "$env:PROTOCOL_SERVICE_URL/version" -Headers $h | Select-Object pipeline_version, fingerprint, offline
 ```
@@ -284,10 +286,16 @@ It reads the key from `PROTOCOL_SERVICE_API_KEY` (step 3.1) and never prints it.
 - **Claude Code (MCP over HTTP):**
 
   ```powershell
-  claude mcp add --transport http protocol-service "$env:PROTOCOL_SERVICE_URL/mcp" --header "Authorization: Bearer $env:PROTOCOL_SERVICE_API_KEY"
+  claude mcp add --scope user --transport http protocol-service "$env:PROTOCOL_SERVICE_URL/mcp" --header "Authorization: Bearer $env:PROTOCOL_SERVICE_API_KEY"
+  claude mcp list
   ```
 
-  Claude Code stores the key in its configuration file, in plain text.
+  - `--scope user` makes the server available in every session. Without it, the server is saved for the current folder
+    only ("local" scope), and the Claude desktop app's sessions do not load it.
+  - `claude mcp list` should show `protocol-service ... Connected`.
+  - Sessions started after the change have the tools. In the desktop app, `/mcp` may not list the server; asking the
+    session "which connectors does this session have?" shows it.
+  - Claude Code stores the key in its configuration file (`%USERPROFILE%\.claude.json`), in plain text.
 - **Other MCP clients:** Streamable HTTP at `<site>/mcp`, with the same header.
 
 ### 3.5 The demo UI and /docs (optional)
@@ -341,7 +349,7 @@ On the VM (`gcloud compute ssh ...`, then `cd ~/ingest_retrieve`):
 | Logs | `docker compose logs -f protocol-service`, `docker compose logs caddy` |
 | Update to the latest commit | `git pull`, `python3 scripts/check_build_context.py`, `docker build -t protocol-service .`, `docker compose up -d` |
 | Change a setting | Edit `.env`, then `docker compose up -d` (recreates what changed) |
-| Rotate the API key | Replace `PROXY_API_KEY` in `.env` (`openssl rand -hex 32`), `docker compose up -d caddy`, update every client |
+| Rotate the API key | `sed -i "s/^PROXY_API_KEY=.*/PROXY_API_KEY=$(openssl rand -hex 32)/" .env`, then `docker compose up -d --no-deps caddy`, and update every client |
 | Restart | `docker compose restart` |
 
 - **After an update:** results made by an older pipeline fingerprint show `stale: true`. Reprocessing sends to

@@ -54,7 +54,9 @@ Real run against the container (PowerShell, from the project root):
     .venv\\Scripts\\python.exe scripts\\smoke_test.py --allow-openrouter
 Against the hosted service behind its proxy (docs/hosting_gcp.md): set PROTOCOL_SERVICE_API_KEY and every REST and
 MCP HTTP request carries "Authorization: Bearer <key>" (the key is never printed); --stdio-cmd= (empty) skips stdio:
-    $env:PROTOCOL_SERVICE_API_KEY = Read-Host 'API key'
+    $s = Read-Host 'API key' -AsSecureString   # hidden input; then copy it into the environment:
+    $env:PROTOCOL_SERVICE_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
     .venv\\Scripts\\python.exe scripts\\smoke_test.py --base-url https://<host> --stdio-cmd= --allow-openrouter
 Offline run against a local service (python -m service.api with OPENROUTER_OFFLINE=1, PORT=8790; the stdio child
 inherits this environment, so set DATA_DIR to the service's):
