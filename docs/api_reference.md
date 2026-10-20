@@ -203,6 +203,8 @@ as this reference describes them. The proxy adds:
 
 - **Base URL:** `https://<host>`; the runbook's host is the VM's IP with dashes plus `.sslip.io`. Plain HTTP is
   redirected to HTTPS.
+- **Current deployment:** `https://35-193-104-211.sslip.io` (one Google Cloud VM, us-central1). MCP:
+  `https://35-193-104-211.sslip.io/mcp`.
 - **An API key on every request:** the header `Authorization: Bearer <key>`, for REST and for `/mcp`. Only `/health`
   answers without it, for uptime checks.
 - **Its own answers** carry no JSON error body, so branch on the status:
